@@ -984,6 +984,9 @@ class StockNotesTest(unittest.TestCase):
         self.assertEqual(stocks.status_code, 200)
         stocks_text = stocks.get_data(as_text=True)
         self.assertIn("个股分析", stocks_text)
+        self.assertIn('id="submenu-review"', stocks_text)
+        self.assertIn("交易记录", stocks_text)
+        self.assertIn("情绪纪律", stocks_text)
         self.assertIn("还没有已平仓交易", stocks_text)
 
         summary = self.client.get("/analysis/summary")
@@ -1795,10 +1798,41 @@ class StockNotesTest(unittest.TestCase):
         self.assertEqual([item["code"] for item in indexes], list(self.module.MARKET_INDEXES)[:4])
 
     def test_portfolio_indexes_api_returns_error_without_name_error(self):
+        with self.module.MARKET_INDEX_STATE_LOCK:
+            self.module.MARKET_INDEX_STATE.update({"data": [], "updated_at": None, "error": None})
         with patch.object(self.module, "fetch_market_indexes", return_value=[]):
             response = self.client.get("/analysis/portfolio/indexes")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["data"], [])
+
+    def test_portfolio_indexes_api_returns_cached_indexes_without_waiting_for_refresh(self):
+        with self.module.MARKET_INDEX_STATE_LOCK:
+            self.module.MARKET_INDEX_STATE.update({
+                "data": [{"code": "sh000001", "name": "上证指数", "price": 3500, "change": 10,
+                          "change_rate": 0.01, "trade_date": "2026-08-21", "fetched_at": "2026-08-21T15:00:00"}],
+                "updated_at": datetime.now().isoformat(timespec="seconds"), "error": None,
+            })
+        with patch.object(self.module, "fetch_market_indexes") as fetch:
+            response = self.client.get("/analysis/portfolio/indexes")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["data"][0]["name"], "上证指数")
+        fetch.assert_not_called()
+
+    def test_portfolio_indexes_api_returns_stale_cache_and_refreshes_in_background(self):
+        with self.module.MARKET_INDEX_STATE_LOCK:
+            self.module.MARKET_INDEX_STATE.update({
+                "data": [{"code": "sh000001", "name": "上证指数", "price": 3500, "change": 10,
+                          "change_rate": 0.01, "trade_date": "2026-08-21", "fetched_at": "2026-08-21T15:00:00"}],
+                "updated_at": (datetime.now() - timedelta(seconds=31)).isoformat(timespec="seconds"),
+                "error": None,
+            })
+        with patch.object(self.module, "refresh_market_indexes_in_background") as refresh, \
+             patch.object(self.module, "fetch_market_indexes") as fetch:
+            response = self.client.get("/analysis/portfolio/indexes")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["data"][0]["name"], "上证指数")
+        refresh.assert_called_once_with()
+        fetch.assert_not_called()
 
     def test_auto_sync_trading_windows(self):
         self.assertEqual(self.module.AUTO_REALTIME_SYNC_INTERVAL_SECONDS, 30)
@@ -2193,6 +2227,28 @@ class StockNotesTest(unittest.TestCase):
         self.assertIsNone(modules["concept"]["error"])
         self.assertIsNone(modules["hot_rank"]["error"])
         self.assertIsNotNone(payload["updated_at"])
+
+
+    def test_hot_sectors_fetches_modules_in_parallel(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def provider():
+            started.set()
+            self.assertTrue(release.wait(timeout=1))
+            return pd.DataFrame([{"涨跌幅": 1}])
+
+        with patch.object(self.module, "fetch_hot_industry", side_effect=provider) as industry, \
+             patch.object(self.module, "fetch_hot_concept", side_effect=provider) as concept, \
+             patch.object(self.module, "fetch_hot_rank", side_effect=provider) as rank:
+            worker = threading.Thread(target=self.module.hot_sectors_data, kwargs={"force": True})
+            worker.start()
+            self.assertTrue(started.wait(timeout=1))
+            time.sleep(0.05)
+            self.assertEqual(industry.call_count + concept.call_count + rank.call_count, 3)
+            release.set()
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
 
 
     def test_hot_sectors_partial_failure_keeps_last_good(self):

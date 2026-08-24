@@ -16,12 +16,15 @@
         <a class="{{ 'active' if page == 'watchlist' else '' }}" href="{{ url_for('analysis_watchlist') }}">☆ <span>重点观察</span></a>
         <a class="{{ 'active' if page == 'hot_sectors' else '' }}" href="{{ url_for('analysis_hot_sectors') }}">◉ <span>热门板块</span></a>
         <a class="{{ 'active' if page == 'notifications' else '' }}" href="{{ url_for('notifications') }}">🔔 <span>通知</span>{% if unread_notifications %}<b class="nav-badge">{{ unread_notifications }}</b>{% endif %}</a>
-        <a class="{{ 'active' if page == 'summary' else '' }}" href="{{ url_for('analysis_summary') }}">◫ <span>汇总</span></a>
-        <a class="{{ 'active' if page == 'reviews' else '' }}" href="{{ url_for('analysis_reviews') }}">✓ <span>交易复盘</span></a>
-        <a class="{{ 'active' if page == 'recent' else '' }}" href="{{ url_for('analysis_recent') }}">📅 <span>近期表现</span></a>
-        <a class="{{ 'active' if page == 'timing' else '' }}" href="{{ url_for('analysis_timing') }}">⏰ <span>时机把握</span></a>
-        <a class="{{ 'active' if page == 'strategy' else '' }}" href="{{ url_for('analysis_strategy') }}">◇ <span>策略验证</span></a>
-        <a class="{{ 'active' if page == 'discipline' else '' }}" href="{{ url_for('analysis_discipline') }}">🧠 <span>情绪纪律</span></a>
+        <details id="submenu-review" class="nav-group" {% if page in ('summary', 'reviews', 'recent', 'timing', 'strategy', 'discipline') %}open{% endif %}>
+          <summary>◫ <span>交易复盘</span></summary>
+          <a class="{{ 'active' if page == 'summary' else '' }}" href="{{ url_for('analysis_summary') }}">汇总</a>
+          <a class="{{ 'active' if page == 'reviews' else '' }}" href="{{ url_for('analysis_reviews') }}">交易记录</a>
+          <a class="{{ 'active' if page == 'recent' else '' }}" href="{{ url_for('analysis_recent') }}">近期表现</a>
+          <a class="{{ 'active' if page == 'timing' else '' }}" href="{{ url_for('analysis_timing') }}">时机把握</a>
+          <a class="{{ 'active' if page == 'strategy' else '' }}" href="{{ url_for('analysis_strategy') }}">策略验证</a>
+          <a class="{{ 'active' if page == 'discipline' else '' }}" href="{{ url_for('analysis_discipline') }}">情绪纪律</a>
+        </details>
         <details id="submenu-admin" class="nav-group" {% if page in ('statements', 'import', 'account', 'three_day_dip', 'three_day_dip_pool', 'intraday_rebound') %}open{% endif %}>
           <summary>⚙ <span>后台管理</span></summary>
           <a class="{{ 'active' if page in ('statements', 'import') else '' }}" href="{{ url_for('statements') }}">交割单</a>
@@ -693,7 +696,6 @@
           <div id="portfolio-kline-chart" class="portfolio-kline-chart"></div>
         </div>
       </div>
-      <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
       <script>
       (function() {
         var backdrop = document.getElementById('portfolio-kline-backdrop');
@@ -703,6 +705,23 @@
         var empty = document.getElementById('portfolio-kline-empty');
         var chartElement = document.getElementById('portfolio-kline-chart');
         var chart = null;
+        var echartsPromise = null;
+
+        function loadEcharts() {
+          if (window.echarts) return Promise.resolve();
+          if (echartsPromise) return echartsPromise;
+          echartsPromise = new Promise(function(resolve, reject) {
+            var script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js';
+            script.onload = resolve;
+            script.onerror = function(error) {
+              echartsPromise = null;
+              reject(error);
+            };
+            document.head.appendChild(script);
+          });
+          return echartsPromise;
+        }
 
         function closeKline() {
           backdrop.hidden = true;
@@ -832,9 +851,12 @@
             range.textContent = '正在加载...';
             empty.hidden = true;
             chartElement.hidden = false;
-            fetch(button.getAttribute('data-kline-url'))
-              .then(function(response) { if (!response.ok) throw new Error('request failed'); return response.json(); })
-              .then(renderKline)
+            Promise.all([
+              fetch(button.getAttribute('data-kline-url'))
+                .then(function(response) { if (!response.ok) throw new Error('request failed'); return response.json(); }),
+              loadEcharts(),
+            ])
+              .then(function(results) { renderKline(results[0]); })
               .catch(function() {
                 range.textContent = '加载失败';
                 empty.textContent = 'K线数据加载失败，请稍后重试。';

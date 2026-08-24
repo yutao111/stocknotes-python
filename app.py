@@ -61,6 +61,9 @@ AUTO_SYNC_STATE = {
 }
 MARKET_INDEX_STATE_LOCK = threading.Lock()
 MARKET_INDEX_STATE = {"data": [], "updated_at": None, "error": None}
+MARKET_INDEX_CACHE_TTL_SECONDS = 30
+MARKET_INDEX_REFRESH_LOCK = threading.Lock()
+MARKET_INDEX_REFRESHING = False
 HOT_SECTORS_CACHE_LOCK = threading.Lock()
 HOT_SECTORS_CACHE = {"modules": {}, "updated_at": None}
 HOT_SECTORS_CACHE_TTL_SECONDS = 30
@@ -2123,6 +2126,24 @@ def market_index_status() -> dict:
         return {"data": list(MARKET_INDEX_STATE["data"]), "updated_at": MARKET_INDEX_STATE["updated_at"], "error": MARKET_INDEX_STATE["error"]}
 
 
+def refresh_market_indexes_in_background() -> None:
+    global MARKET_INDEX_REFRESHING
+    with MARKET_INDEX_REFRESH_LOCK:
+        if MARKET_INDEX_REFRESHING:
+            return
+        MARKET_INDEX_REFRESHING = True
+
+    def refresh() -> None:
+        global MARKET_INDEX_REFRESHING
+        try:
+            sync_market_indexes()
+        finally:
+            with MARKET_INDEX_REFRESH_LOCK:
+                MARKET_INDEX_REFRESHING = False
+
+    threading.Thread(target=refresh, daemon=True).start()
+
+
 def save_realtime_prices(db: sqlite3.Connection, quotes: dict[str, dict]) -> int:
     for stock_code, quote in quotes.items():
         db.execute(
@@ -2562,16 +2583,22 @@ def hot_sectors_data(force: bool = False) -> dict:
         ("hot_rank", fetch_hot_rank, "人气榜"),
     )
     modules: dict[str, dict] = {}
-    for key, provider, label in providers:
-        try:
-            modules[key] = {"records": df_records(provider(), 20), "error": None}
-        except Exception as error:
-            with HOT_SECTORS_CACHE_LOCK:
-                previous = HOT_SECTORS_CACHE["modules"].get(key)
-            modules[key] = {
-                "records": previous["records"] if previous else [],
-                "error": f"{label}：{error}",
-            }
+    with ThreadPoolExecutor(max_workers=len(providers)) as executor:
+        futures = {
+            executor.submit(provider): (key, label)
+            for key, provider, label in providers
+        }
+        for future in as_completed(futures):
+            key, label = futures[future]
+            try:
+                modules[key] = {"records": df_records(future.result(), 20), "error": None}
+            except Exception as error:
+                with HOT_SECTORS_CACHE_LOCK:
+                    previous = HOT_SECTORS_CACHE["modules"].get(key)
+                modules[key] = {
+                    "records": previous["records"] if previous else [],
+                    "error": f"{label}：{error}",
+                }
     with HOT_SECTORS_CACHE_LOCK:
         HOT_SECTORS_CACHE["modules"] = modules
         HOT_SECTORS_CACHE["updated_at"] = now
@@ -4122,8 +4149,14 @@ def portfolio_quotes():
 
 @app.get("/analysis/portfolio/indexes")
 def portfolio_indexes():
-    indexes, error = sync_market_indexes()
-    status = {"data": indexes, "updated_at": datetime.now().isoformat(timespec="seconds") if indexes else None, "error": error}
+    status = market_index_status()
+    if status["data"]:
+        updated_at = datetime.fromisoformat(status["updated_at"]) if status["updated_at"] else None
+        if updated_at is None or (datetime.now() - updated_at).total_seconds() >= MARKET_INDEX_CACHE_TTL_SECONDS:
+            refresh_market_indexes_in_background()
+    else:
+        indexes, error = sync_market_indexes()
+        status = {"data": indexes, "updated_at": datetime.now().isoformat(timespec="seconds") if indexes else None, "error": error}
     return jsonify(status)
 
 

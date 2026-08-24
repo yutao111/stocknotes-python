@@ -161,3 +161,4 @@
 }
 .hot-sectors-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start;margin-bottom:16px}.hot-sectors-panel[data-module="hot_rank"]{grid-column:1/-1}.hot-sectors-panel td{white-space:nowrap}.hot-sectors-panel td:nth-child(2) b,.hot-sectors-panel td:nth-child(2) small{display:block}.hot-sectors-panel td small{color:var(--muted);font-weight:normal}
 @media(max-width:900px){.hot-sectors-grid{grid-template-columns:1fr}.hot-sectors-panel[data-module="hot_rank"]{grid-column:auto}}
+.sidebar .nav-group>a{padding-left:44px}
