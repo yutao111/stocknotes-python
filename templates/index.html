@@ -1,0 +1,2304 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>StockNotes · 交割单分析</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><span>S</span><div><b>StockNotes</b><small>交割单分析台</small></div></div>
+      <nav>
+        <a class="{{ 'active' if page == 'portfolio' else '' }}" href="{{ url_for('analysis_portfolio') }}">▤ <span>持仓分析</span></a>
+        <a class="{{ 'active' if page in ('stocks', 'trade_detail') else '' }}" href="{{ url_for('analysis_stocks') }}">◒ <span>个股分析</span></a>
+        <a class="{{ 'active' if page == 'watchlist' else '' }}" href="{{ url_for('analysis_watchlist') }}">☆ <span>重点观察</span></a>
+        <a class="{{ 'active' if page == 'hot_sectors' else '' }}" href="{{ url_for('analysis_hot_sectors') }}">◉ <span>热门板块</span></a>
+        <a class="{{ 'active' if page == 'notifications' else '' }}" href="{{ url_for('notifications') }}">🔔 <span>通知</span>{% if unread_notifications %}<b class="nav-badge">{{ unread_notifications }}</b>{% endif %}</a>
+        <a class="{{ 'active' if page == 'summary' else '' }}" href="{{ url_for('analysis_summary') }}">◫ <span>汇总</span></a>
+        <a class="{{ 'active' if page == 'reviews' else '' }}" href="{{ url_for('analysis_reviews') }}">✓ <span>交易复盘</span></a>
+        <a class="{{ 'active' if page == 'recent' else '' }}" href="{{ url_for('analysis_recent') }}">📅 <span>近期表现</span></a>
+        <a class="{{ 'active' if page == 'timing' else '' }}" href="{{ url_for('analysis_timing') }}">⏰ <span>时机把握</span></a>
+        <a class="{{ 'active' if page == 'strategy' else '' }}" href="{{ url_for('analysis_strategy') }}">◇ <span>策略验证</span></a>
+        <a class="{{ 'active' if page == 'discipline' else '' }}" href="{{ url_for('analysis_discipline') }}">🧠 <span>情绪纪律</span></a>
+        <details id="submenu-admin" class="nav-group" {% if page in ('statements', 'import', 'account', 'three_day_dip', 'three_day_dip_pool', 'intraday_rebound') %}open{% endif %}>
+          <summary>⚙ <span>后台管理</span></summary>
+          <a class="{{ 'active' if page in ('statements', 'import') else '' }}" href="{{ url_for('statements') }}">交割单</a>
+          <a class="{{ 'active' if page == 'account' else '' }}" href="{{ url_for('account_management') }}">账户资金</a>
+          <details class="nav-subgroup" {% if page in ('three_day_dip', 'three_day_dip_pool', 'intraday_rebound') %}open{% endif %}>
+            <summary>提醒类型</summary>
+            <a class="{{ 'active' if page in ('three_day_dip', 'three_day_dip_pool') else '' }}" href="{{ url_for('three_day_dip_management') }}">三日低吸</a>
+            <a class="{{ 'active' if page == 'intraday_rebound' else '' }}" href="{{ url_for('intraday_rebound_management') }}">日内反弹</a>
+          </details>
+        </details>
+      </nav>
+      <div class="sidebar-note">先把客观成交处理干净，再讨论主观复盘。<br><strong>本版本只做这一条主链路。</strong></div>
+    </aside>
+    <main class="main{{ ' summary-page' if page == 'summary' else '' }}">
+      {% set return_to = request.full_path if request.query_string else request.path %}
+      <header class="top">
+        <div><small>STOCKNOTES / LOCAL</small><h1>{{ {'stocks': '个股分析', 'trade_detail': '交易复盘详情', 'portfolio': '持仓分析', 'watchlist': '重点观察', 'hot_sectors': '热门板块', 'notifications': '通知', 'summary': '汇总', 'reviews': '交易复盘', 'recent': '近期表现', 'timing': '时机把握', 'strategy': '策略验证', 'discipline': '情绪纪律', 'statements': '交割单', 'import': '导入交割单', 'account': '账户资金', 'three_day_dip': '三日低吸', 'three_day_dip_pool': '三日低吸池', 'intraday_rebound': '日内反弹'}.get(page, '后台管理') }}</h1></div>
+        <div class="workspace-tools">
+          <div class="local-badge">● SQLite 本地数据库</div>
+          <a class="database-backup" href="{{ url_for('export_database') }}" title="下载包含本机全部用户及所有业务数据的完整 SQLite 数据库">备份</a>
+          <form class="user-switcher" method="post" action="{{ url_for('switch_user') }}">
+            <input type="hidden" name="next" value="{{ return_to }}">
+            <label for="workspace-user">当前用户</label>
+            <select id="workspace-user" name="user_id" onchange="this.form.submit()" aria-label="切换当前用户">
+              {% for user in users %}
+              <option value="{{ user.id }}" {{ 'selected' if user.id == current_user.id else '' }}>{{ user.name }}</option>
+              {% endfor %}
+            </select>
+          </form>
+          <details class="notification-center" id="notification-center">
+            <summary aria-label="通知"><span class="notification-bell">♢</span><span>通知</span><b id="notification-badge" class="notification-badge" {{ 'hidden' if not unread_notifications else '' }}>{{ unread_notifications }}</b></summary>
+            <div class="notification-popup">
+              <div class="notification-heading"><div><strong>提醒通知</strong><small id="notification-count-text">{{ unread_notifications }} 条未读</small></div><button id="notification-read-all" type="button" {{ 'disabled' if not unread_notifications else '' }}>全部已读</button></div>
+              <div class="notification-list" id="notification-list">
+                {% for item in recent_notifications %}<button class="notification-item {{ 'unread' if not item.read_at else '' }}" type="button" data-id="{{ item.id }}"><span class="notification-stage {{ item.stage|lower }}">{{ '候选' if item.stage == 'CANDIDATE' else '确认' }}</span><span><b>{{ item.title }}</b><small>{{ item.content }}</small><time>{{ item.created_at[:16]|replace('T', ' ') }}</time></span></button>{% else %}<div class="notification-empty">还没有提醒通知。</div>{% endfor %}
+              </div>
+            </div>
+          </details>
+          <details class="user-manager">
+            <summary>管理用户</summary>
+            <div class="user-manager-popup">
+              <div class="user-manager-heading"><strong>本机用户工作区</strong><span>当前：{{ current_user.name }}</span></div>
+              <form class="user-form" method="post" action="{{ url_for('create_user') }}">
+                <input type="hidden" name="next" value="{{ return_to }}">
+                <label for="new-user-name">创建用户</label>
+                <div class="user-form-row"><input id="new-user-name" name="name" type="text" maxlength="50" placeholder="输入用户名" required><button type="submit">创建</button></div>
+              </form>
+              <form class="user-form" method="post" action="{{ url_for('rename_user', id=current_user.id) }}">
+                <input type="hidden" name="next" value="{{ return_to }}">
+                <label for="rename-user">重命名当前用户</label>
+                <div class="user-form-row"><input id="rename-user" name="name" type="text" maxlength="50" value="{{ current_user.name }}" required><button type="submit">保存</button></div>
+              </form>
+              <form class="user-form danger-zone" method="post" action="{{ url_for('delete_user', id=current_user.id) }}">
+                <input type="hidden" name="next" value="{{ return_to }}">
+                <strong>删除当前用户</strong>
+                <p>该用户的成交、持仓和分析数据会永久删除。请输入“{{ current_user.name }}”确认；最后一个用户无法删除。</p>
+                <label for="confirm-user-name">确认用户名</label>
+                <div class="user-form-row"><input id="confirm-user-name" name="confirm_name" type="text" autocomplete="off" required><button class="danger-button" type="submit">删除</button></div>
+              </form>
+            </div>
+          </details>
+        </div>
+      </header>
+      <script>(function(){var center=document.getElementById('notification-center'),badge=document.getElementById('notification-badge'),count=document.getElementById('notification-count-text'),list=document.getElementById('notification-list'),readAll=document.getElementById('notification-read-all');function esc(value){var node=document.createElement('span');node.textContent=value||'';return node.innerHTML}function render(data){var unread=data.unread_count||0;badge.textContent=unread;badge.hidden=!unread;count.textContent=unread+' 条未读';readAll.disabled=!unread;if(!data.notifications.length){list.innerHTML='<div class="notification-empty">还没有提醒通知。</div>';return}list.innerHTML=data.notifications.map(function(item){return '<button class="notification-item '+(item.read_at?'':'unread')+'" type="button" data-id="'+item.id+'"><span class="notification-stage '+item.stage.toLowerCase()+'">'+(item.stage==='CANDIDATE'?'候选':'确认')+'</span><span><b>'+esc(item.title)+'</b><small>'+esc(item.content)+'</small><time>'+esc(item.created_at.slice(0,16).replace('T',' '))+'</time></span></button>'}).join('')}function refresh(){fetch('{{ url_for("notifications_api") }}').then(function(response){if(response.ok)return response.json();throw new Error()}).then(render).catch(function(){})}list.addEventListener('click',function(event){var item=event.target.closest('.notification-item');if(!item||!item.classList.contains('unread'))return;fetch('/api/notifications/'+item.dataset.id+'/read',{method:'POST'}).then(refresh)});readAll.addEventListener('click',function(){fetch('{{ url_for("read_all_notifications") }}',{method:'POST'}).then(refresh)});center.addEventListener('toggle',function(){if(center.open)refresh()});setInterval(refresh,20000)}());</script>
+      <script>
+      window.renderUnifiedKline = function(element, payload, options) {
+        options = options || {};
+        var data = payload.data || [];
+        var points = payload.bs_points || [];
+        var dates = data.map(function(item) { return item.date; });
+        function ma(days) {
+          return data.map(function(item, index) {
+            if (index < days - 1) return null;
+            var total = 0;
+            for (var offset = 0; offset < days; offset += 1) total += data[index - offset].close;
+            return Number((total / days).toFixed(2));
+          });
+        }
+        function markerPoints(action, edge) {
+          return points.filter(function(point) { return point.action === action; }).map(function(point) {
+            var candle = data.find(function(item) { return item.date === point.date; });
+            return { value: [point.date, candle ? candle[edge] : point.price], tradePrice: point.price };
+          });
+        }
+        function compactVolume(value) {
+          return value >= 100000000 ? (value / 100000000).toFixed(2) + ' 亿手' : value >= 10000 ? (value / 10000).toFixed(2) + ' 万手' : value.toFixed(0) + ' 手';
+        }
+        function compactAmount(value) {
+          return value >= 100000000 ? (value / 100000000).toFixed(2) + ' 亿元' : value >= 10000 ? (value / 10000).toFixed(2) + ' 万元' : value.toFixed(2) + ' 元';
+        }
+        var ma5 = ma(5), ma10 = ma(10), ma20 = ma(20);
+        var series = [
+          { name: '日K', type: 'candlestick', data: data.map(function(item) { return [item.open, item.close, item.low, item.high]; }), itemStyle: { color: '#b95d4c', color0: '#22654d', borderColor: '#b95d4c', borderColor0: '#22654d' } },
+          { name: '买入 B', type: 'scatter', data: markerPoints('BUY', 'low'), symbol: 'circle', symbolSize: 4, z: 10, label: { show: true, formatter: 'B', position: 'bottom', distance: 4, color: '#b95d4c', fontSize: 10, fontWeight: 'bold' }, itemStyle: { color: '#b95d4c' } },
+          { name: '卖出 S', type: 'scatter', data: markerPoints('SELL', 'high'), symbol: 'diamond', symbolSize: 4, z: 10, label: { show: true, formatter: 'S', position: 'top', distance: 4, color: '#22654d', fontSize: 10, fontWeight: 'bold' }, itemStyle: { color: '#22654d' } },
+          { name: 'MA5', type: 'line', data: ma5, showSymbol: false, connectNulls: false, lineStyle: { width: 1.2, color: '#f59e0b' } },
+          { name: 'MA10', type: 'line', data: ma10, showSymbol: false, connectNulls: false, lineStyle: { width: 1.2, color: '#2563eb' } },
+          { name: 'MA20', type: 'line', data: ma20, showSymbol: false, connectNulls: false, lineStyle: { width: 1.2, color: '#9333ea' } },
+          { name: '成交量（手）', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: data.map(function(item) { return { value: item.volume, itemStyle: { color: item.close >= item.open ? '#b95d4c' : '#22654d' } }; }) }
+        ];
+        if (options.avgCost !== undefined && options.avgCost !== null) {
+          series[0].markLine = { silent: true, symbol: ['none', 'none'], label: { formatter: '持仓成本 ' + Number(options.avgCost).toFixed(2) }, lineStyle: { color: '#59645f', type: 'dashed', width: 1.5 }, data: [{ yAxis: Number(options.avgCost) }] };
+        }
+        var chart = options.chart || echarts.init(element);
+        chart.clear();
+        chart.setOption({
+          animation: false,
+          legend: { top: 0, data: ['日K', '买入 B', '卖出 S', 'MA5', 'MA10', 'MA20', '成交量（手）'] },
+          tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, formatter: function(params) {
+            var candle = params.find(function(param) { return param.seriesName === '日K'; });
+            if (!candle) return '';
+            var item = data[candle.dataIndex];
+            var previous = candle.dataIndex > 0 ? data[candle.dataIndex - 1].close : null;
+            var change = previous === null ? null : item.close - previous;
+            var rate = previous === null ? null : change / previous * 100;
+            return ['<b>' + item.date + '</b>', '开盘：' + item.open.toFixed(2), '收盘：' + item.close.toFixed(2), '最高：' + item.high.toFixed(2), '最低：' + item.low.toFixed(2), '涨跌额：' + (change === null ? '--' : change.toFixed(2)), '涨幅：' + (rate === null ? '--' : rate.toFixed(2) + '%'), '成交量：' + compactVolume(item.volume), '成交额：' + compactAmount(item.amount)].join('<br>');
+          } },
+          axisPointer: { link: [{ xAxisIndex: 'all' }] },
+          grid: [{ left: 58, right: 24, top: 42, height: '58%' }, { left: 58, right: 24, top: '73%', height: '13%' }],
+          xAxis: [{ type: 'category', data: dates, boundaryGap: true, axisLabel: { hideOverlap: true } }, { type: 'category', gridIndex: 1, data: dates, boundaryGap: true, axisLabel: { show: false } }],
+          yAxis: [{ scale: true }, { min: 0, gridIndex: 1, axisLabel: { formatter: function(value) { return value >= 100000000 ? (value / 100000000).toFixed(1) + '亿' : value >= 10000 ? (value / 10000).toFixed(0) + '万' : value.toFixed(0); }, fontSize: 10 } }],
+          dataZoom: [{ type: 'inside', xAxisIndex: [0, 1], start: Math.max(0, 100 - 6000 / data.length), end: 100 }, { type: 'slider', xAxisIndex: [0, 1], bottom: 5, height: 20, start: Math.max(0, 100 - 6000 / data.length), end: 100 }],
+          series: series
+        });
+        requestAnimationFrame(function() { chart.resize(); });
+        return chart;
+      };
+      </script>
+      {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="messages">{% for category, message in messages %}<div class="message {{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}{% endwith %}
+
+      {% if page == 'stocks' %}
+      <section class="intro">
+        <div><span class="eyebrow">STOCK ANALYSIS</span><p>左侧按个股查看整体表现，右侧汇总已平仓周期并展示逐笔交易数据。</p></div>
+        <a class="button secondary" href="{{ url_for('analysis_summary') }}">查看汇总 →</a>
+      </section>
+      <section class="stock-layout">
+        <aside class="stock-list panel">
+          <div class="stock-list-heading"><div class="panel-title">个股 · 已平仓</div><form method="get" action="{{ url_for('analysis_stocks') }}"><label for="stock-sort">排序</label><select id="stock-sort" name="sort" onchange="this.form.submit()"><option value="recent" {{ 'selected' if stock_sort == 'recent' else '' }}>最近交易</option><option value="profit" {{ 'selected' if stock_sort == 'profit' else '' }}>盈利最高</option><option value="loss" {{ 'selected' if stock_sort == 'loss' else '' }}>亏损最多</option><option value="trades" {{ 'selected' if stock_sort == 'trades' else '' }}>交易周期最多</option><option value="win_rate" {{ 'selected' if stock_sort == 'win_rate' else '' }}>胜率最高</option></select></form></div>
+          <form class="stock-filter" method="get" action="{{ url_for('analysis_stocks') }}">
+            <input type="hidden" name="sort" value="{{ stock_sort }}">
+            <label for="stock-query">筛选股票</label>
+            <div><input id="stock-query" name="q" type="search" value="{{ stock_query }}" placeholder="输入名称或代码" autocomplete="off"><button type="submit">筛选</button>{% if stock_query %}<a href="{{ url_for('analysis_stocks', sort=stock_sort) }}">清除</a>{% endif %}</div>
+          </form>
+          {% if stock_query %}<div class="filter-result">“{{ stock_query }}”找到 {{ stocks|length }} 只股票</div>{% endif %}
+          <div class="stock-rows">
+            {% for stock in stocks %}
+            <a data-code="{{ stock.stock_code }}" class="stock-row stock-row-detailed {{ 'active' if stock.stock_code == selected else '' }}" href="{{ url_for('analysis_stocks', code=stock.stock_code, sort=stock_sort, q=stock_query) }}">
+              <div class="stock-row-main">
+                <b>{{ stock.stock_name }} <span class="stock-row-code">{{ stock.stock_code }}</span></b>
+                <div class="stock-row-stats">
+                  <div><span>累计盈亏</span><strong class="{{ 'gain' if stock.profit >= 0 else 'loss' }}">{{ '+' if stock.profit > 0 else '' }}{{ stock.profit|money }} 元</strong></div>
+                  <div><span>累计收益率</span><strong class="{{ 'gain' if stock.profit_rate >= 0 else 'loss' }}">{{ '+' if stock.profit_rate > 0 else '' }}{{ stock.profit_rate|percent }}</strong></div>
+                  <div><span>交易总次数</span><strong>{{ stock.trades }} 笔</strong></div>
+                  <div><span>最后交易</span><strong>{{ stock.last_trade_at[:10] }}</strong></div>
+                  <div><span>最大盈利</span><strong class="gain">{{ ('+' ~ (stock.max_profit|money)) if stock.max_profit is not none else '--' }}</strong></div>
+                  <div><span>最大亏损</span><strong class="loss">{{ (stock.max_loss|money) if stock.max_loss is not none else '--' }}</strong></div>
+                  <div><span>平均持仓天数</span><strong>{{ '%.1f'|format(stock.avg_holding_days) }} 天</strong></div>
+                  <div><span>胜率</span><strong>{{ '%.0f'|format(stock.win_rate * 100) }}%</strong></div>
+                </div>
+              </div>
+            </a>
+            {% else %}
+            <div class="empty">{{ '没有匹配名称或代码的股票。' if stock_query else '还没有已平仓交易，请先导入交割单。' }}</div>
+            {% endfor %}
+          </div>
+        </aside>
+        <section class="stock-detail panel">
+          {% if detail %}
+          {% set ds = detail.summary %}
+           <div class="panel-title stock-detail-title"><span>{{ detail.name }} · {{ detail.code }} {% if detail.position %}<span class="pill">当前持仓</span>{% else %}<span class="pill">已平仓</span>{% endif %}</span><button class="detail-link kline-popup-trigger stock-kline-trigger" type="button" data-kline-url="{{ url_for('stocks_kline', stock_code=detail.code) }}"><span aria-hidden="true">▥</span> 看K线</button></div>
+          {% if detail.position %}
+          {% set cp = detail.position %}
+          <section class="current-position-card" id="current-position">
+            <div class="current-position-head"><div><span class="eyebrow">OPEN POSITION</span><h3>当前持仓</h3></div>{% if cp.open_episode_id %}<a class="detail-link" href="{{ url_for('analysis_trade_detail', episode_id=cp.open_episode_id, sort=stock_sort, q=stock_query) }}">查看成交与交易计划 →</a>{% endif %}</div>
+            <div class="current-position-grid">
+              <div><span>持仓数量</span><b>{{ cp.quantity|money }} 股</b></div><div><span>含费持仓成本</span><b>{{ cp.total_cost|money }} 元</b></div><div><span>成本均价</span><b>{{ cp.avg_cost|money }}</b></div><div><span>持仓天数</span><b>{{ cp.holding_days }} 天</b></div>
+              <div><span>最近收盘价</span>{% if cp.latest_price is not none %}<b>{{ cp.latest_price|money }}</b><small>{{ cp.price_date }}</small>{% else %}<b>暂无行情</b>{% endif %}</div><div><span>浮动盈亏</span>{% if cp.unrealized_profit is not none %}<b class="{{ 'gain' if cp.unrealized_profit >= 0 else 'loss' }}">{{ '+' if cp.unrealized_profit > 0 else '' }}{{ cp.unrealized_profit|money }}</b><small>{{ cp.unrealized_rate|percent }}</small>{% else %}<b>--</b>{% endif %}</div>
+            </div>
+          </section>
+          {% endif %}
+          <div class="stock-summary-cards">
+            <div class="stock-summary-card"><span>总交易笔数</span><b>{{ ds.trades }}<small>笔</small></b></div>
+            <div class="stock-summary-card"><span>胜率</span><b>{{ '%.1f'|format(ds.win_rate * 100) }}%</b></div>
+            <div class="stock-summary-card"><span>总盈亏</span><b class="{{ 'gain' if ds.profit >= 0 else 'loss' }}">{{ '+' if ds.profit > 0 else '' }}{{ ds.profit|money }}<small>元</small></b></div>
+            <div class="stock-summary-card"><span>盈亏比</span><b>{{ '%.2f'|format(ds.profit_factor) if ds.profit_factor is not none else '--' }}</b></div>
+          </div>
+          <div class="section-heading stock-trade-heading"><div><span class="eyebrow">CLOSED TRADES</span><h3>交易明细</h3></div><small>按卖出时间倒序 · 完整交易周期口径</small></div>
+          <div class="table-wrap stock-trade-table"><table><thead><tr><th>#</th><th>买入日期</th><th>买入价</th><th>卖出日期</th><th>卖出价</th><th>股数</th><th>盈亏</th><th>收益率</th><th>持仓天数</th><th>复盘</th></tr></thead><tbody>
+            {% for episode in detail.episodes %}
+            <tr class="episode-row-clickable" {% if episode.review_status == 'COMPLETED' and episode.review_data %}data-review='{{ episode.review_data|tojson }}' title="查看复盘详情"{% else %}data-href="{{ url_for('analysis_trade_detail', episode_id=episode.id, sort=stock_sort, q=stock_query) }}" title="去复盘"{% endif %}>
+              <td>{{ episode.index }}</td><td>{{ episode.buy_at_display }}</td><td>{{ '%.2f'|format(episode.buy_price) }}</td><td>{{ episode.sell_at_display }}</td><td>{{ '%.2f'|format(episode.sell_price) }}</td><td>{{ '%.0f'|format(episode.quantity) }}</td><td class="{{ 'gain' if episode.profit >= 0 else 'loss' }}">{{ '+' if episode.profit > 0 else '' }}{{ episode.profit|money }}</td><td class="{{ 'gain' if episode.profit_rate >= 0 else 'loss' }}">{{ '+' if episode.profit_rate > 0 else '' }}{{ '%.2f'|format(episode.profit_rate * 100) }}%</td><td>{{ episode.holding_display }}</td>
+              <td>{% if episode.review_status == 'COMPLETED' %}<span class="episode-status closed">已复盘</span>{% elif episode.review_status == 'DRAFT' %}<span class="episode-status open">草稿</span>{% else %}<span class="episode-status pending">未复盘</span>{% endif %}</td>
+            </tr>
+            {% else %}<tr><td colspan="10" class="empty">暂无已平仓交易。</td></tr>{% endfor %}
+          </tbody></table></div>
+          {% else %}
+          <div class="empty">点击左侧个股查看具体买卖记录。</div>
+          {% endif %}
+        </section>
+      </section>
+      <div class="review-modal-backdrop" id="stock-review-modal-backdrop" hidden>
+        <div class="review-modal" role="dialog" aria-modal="true" aria-label="复盘信息">
+          <button type="button" class="review-modal-close" id="stock-review-modal-close" aria-label="关闭">×</button>
+          <div id="stock-review-modal-content"></div>
+        </div>
+      </div>
+      <div class="review-modal-backdrop" id="stock-kline-backdrop" hidden>
+        <div class="portfolio-kline-modal" role="dialog" aria-modal="true" aria-labelledby="stock-kline-title">
+          <button type="button" class="review-modal-close" id="stock-kline-close" aria-label="关闭">×</button>
+          <div class="portfolio-kline-modal-head"><div><span class="eyebrow">PRICE ACTION</span><h3 id="stock-kline-title">个股 K线</h3></div><small id="stock-kline-range">正在加载...</small></div>
+          <div class="portfolio-ma-legend"><span class="ma5">MA5 五日线</span><span class="ma10">MA10 十日线</span><span class="ma20">MA20 二十日线</span></div>
+          <div id="stock-kline-empty" class="empty" hidden></div><div id="stock-kline-chart" class="portfolio-kline-chart"></div>
+        </div>
+      </div>
+      <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+      <script>
+        document.addEventListener('DOMContentLoaded', function() {
+        const list = document.querySelector('.stock-rows');
+        const detailPanel = document.querySelector('.stock-detail');
+        if (!list || !detailPanel) return;
+
+        async function loadDetail(url) {
+          try {
+            const response = await fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+            if (!response.ok) { window.location.href = url; return; }
+            const html = await response.text();
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const nextDetail = doc.querySelector('.stock-detail');
+            if (!nextDetail) { window.location.href = url; return; }
+            detailPanel.innerHTML = nextDetail.innerHTML;
+            list.querySelectorAll('.stock-row.active').forEach(function(row) {
+              row.classList.remove('active');
+            });
+            const code = new URL(url, window.location.href).searchParams.get('code');
+            if (code) {
+              const target = list.querySelector('[data-code="' + code + '"]');
+              if (target) target.classList.add('active');
+            }
+            history.pushState({ url: url }, '', url);
+          } catch (error) {
+            window.location.href = url;
+          }
+        }
+
+        list.addEventListener('click', function(event) {
+          const anchor = event.target.closest('a.stock-row');
+          if (!anchor) return;
+          event.preventDefault();
+          loadDetail(anchor.href);
+        });
+
+        window.addEventListener('popstate', function(event) {
+          loadDetail((event.state && event.state.url) || window.location.href);
+        });
+
+        const modalBackdrop = document.getElementById('stock-review-modal-backdrop');
+        const modalContent = document.getElementById('stock-review-modal-content');
+         const modalCloseBtn = document.getElementById('stock-review-modal-close');
+         const klineBackdrop = document.getElementById('stock-kline-backdrop');
+         const klineCloseBtn = document.getElementById('stock-kline-close');
+         const klineTitle = document.getElementById('stock-kline-title');
+         const klineRange = document.getElementById('stock-kline-range');
+         const klineEmpty = document.getElementById('stock-kline-empty');
+         const klineElement = document.getElementById('stock-kline-chart');
+         let klineChart = null;
+
+         function closeStockKline() {
+           klineBackdrop.hidden = true;
+           document.body.style.overflow = '';
+         }
+         function renderStockKline(payload) {
+           const data = payload.data || [];
+           klineTitle.textContent = payload.stock_name + ' · ' + payload.stock_code + ' K线';
+           if (!data.length) {
+              klineRange.textContent = payload.sync_attempted ? '历史行情获取完成' : '暂无历史行情';
+              klineEmpty.textContent = payload.sync_error ? '历史行情获取失败：' + payload.sync_error : '暂无该股票历史行情，请稍后重试。';
+             klineEmpty.hidden = false;
+             klineElement.hidden = true;
+             return;
+           }
+           klineEmpty.hidden = true;
+           klineElement.hidden = false;
+           klineRange.textContent = data[0].date + ' 至 ' + data[data.length - 1].date + ' · ' + data.length + ' 个交易日';
+           if (typeof echarts === 'undefined') { klineEmpty.textContent = 'K线组件加载失败，请检查网络后重试。'; klineEmpty.hidden = false; klineElement.hidden = true; return; }
+           klineChart = window.renderUnifiedKline(klineElement, payload);
+           return;
+           if (!klineChart) klineChart = echarts.init(klineElement);
+           function ma(days) { return data.map(function(item, index) { if (index < days - 1) return null; var total = 0; for (var offset = 0; offset < days; offset += 1) total += data[index - offset].close; return Number((total / days).toFixed(2)); }); }
+           function markerPoints(action, edge) { return (payload.bs_points || []).filter(function(point) { return point.action === action; }).map(function(point) { var candle = data.find(function(item) { return item.date === point.date; }); return { value: [point.date, candle ? candle[edge] : point.price], tradePrice: point.price }; }); }
+           var ma5 = ma(5), ma10 = ma(10), ma20 = ma(20);
+           klineChart.setOption({
+             animation: false, legend: { top: 0, data: ['日K', '买入 B', '卖出 S', 'MA5', 'MA10', 'MA20', '成交量'] },
+             tooltip: {
+               trigger: 'axis', axisPointer: { type: 'cross' },
+               formatter: function(params) {
+                 var candle = params.find(function(param) { return param.seriesName === '日K'; });
+                 if (!candle) return '';
+                 var index = candle.dataIndex;
+                 var item = data[index];
+                 var previous = index > 0 ? data[index - 1].close : null;
+                 var change = previous === null ? null : item.close - previous;
+                 var rate = previous === null ? null : change / previous * 100;
+                 function compact(value, unit) {
+                   if (value === null || value === undefined || isNaN(value)) return '--';
+                   if (unit === 'volume') return value >= 100000000 ? (value / 100000000).toFixed(2) + ' 亿手' : value >= 10000 ? (value / 10000).toFixed(2) + ' 万手' : value.toFixed(0) + ' 手';
+                   return value >= 100000000 ? (value / 100000000).toFixed(2) + ' 亿元' : value >= 10000 ? (value / 10000).toFixed(2) + ' 万元' : value.toFixed(2) + ' 元';
+                 }
+                 return ['<b>' + item.date + '</b>', '开盘：' + item.open.toFixed(2), '收盘：' + item.close.toFixed(2), '最高：' + item.high.toFixed(2), '最低：' + item.low.toFixed(2), '涨跌额：' + (change === null ? '--' : change.toFixed(2)), '涨幅：' + (rate === null ? '--' : rate.toFixed(2) + '%'), '成交量：' + compact(item.volume, 'volume'), '成交额：' + compact(item.amount, 'amount')].join('<br>');
+               }
+             },
+             grid: [{ left: 58, right: 24, top: 42, height: '58%' }, { left: 58, right: 24, top: '73%', height: '13%' }],
+             xAxis: [{ type: 'category', data: data.map(function(item) { return item.date; }), boundaryGap: true }, { type: 'category', gridIndex: 1, data: data.map(function(item) { return item.date; }), axisLabel: { show: false } }],
+             yAxis: [{ scale: true }, { min: 0, gridIndex: 1, axisLabel: { formatter: function(value) { return value >= 100000000 ? (value / 100000000).toFixed(1) + '亿' : value >= 10000 ? (value / 10000).toFixed(0) + '万' : value.toFixed(0); } } }],
+             dataZoom: [{ type: 'inside', xAxisIndex: [0, 1] }, { type: 'slider', xAxisIndex: [0, 1], bottom: 5, height: 20 }],
+             series: [
+               { name: '日K', type: 'candlestick', data: data.map(function(item) { return [item.open, item.close, item.low, item.high]; }), itemStyle: { color: '#b95d4c', color0: '#22654d', borderColor: '#b95d4c', borderColor0: '#22654d' } },
+               { name: '买入 B', type: 'scatter', data: markerPoints('BUY', 'low'), symbolSize: 4, z: 10, label: { show: true, formatter: 'B', position: 'bottom', distance: 4, color: '#b95d4c', fontSize: 10, fontWeight: 'bold' }, itemStyle: { color: '#b95d4c' } },
+               { name: '卖出 S', type: 'scatter', data: markerPoints('SELL', 'high'), symbol: 'diamond', symbolSize: 4, z: 10, label: { show: true, formatter: 'S', position: 'top', distance: 4, color: '#22654d', fontSize: 10, fontWeight: 'bold' }, itemStyle: { color: '#22654d' } },
+               { name: 'MA5', type: 'line', data: ma5, showSymbol: false, lineStyle: { color: '#f59e0b', width: 1.2 } },
+               { name: 'MA10', type: 'line', data: ma10, showSymbol: false, lineStyle: { color: '#2563eb', width: 1.2 } },
+               { name: 'MA20', type: 'line', data: ma20, showSymbol: false, lineStyle: { color: '#9333ea', width: 1.2 } },
+                { name: '成交量（手）', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: data.map(function(item) { return { value: item.volume, itemStyle: { color: item.close >= item.open ? '#b95d4c' : '#22654d' } }; }) }
+             ]
+           });
+           requestAnimationFrame(function() { klineChart.resize(); });
+         }
+
+        function stockSection(title, body) {
+          return body ? '<div class="review-modal-section"><h4>' + title + '</h4><p>' + body + '</p></div>' : '';
+        }
+        function esc(text) {
+          return String(text == null ? '' : text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+        function openStockReview(json) {
+          const d = JSON.parse(json);
+          let html = '';
+          html += '<div class="review-modal-head"><b>' + esc(d.stock_code) + ' ' + esc(d.stock_name) + '</b><span>' + (d.completed_at ? '复盘日期 ' + esc(d.completed_at) : '') + '</span></div>';
+          html += '<div class="review-modal-meta">';
+          html += '<div><span>判断结论</span><b class="judgement">' + esc(d.judgement_label) + '</b></div>';
+          html += '<div><span>主要问题</span><b>' + esc(d.main_problem_label) + '</b></div>';
+          html += '<div><span>信心评分</span><b>' + (d.confidence_level ? esc(d.confidence_level) + ' / 5' : '未填写') + '</b></div>';
+          html += '</div>';
+          if (d.reason_labels && d.reason_labels.length) {
+            html += '<div class="review-modal-reasons"><h4>交易类型</h4><div class="review-modal-reason-chips">' + d.reason_labels.map(function (label) { return '<span>' + esc(label) + '</span>'; }).join('') + '</div></div>';
+          }
+          html += stockSection('为什么买', esc(d.trade_reason));
+          html += stockSection('为什么卖', esc(d.sell_reason));
+          html += stockSection('复盘笔记', esc(d.review_note));
+          html += stockSection('下一步行动', esc(d.next_action));
+          if (d.expected_profit_percent || d.expected_target_price || d.stop_loss_price || d.expected_holding_days) {
+            const plan = [];
+            if (d.expected_profit_percent) { plan.push('预期空间 ' + d.expected_profit_percent + '%'); }
+            if (d.expected_target_price) { plan.push('目标价 ' + d.expected_target_price); }
+            if (d.stop_loss_price) { plan.push('止损 ' + d.stop_loss_price); }
+            if (d.expected_holding_days) { plan.push('持有 ' + d.expected_holding_days + ' 天'); }
+            html += stockSection('买入时计划', esc(plan.join(' · ')));
+          }
+          modalContent.innerHTML = html;
+          modalBackdrop.hidden = false;
+          document.body.style.overflow = 'hidden';
+        }
+        function closeStockReview() {
+          modalBackdrop.hidden = true;
+          document.body.style.overflow = '';
+        }
+
+         detailPanel.addEventListener('click', function(event) {
+           const klineButton = event.target.closest('.stock-kline-trigger');
+           if (klineButton) {
+             klineBackdrop.hidden = false;
+             document.body.style.overflow = 'hidden';
+             klineRange.textContent = '正在加载...';
+             klineEmpty.hidden = true;
+             klineElement.hidden = false;
+             klineRange.textContent = '正在获取历史行情...';
+             fetch(klineButton.getAttribute('data-kline-url')).then(function(response) {
+               if (!response.ok) throw new Error('request failed');
+               return response.json();
+             }).then(renderStockKline).catch(function(error) {
+               klineRange.textContent = '加载失败';
+               klineEmpty.textContent = error.message || 'K线数据加载失败，请稍后重试。';
+               klineEmpty.hidden = false;
+               klineElement.hidden = true;
+             });
+             return;
+           }
+           const row = event.target.closest('tr.episode-row-clickable');
+          if (!row) return;
+          if (row.hasAttribute('data-review')) {
+            openStockReview(row.getAttribute('data-review'));
+            return;
+          }
+          if (row.hasAttribute('data-href')) {
+            window.location.href = row.getAttribute('data-href');
+          }
+        });
+
+        modalCloseBtn.addEventListener('click', closeStockReview);
+         modalBackdrop.addEventListener('click', function(event) {
+           if (event.target === modalBackdrop) closeStockReview();
+         });
+         klineCloseBtn.addEventListener('click', closeStockKline);
+         klineBackdrop.addEventListener('click', function(event) {
+           if (event.target === klineBackdrop) closeStockKline();
+         });
+         document.addEventListener('keydown', function(event) {
+           if (event.key === 'Escape') closeStockReview();
+           if (event.key === 'Escape' && !klineBackdrop.hidden) closeStockKline();
+         });
+        });
+        </script>
+      {% elif page == 'trade_detail' %}
+      {% set ep = trade_detail.episode %}
+      <section class="intro trade-detail-intro">
+        <div><span class="eyebrow">TRADE REVIEW / PHASE 1</span><h2>{{ ep.stock_name }} <small>{{ ep.stock_code }}</small></h2><p>{{ ep.buy_date }} 建仓{% if ep.status == 'CLOSED' %}，{{ ep.sell_date }} 完全退出{% else %}，当前仍在持仓{% endif %}。</p></div>
+        <a class="button secondary neutral-action" href="{{ url_for('analysis_stocks', code=ep.stock_code, sort=stock_sort, q=stock_query) }}">← 返回个股分析</a>
+      </section>
+      <section class="trade-result-card panel {{ 'positive' if ep.profit >= 0 else 'negative' }}">
+        <div><span>实际盈亏</span><strong class="{{ 'gain' if ep.profit >= 0 else 'loss' }}">{{ ep.profit|money }}</strong><small>{{ ep.profit_rate|percent }} · {{ '已平仓' if ep.status == 'CLOSED' else '持仓中，仅显示已实现盈亏' }}</small></div>
+        <div class="trade-result-grid">
+          <div><small>买入日期</small><b>{{ ep.buy_date }}</b></div><div><small>卖出日期</small><b>{{ ep.sell_date or '-' }}</b></div>
+          <div><small>买入均价</small><b>{{ ep.buy_price|money }}</b></div><div><small>卖出均价</small><b>{{ ep.sell_price|money if ep.status == 'CLOSED' else '-' }}</b></div>
+          <div><small>累计数量</small><b>{{ ep.quantity|money }}</b></div><div><small>持仓天数</small><b>{{ ep.holding_days }} 天</b></div>
+          <div><small>含费买入成本</small><b>{{ ep.buy_cost|money }}</b></div><div><small>卖出净收入</small><b>{{ ep.sell_income|money }}</b></div>
+          <div><small>交易费用</small><b>{{ ep.fees|money }}</b></div><div><small>交易状态</small><b>{{ '已平仓' if ep.status == 'CLOSED' else '持仓中' }}</b></div>
+        </div>
+      </section>
+      {% if trade_detail.chart %}<section class="panel"><div class="panel-title">交易过程</div><div class="chart-box"><div class="chart-legend"><span class="legend-dot buy"></span>买入 <span class="legend-dot sell"></span>卖出 <span class="legend-dot label"></span>平仓盈亏</div><div class="chart-wrap">{{ trade_detail.chart|safe }}</div></div></section>{% endif %}
+      <section class="panel excursion-panel">
+        <div class="panel-title">实际走势 · MFE / MAE</div>
+        {% if trade_detail.metrics %}
+        <div class="excursion-grid">
+          <div class="metric"><span>MFE 最大浮盈</span><b class="gain">{{ trade_detail.metrics.mfe|percent }}</b><small>持仓期最高 {{ trade_detail.metrics.highest_price|money }}</small></div>
+          <div class="metric"><span>MAE 最大浮亏</span><b class="loss">{{ trade_detail.metrics.mae|percent }}</b><small>持仓期最低 {{ trade_detail.metrics.lowest_price|money }}</small></div>
+          <div class="metric"><span>利润捕获率</span><b>{{ (trade_detail.metrics.capture_rate|percent) if trade_detail.metrics.capture_rate is not none else '不可计算' }}</b><small>实际收益 / 最大可实现收益</small></div>
+          <div class="metric"><span>行情区间</span><b class="excursion-range">{{ trade_detail.metrics.data_start_date }} ~ {{ trade_detail.metrics.data_end_date }}</b><small>来源 {{ trade_detail.metrics.price_source }} · 买入基准 {{ trade_detail.metrics.buy_price|money }}</small></div>
+        </div>
+        {% else %}
+        <div class="excursion-empty">暂无历史行情数据。点击下方按钮，从 AkShare 同步持仓期间的每日最高 / 最低价后计算 MFE、MAE 与利润捕获率。</div>
+        {% endif %}
+        <form class="excursion-sync" method="post" action="{{ url_for('sync_trade_prices', episode_id=ep.id) }}">
+          <input type="hidden" name="sort" value="{{ stock_sort }}">
+          <input type="hidden" name="q" value="{{ stock_query }}">
+          <button class="button secondary" type="submit">同步行情并计算</button>
+        </form>
+      </section>
+      <section class="panel diagnosis-panel">
+        <div class="panel-title">交易诊断</div>
+        <div class="diagnosis-list">
+          {% for item in trade_detail.diagnosis %}
+          <div class="diagnosis-item {{ item.severity }}">
+            <span class="diagnosis-dot"></span>
+            <div><b>{{ item.title }}</b><p>{{ item.message }}</p></div>
+          </div>
+          {% endfor %}
+        </div>
+        <p class="hint">诊断基于客观成交、计划止损 / 目标价与持仓期行情自动生成，仅作辅助参考，不构成投资建议。</p>
+      </section>
+      <section class="trade-detail-columns">
+        <div class="panel"><div class="panel-title">买入成交 <span class="pill">{{ trade_detail.buys|length }} 笔</span></div><div class="table-wrap"><table><thead><tr><th>日期</th><th>时间</th><th>角色</th><th>数量</th><th>价格</th><th>金额</th></tr></thead><tbody>{% for row in trade_detail.buys %}<tr><td>{{ row.trade_date }}</td><td>{{ row.trade_time }}</td><td>{{ '首次建仓' if row.role == 'ENTRY' else '加仓' }}</td><td>{{ row.attributed_quantity|money }}</td><td>{{ row.deal_price|money }}</td><td>{{ row.deal_amount|money }}</td></tr>{% endfor %}</tbody></table></div></div>
+        <div class="panel"><div class="panel-title">卖出成交 <span class="pill">{{ trade_detail.sells|length }} 笔</span></div><div class="table-wrap"><table><thead><tr><th>日期</th><th>时间</th><th>角色</th><th>数量</th><th>价格</th><th>金额</th></tr></thead><tbody>{% for row in trade_detail.sells %}<tr><td>{{ row.trade_date }}</td><td>{{ row.trade_time }}</td><td>{{ '完全退出' if row.role == 'EXIT' else '减仓' }}</td><td>{{ row.attributed_quantity|money }}</td><td>{{ row.deal_price|money }}</td><td>{{ row.deal_amount|money }}</td></tr>{% else %}<tr><td colspan="6" class="empty">当前交易周期尚未卖出。</td></tr>{% endfor %}</tbody></table></div></div>
+      </section>
+      <details class="panel fifo-details"><summary>FIFO 成本匹配明细（{{ trade_detail.matches|length }} 条）</summary><div class="table-wrap"><table><thead><tr><th>买入日期</th><th>卖出日期</th><th>数量</th><th>买入成本</th><th>卖出收入</th><th>盈亏</th><th>收益率</th></tr></thead><tbody>{% for row in trade_detail.matches %}<tr><td>{{ row.buy_date }}</td><td>{{ row.sell_date }}</td><td>{{ row.quantity|money }}</td><td>{{ row.buy_cost|money }}</td><td>{{ row.sell_income|money }}</td><td class="{{ 'gain' if row.profit >= 0 else 'loss' }}">{{ row.profit|money }}</td><td class="{{ 'gain' if row.profit >= 0 else 'loss' }}">{{ row.profit_rate|percent }}</td></tr>{% else %}<tr><td colspan="7" class="empty">尚无已实现 FIFO 匹配。</td></tr>{% endfor %}</tbody></table></div></details>
+      <section class="panel review-form-panel">
+        <div class="panel-title">我的交易复盘</div>
+        {% if trade_detail.review and trade_detail.review.review_status == 'COMPLETED' %}<span class="review-badge completed">已复盘</span>{% elif trade_detail.review %}<span class="review-badge draft">草稿</span>{% else %}<span class="review-badge">未复盘</span>{% endif %}
+        {% set rv = trade_detail.review %}
+        {% if rv and rv.review_status == 'COMPLETED' and not request.args.get('edit') %}
+        <div class="review-readonly">
+          <div class="review-section">
+            <div class="review-section-title">交易逻辑类型</div>
+            <div class="reason-type-grid">
+              {% for rt in trade_detail.review_reason_types %}<span class="reason-chip readonly"><span>{{ review_reason_labels[rt] }}</span></span>{% else %}<p class="hint">未选择</p>{% endfor %}
+            </div>
+          </div>
+          <div class="review-section">
+            <div class="review-section-title">我的交易逻辑</div>
+            <p class="review-readonly-line"><b>为什么买</b>{{ rv.trade_reason or '未填写' }}</p>
+            <p class="review-readonly-line"><b>为什么卖</b>{{ rv.sell_reason or '未填写' }}</p>
+          </div>
+          <div class="review-section">
+            <div class="review-section-title">买入时预期</div>
+            <div class="review-field-grid">
+              <div class="review-readonly-field"><span>预期上涨空间</span><b>{{ rv.expected_profit_percent ~ '%' if rv.expected_profit_percent is not none else '未填写' }}</b></div>
+              <div class="review-readonly-field"><span>目标价格</span><b>{{ rv.expected_target_price|money if rv.expected_target_price is not none else '未填写' }}</b></div>
+              <div class="review-readonly-field"><span>计划止损价</span><b>{{ rv.stop_loss_price|money if rv.stop_loss_price is not none else '未填写' }}</b></div>
+              <div class="review-readonly-field"><span>预期持有天数</span><b>{{ rv.expected_holding_days ~ ' 天' if rv.expected_holding_days is not none else '未填写' }}</b></div>
+              <div class="review-readonly-field"><span>主观信心</span><b>{{ rv.confidence_level ~ ' 星' if rv.confidence_level is not none else '未填写' }}</b></div>
+            </div>
+          </div>
+          <div class="review-section">
+            <div class="review-section-title">交易复盘</div>
+            <div class="review-field-grid">
+              <div class="review-readonly-field"><span>判断是否正确</span><b>{{ review_judgement_labels[rv.judgement_result] if rv.judgement_result else '未选择' }}</b></div>
+              <div class="review-readonly-field"><span>主要问题</span><b>{{ review_main_problem_labels[rv.main_problem] if rv.main_problem else '未选择' }}</b></div>
+            </div>
+            <p class="review-readonly-line"><b>复盘总结</b>{{ rv.review_note or '未填写' }}</p>
+            <p class="review-readonly-line"><b>下一次只改变什么</b>{{ rv.next_action or '未填写' }}</p>
+          </div>
+          <div class="review-actions">
+            <a class="button secondary edit-action" href="{{ url_for('analysis_trade_detail', episode_id=ep.id, edit=1, sort=stock_sort, q=stock_query) }}">编辑复盘</a>
+          </div>
+        </div>
+        {% else %}
+        {% if ep.status == 'OPEN' %}<div class="review-notice">当前持仓中：可记录买入逻辑与预期，最终复盘需清仓后进行。</div>{% endif %}
+        <form class="review-form" method="post" action="{{ url_for('save_trade_review', episode_id=ep.id) }}">
+          <input type="hidden" name="sort" value="{{ stock_sort }}">
+          <input type="hidden" name="q" value="{{ stock_query }}">
+          <div class="review-section">
+            <div class="review-section-title">交易逻辑类型（可多选）</div>
+            <div class="reason-type-grid">
+              {% for key, label in review_reason_labels.items() %}
+              <label class="reason-chip"><input type="checkbox" name="reason_type" value="{{ key }}" {{ 'checked' if key in trade_detail.review_reason_types else '' }}><span>{{ label }}</span></label>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="review-section">
+            <div class="review-section-title">我的交易逻辑</div>
+            <label>为什么买？<textarea name="trade_reason" rows="3" placeholder="当时为什么买入这只股票">{{ trade_detail.review.trade_reason if trade_detail.review else '' }}</textarea></label>
+            <label>为什么卖？<textarea name="sell_reason" rows="3" placeholder="当时为什么卖出">{{ trade_detail.review.sell_reason if trade_detail.review else '' }}</textarea></label>
+          </div>
+          <div class="review-section">
+            <div class="review-section-title">买入时预期</div>
+            <div class="review-field-grid">
+              <label>预期上涨空间（%）<input name="expected_profit_percent" type="number" min="0" step="any" placeholder="例如 20" value="{{ trade_detail.review.expected_profit_percent if trade_detail.review else '' }}"></label>
+              <label>目标价格<input name="expected_target_price" type="number" min="0.000001" step="any" placeholder="例如 15.00" value="{{ trade_detail.review.expected_target_price if trade_detail.review else '' }}"></label>
+              <label>计划止损价<input name="stop_loss_price" type="number" min="0.000001" step="any" placeholder="例如 9.50" value="{{ trade_detail.review.stop_loss_price if trade_detail.review else '' }}"></label>
+              <label>预期持有天数<input name="expected_holding_days" type="number" min="0" step="1" placeholder="例如 10" value="{{ trade_detail.review.expected_holding_days if trade_detail.review else '' }}"></label>
+              <label>主观信心（1-5）<select name="confidence_level">
+                <option value="" {{ 'selected' if not (trade_detail.review and trade_detail.review.confidence_level) else '' }}>未填写</option>
+                {% for level in range(1, 6) %}<option value="{{ level }}" {{ 'selected' if trade_detail.review and trade_detail.review.confidence_level == level else '' }}>{{ level }} 星{% if level == 1 %}（低）{% elif level == 5 %}（高）{% endif %}</option>{% endfor %}
+              </select></label>
+            </div>
+          </div>
+          <div class="review-section">
+            <div class="review-section-title">交易复盘</div>
+            <div class="review-field-grid">
+              <label>判断是否正确<select name="judgement_result">
+                <option value="" {{ 'selected' if not (trade_detail.review and trade_detail.review.judgement_result) else '' }}>未选择</option>
+                {% for key, label in review_judgement_labels.items() %}<option value="{{ key }}" {{ 'selected' if trade_detail.review and trade_detail.review.judgement_result == key else '' }}>{{ label }}</option>{% endfor %}
+              </select></label>
+              <label>主要问题<select name="main_problem">
+                <option value="" {{ 'selected' if not (trade_detail.review and trade_detail.review.main_problem) else '' }}>未选择</option>
+                {% for key, label in review_main_problem_labels.items() %}<option value="{{ key }}" {{ 'selected' if trade_detail.review and trade_detail.review.main_problem == key else '' }}>{{ label }}</option>{% endfor %}
+              </select></label>
+            </div>
+            <label>复盘总结<textarea name="review_note" rows="4" placeholder="这笔交易做对了什么、做错了什么">{{ trade_detail.review.review_note if trade_detail.review else '' }}</textarea></label>
+            <label>下一次只改变什么<textarea name="next_action" rows="2" placeholder="下一次我只改变一件什么事">{{ trade_detail.review.next_action if trade_detail.review else '' }}</textarea></label>
+          </div>
+          <div class="review-actions">
+            <button class="button secondary" type="submit" name="action" value="draft">保存草稿</button>
+            {% if ep.status == 'CLOSED' %}<button class="button" type="submit" name="action" value="complete">标记已复盘</button>{% endif %}
+          </div>
+        </form>
+        {% endif %}
+      </section>
+
+      {% elif page == 'portfolio' %}
+      {% set ps = portfolio.summary %}
+      <section class="intro portfolio-intro">
+        <div><span class="eyebrow">PORTFOLIO ANALYSIS</span><p>不只看“持有什么”，而是看当前资金、风险与持仓质量。</p></div>
+        <div class="intro-actions">
+          <div class="portfolio-price-status">
+            {% if ps.price_date %}<b id="portfolio-price-date">行情日期 {{ ps.price_date }}</b><small id="portfolio-price-fetched">最近同步 {{ ps.price_fetched_at[:19]|replace('T', ' ') }}</small>{% else %}<b id="portfolio-price-date">暂无行情数据</b><small id="portfolio-price-fetched">请先同步历史或实时行情</small>{% endif %}<small>自动同步：交易日每 30 秒 · 09:15-11:30 / 13:00-15:00{% if auto_sync.last_success_at %} · 最近 {{ auto_sync.last_success_at[11:19] }}{% endif %}</small>
+          </div>
+          <form class="portfolio-sync-form" method="post" action="{{ url_for('sync_portfolio_realtime') }}" data-loading="正在获取持仓实时行情"><button class="button secondary" type="submit">同步实时行情</button></form>
+          <form class="portfolio-sync-form" method="post" action="{{ url_for('sync_portfolio_history') }}" data-loading="正在同步持仓历史行情"><button class="button secondary" type="submit">同步历史行情</button></form>
+          <small class="portfolio-sync-status" id="portfolio-sync-status" aria-live="polite">{% if auto_sync.last_error %}自动同步最近失败{% endif %}</small>
+        </div>
+       </section>
+
+       <section class="market-index-panel panel" id="market-index-panel">
+         <div class="market-index-heading"><div><span class="eyebrow">MARKET INDEXES</span><div class="panel-title">主要指数</div></div><small id="market-index-status">正在获取当日行情...</small></div>
+         <div class="market-index-grid" id="market-index-grid"><div class="empty">正在获取上证、深证、创业板和科创50行情...</div></div>
+       </section>
+       <script>
+       (function() {
+         var panel = document.getElementById('market-index-panel');
+         var grid = document.getElementById('market-index-grid');
+         var status = document.getElementById('market-index-status');
+         if (!panel || !grid) return;
+         function money(value) { return Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+         function render(payload) {
+           var rows = payload.data || [];
+           if (!rows.length) { grid.innerHTML = '<div class="empty">暂无指数行情，请稍后重试。</div>'; status.textContent = payload.error || '暂未获取到行情'; return; }
+           grid.innerHTML = rows.map(function(item) {
+             var positive = item.change === null || item.change >= 0;
+             var sign = item.change > 0 ? '+' : '';
+             return '<div class="market-index-item"><span>' + item.name + '</span><b>' + money(item.price) + '</b><strong class="' + (positive ? 'gain' : 'loss') + '">' + (item.change === null ? '--' : sign + money(item.change) + '  ' + sign + (item.change_rate * 100).toFixed(2) + '%') + '</strong><small>' + item.trade_date + '</small></div>';
+           }).join('');
+           status.textContent = rows[0].trade_date + ' · 最近更新 ' + rows[0].fetched_at.slice(11, 16);
+         }
+         function refresh() { fetch('{{ url_for("portfolio_indexes") }}').then(function(response) { return response.json(); }).then(render).catch(function() { status.textContent = '指数行情获取失败'; grid.innerHTML = '<div class="empty">指数行情获取失败，请检查网络后重试。</div>'; }); }
+          refresh();
+          (function scheduleAlignedRefresh() {
+             var now = new Date();
+              var delay = 30000 - now.getMilliseconds() - (now.getSeconds() % 30) * 1000 + 1000;
+              window.setTimeout(function() { refresh(); window.setInterval(refresh, 30000); }, delay);
+          }());
+       }());
+       </script>
+
+        <script>
+        document.addEventListener('DOMContentLoaded', function() {
+           var totalValue = document.getElementById('portfolio-total-value');
+          var totalProfit = document.getElementById('portfolio-total-profit');
+          var priceDate = document.getElementById('portfolio-price-date');
+          var priceFetched = document.getElementById('portfolio-price-fetched');
+          var table = document.querySelector('.portfolio-position-table');
+         if (!totalValue || !totalProfit || !table) return;
+         function money(value) { return value === null || value === undefined ? '--' : Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+          function rate(value) { return value === null || value === undefined ? '--' : (Number(value) * 100).toFixed(2) + '%'; }
+          function signedRate(value) { return value > 0 ? '+' + rate(value) : rate(value); }
+         function signed(value) { return value > 0 ? '+' + money(value) : money(value); }
+         function apply(payload) {
+            var summary = payload.summary || {};
+            totalValue.innerHTML = '<span>总市值</span><b>' + money(summary.prices_complete ? summary.total_market_value : summary.total_cost) + '<small>元</small></b><small>' + (summary.prices_complete ? '最新行情' : '投入资金') + '</small>';
+            totalProfit.className = 'portfolio-inline-metric ' + (summary.unrealized_profit === null ? '' : summary.unrealized_profit >= 0 ? 'metric-success' : 'metric-warning'); totalProfit.innerHTML = '<span>浮动盈亏</span>' + (summary.unrealized_profit === null ? '<b>--</b><small>' + (summary.priced_count || 0) + '/' + (summary.count || 0) + ' 只持仓有行情</small>' : '<b class="' + (summary.unrealized_profit >= 0 ? 'gain' : 'loss') + '">' + signed(summary.unrealized_profit) + '</b><small>' + rate(summary.unrealized_rate) + '</small>');
+            priceDate.textContent = summary.price_date ? '行情日期 ' + summary.price_date : '暂无行情数据';
+            priceFetched.textContent = summary.price_fetched_at ? '最近同步 ' + summary.price_fetched_at.slice(0, 19).replace('T', ' ') : '请先同步历史或实时行情';
+            (payload.positions || []).forEach(function(item) {
+             var row = document.getElementById('position-' + item.stock_code);
+             if (!row) return;
+              var cells = row.children;
+              cells[3].innerHTML = item.latest_price === null ? '<span class="muted-value">暂无行情</span>' : '<b>' + money(item.latest_price) + '</b><small>' + (item.price_date || '') + ' · ' + (item.price_fetched_at ? item.price_fetched_at.slice(11, 19) : '') + '</small>';
+              cells[4].innerHTML = item.change_rate === null ? '--' : '<b class="' + (item.change_rate >= 0 ? 'gain' : 'loss') + '">' + signedRate(item.change_rate) + '</b>';
+              cells[5].innerHTML = item.unrealized_profit === null ? '--' : '<b class="' + (item.unrealized_profit >= 0 ? 'gain' : 'loss') + '">' + signed(item.unrealized_profit) + '</b>';
+              cells[6].innerHTML = item.unrealized_rate === null ? '--' : '<b class="' + (item.unrealized_rate >= 0 ? 'gain' : 'loss') + '">' + rate(item.unrealized_rate) + '</b>';
+           });
+         }
+          function refresh() { fetch('{{ url_for("portfolio_quotes") }}', { cache: 'no-store' }).then(function(response) { if (!response.ok) throw new Error(); return response.json(); }).then(apply).catch(function() { priceFetched.textContent = '持仓行情刷新失败，请检查网络后重试'; }); }
+          refresh();
+          (function scheduleAlignedRefresh() {
+             var now = new Date();
+              var delay = 30000 - now.getMilliseconds() - (now.getSeconds() % 30) * 1000 + 1000;
+              window.setTimeout(function() { refresh(); window.setInterval(refresh, 30000); }, delay);
+          }());
+        });
+        </script>
+
+       <script>(function(){var forms=document.querySelectorAll('.portfolio-sync-form'),status=document.getElementById('portfolio-sync-status');forms.forEach(function(form){form.addEventListener('submit',function(event){event.preventDefault();var button=form.querySelector('button'),label=button.textContent;forms.forEach(function(item){item.querySelector('button').disabled=true});button.textContent='正在同步...';status.textContent=form.dataset.loading+'，页面可以继续操作';fetch(form.action,{method:'POST',headers:{'X-Requested-With':'XMLHttpRequest'}}).then(function(response){if(!response.ok)throw new Error('同步请求失败');return response.json()}).then(function(result){status.textContent=result.message;button.textContent='同步完成';setTimeout(function(){window.location.reload()},500)}).catch(function(){status.textContent='同步失败，请稍后重试';forms.forEach(function(item){item.querySelector('button').disabled=false});button.textContent=label})})})}());</script>
+
+      <section class="panel portfolio-positions-panel" id="current-positions">
+         <div class="portfolio-section-head"><div><span class="eyebrow">CURRENT POSITIONS</span><div class="panel-title">当前持仓</div></div><div class="portfolio-inline-metrics"><div class="portfolio-inline-metric" id="portfolio-total-value"><span>总市值</span><b>{{ (ps.total_market_value if ps.prices_complete else ps.total_cost)|money }}<small>元</small></b><small>{{ '最新行情' if ps.prices_complete else '投入资金' }}</small></div><div class="portfolio-inline-metric {{ 'metric-success' if ps.unrealized_profit is not none and ps.unrealized_profit >= 0 else ('metric-warning' if ps.unrealized_profit is not none else '') }}" id="portfolio-total-profit"><span>浮动盈亏</span>{% if ps.unrealized_profit is not none %}<b class="{{ 'gain' if ps.unrealized_profit >= 0 else 'loss' }}">{{ '+' if ps.unrealized_profit > 0 else '' }}{{ ps.unrealized_profit|money }}</b><small>{{ ps.unrealized_rate|percent }}</small>{% else %}<b>--</b><small>{{ ps.priced_count }}/{{ ps.count }} 只持仓有行情</small>{% endif %}</div></div><small>{{ '按持仓市值从高到低' if ps.prices_complete else '行情不完整，按持仓成本从高到低' }}</small></div>
+        {% if portfolio.positions %}
+          <div class="table-wrap portfolio-position-table"><table><thead><tr><th>证券</th><th>持仓数量</th><th>持仓成本</th><th>现价</th><th>涨跌幅</th><th>浮盈亏</th><th>浮盈率</th><th>持仓天数</th><th></th></tr></thead><tbody>
+          {% for row in portfolio.positions %}
+          <tr id="position-{{ row.stock_code }}">
+            <td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td>
+             <td>{{ row.quantity|money }} 股</td><td><b>{{ row.total_cost|money }}</b><small>均价 {{ row.avg_cost|money }}</small></td>
+              <td>{% if row.latest_price is not none %}<b>{{ row.latest_price|money }}</b><small>{{ row.price_date }} · {{ row.price_fetched_at[11:19] }}</small>{% else %}<span class="muted-value">暂无行情</span>{% endif %}</td>
+             <td>{% if row.change_rate is not none %}<b class="{{ 'gain' if row.change_rate >= 0 else 'loss' }}">{{ '%+.2f%%'|format(row.change_rate * 100) if row.change_rate > 0 else '%.2f%%'|format(row.change_rate * 100) }}</b>{% else %}--{% endif %}</td>
+             <td>{% if row.unrealized_profit is not none %}<b class="{{ 'gain' if row.unrealized_profit >= 0 else 'loss' }}">{{ '+' if row.unrealized_profit > 0 else '' }}{{ row.unrealized_profit|money }}</b>{% else %}--{% endif %}</td>
+            <td>{% if row.unrealized_rate is not none %}<b class="{{ 'gain' if row.unrealized_rate >= 0 else 'loss' }}">{{ row.unrealized_rate|percent }}</b>{% else %}--{% endif %}</td>
+            <td><b>{{ row.holding_days }} 天</b><small>{{ row.first_buy_date }} 起</small></td>
+            <td><button class="detail-link kline-popup-trigger" type="button" data-kline-url="{{ url_for('portfolio_kline', stock_code=row.stock_code) }}">看K线 →</button></td>
+          </tr>
+          {% endfor %}
+        </tbody></table></div>
+        {% else %}<div class="empty">{{ '当前筛选下没有持仓。' if ps.count else '当前没有持仓。导入交割单后，系统会通过 FIFO 自动计算。' }}</div>{% endif %}
+      </section>
+
+      <div class="review-modal-backdrop" id="portfolio-kline-backdrop" hidden>
+        <div class="portfolio-kline-modal" role="dialog" aria-modal="true" aria-labelledby="portfolio-kline-title">
+          <button type="button" class="review-modal-close" id="portfolio-kline-close" aria-label="关闭">×</button>
+          <div class="portfolio-kline-modal-head"><div><span class="eyebrow">PRICE ACTION</span><h3 id="portfolio-kline-title">个股 K线</h3></div><small id="portfolio-kline-range">正在加载...</small></div>
+          <div class="portfolio-ma-legend"><span class="ma5">MA5 五日线</span><span class="ma10">MA10 十日线</span><span class="ma20">MA20 二十日线</span><span class="cost">持仓成本线</span></div>
+          <div id="portfolio-kline-empty" class="empty" hidden></div>
+          <div id="portfolio-kline-chart" class="portfolio-kline-chart"></div>
+        </div>
+      </div>
+      <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+      <script>
+      (function() {
+        var backdrop = document.getElementById('portfolio-kline-backdrop');
+        var closeButton = document.getElementById('portfolio-kline-close');
+        var title = document.getElementById('portfolio-kline-title');
+        var range = document.getElementById('portfolio-kline-range');
+        var empty = document.getElementById('portfolio-kline-empty');
+        var chartElement = document.getElementById('portfolio-kline-chart');
+        var chart = null;
+
+        function closeKline() {
+          backdrop.hidden = true;
+          document.body.style.overflow = '';
+        }
+        function renderKline(payload) {
+          var chartData = payload.data || [];
+          title.textContent = payload.stock_name + ' · ' + payload.stock_code + ' K线';
+          if (!chartData.length) {
+            range.textContent = '暂无历史行情';
+            empty.textContent = '暂无该股票的历史行情，请先点击“同步持仓行情”。';
+            empty.hidden = false;
+            chartElement.hidden = true;
+            return;
+          }
+          empty.hidden = true;
+          chartElement.hidden = false;
+          range.textContent = chartData[0].date + ' 至 ' + chartData[chartData.length - 1].date + ' · ' + chartData.length + ' 个交易日';
+           if (typeof echarts === 'undefined') {
+            empty.textContent = 'K线组件加载失败，请检查网络后重试。';
+            empty.hidden = false;
+            chartElement.hidden = true;
+             return;
+           }
+           chart = window.renderUnifiedKline(chartElement, payload, { avgCost: payload.avg_cost });
+           return;
+           if (!chart) chart = echarts.init(chartElement);
+          chart.clear();
+         var dates = chartData.map(function(item) { return item.date; });
+         var values = chartData.map(function(item) { return [item.open, item.close, item.low, item.high]; });
+          function markerPoints(action, edge) {
+            return (payload.bs_points || []).filter(function(point) { return point.action === action; }).map(function(point) {
+              var candle = chartData.find(function(item) { return item.date === point.date; });
+              return { value: [point.date, candle ? candle[edge] : point.price], tradePrice: point.price };
+            });
+          }
+          var buyPoints = markerPoints('BUY', 'low');
+          var sellPoints = markerPoints('SELL', 'high');
+        function calculateMA(days) {
+          return chartData.map(function(item, index) {
+            if (index < days - 1) return null;
+            var total = 0;
+            for (var offset = 0; offset < days; offset += 1) total += chartData[index - offset].close;
+            return Number((total / days).toFixed(2));
+          });
+        }
+        var ma5 = calculateMA(5);
+        var ma10 = calculateMA(10);
+        var ma20 = calculateMA(20);
+        var volumes = chartData.map(function(item) {
+          return { value: item.volume, itemStyle: { color: item.close >= item.open ? '#b95d4c' : '#22654d' } };
+        });
+        chart.setOption({
+          animation: false,
+           legend: { top: 0, data: ['日K', '买入 B', '卖出 S', 'MA5', 'MA10', 'MA20', '成交量'] },
+          tooltip: {
+            trigger: 'axis',
+            axisPointer: { type: 'cross' },
+            formatter: function(params) {
+              var candle = params.find(function(param) { return param.seriesName === '日K'; });
+              if (!candle) return '';
+              var index = candle.dataIndex;
+              var item = chartData[index];
+              var previousClose = index > 0 ? chartData[index - 1].close : null;
+              var changeAmount = previousClose ? item.close - previousClose : null;
+              var changeRate = previousClose ? changeAmount / previousClose * 100 : null;
+              var changeColor = changeAmount >= 0 ? '#b95d4c' : '#22654d';
+              var changeSign = changeAmount > 0 ? '+' : '';
+               var volume = item.volume >= 100000000
+                 ? (item.volume / 100000000).toFixed(2) + ' 亿手'
+                 : item.volume >= 10000 ? (item.volume / 10000).toFixed(2) + ' 万手' : item.volume.toFixed(0) + ' 手';
+              return [
+                '<b>' + item.date + '</b>',
+                '开盘：' + item.open.toFixed(2),
+                '收盘：' + item.close.toFixed(2),
+                '最高：' + item.high.toFixed(2),
+                '最低：' + item.low.toFixed(2),
+                '涨跌额：' + (changeAmount === null ? '--' : '<span style="color:' + changeColor + '">' + changeSign + changeAmount.toFixed(2) + '</span>'),
+                '涨幅：' + (changeRate === null ? '--' : '<span style="color:' + changeColor + '">' + changeSign + changeRate.toFixed(2) + '%</span>'),
+                '成交量：' + volume,
+                '成交额：' + (item.amount >= 100000000 ? (item.amount / 100000000).toFixed(2) + ' 亿元' : (item.amount / 10000).toFixed(2) + ' 万元'),
+                ma5[index] === null ? 'MA5：--' : 'MA5：' + ma5[index].toFixed(2),
+                ma10[index] === null ? 'MA10：--' : 'MA10：' + ma10[index].toFixed(2),
+                ma20[index] === null ? 'MA20：--' : 'MA20：' + ma20[index].toFixed(2)
+              ].join('<br>');
+            }
+          },
+          axisPointer: { link: [{ xAxisIndex: 'all' }] },
+          grid: [{ left: 58, right: 24, top: 42, height: '58%' }, { left: 58, right: 24, top: '73%', height: '13%' }],
+          xAxis: [
+            { type: 'category', data: dates, boundaryGap: true, axisLine: { lineStyle: { color: '#b8b4aa' } }, splitLine: { show: false }, min: 'dataMin', max: 'dataMax' },
+            { type: 'category', gridIndex: 1, data: dates, boundaryGap: true, axisLabel: { show: false }, axisTick: { show: false }, axisLine: { lineStyle: { color: '#b8b4aa' } }, min: 'dataMin', max: 'dataMax' }
+          ],
+           yAxis: [
+             { scale: true, splitLine: { lineStyle: { color: '#eeeae1' } } },
+             { min: 0, gridIndex: 1, axisLabel: { formatter: function(value) { return value >= 100000000 ? (value / 100000000).toFixed(1) + '亿' : value >= 10000 ? (value / 10000).toFixed(0) + '万' : value.toFixed(0); }, fontSize: 10 }, splitLine: { show: false } }
+          ],
+          dataZoom: [
+            { type: 'inside', xAxisIndex: [0, 1], start: Math.max(0, 100 - 6000 / chartData.length), end: 100 },
+            { type: 'slider', xAxisIndex: [0, 1], bottom: 5, height: 20, start: Math.max(0, 100 - 6000 / chartData.length), end: 100 }
+          ],
+          series: [
+           {
+              name: '日K', type: 'candlestick', data: values,
+              itemStyle: { color: '#b95d4c', color0: '#22654d', borderColor: '#b95d4c', borderColor0: '#22654d' },
+               markLine: { silent: true, symbol: ['none', 'none'], label: { formatter: '持仓成本 ' + payload.avg_cost.toFixed(2) }, lineStyle: { color: '#59645f', type: 'dashed', width: 1.5 }, data: [{ yAxis: payload.avg_cost }] }
+             },
+             { name: '买入 B', type: 'scatter', data: buyPoints, symbol: 'circle', symbolSize: 4, z: 10, itemStyle: { color: '#b95d4c', borderColor: '#fff', borderWidth: 1 }, label: { show: true, formatter: 'B', position: 'bottom', distance: 4, color: '#b95d4c', fontSize: 10, fontWeight: 'bold' }, tooltip: { formatter: function(params) { return '买入 B<br>' + params.value[0] + '<br>价格：' + Number(params.value[1]).toFixed(2); } } },
+             { name: '卖出 S', type: 'scatter', data: sellPoints, symbol: 'diamond', symbolSize: 4, z: 10, itemStyle: { color: '#22654d', borderColor: '#fff', borderWidth: 1 }, label: { show: true, formatter: 'S', position: 'top', distance: 4, color: '#22654d', fontSize: 10, fontWeight: 'bold' }, tooltip: { formatter: function(params) { return '卖出 S<br>' + params.value[0] + '<br>价格：' + Number(params.value[1]).toFixed(2); } } },
+             { name: 'MA5', type: 'line', data: ma5, showSymbol: false, connectNulls: false, smooth: false, z: 20, lineStyle: { width: 1.2, color: '#f59e0b', opacity: .9 }, itemStyle: { color: '#f59e0b' }, emphasis: { focus: 'series', lineStyle: { width: 1.8 } } },
+            { name: 'MA10', type: 'line', data: ma10, showSymbol: false, connectNulls: false, smooth: false, z: 21, lineStyle: { width: 1.2, color: '#2563eb', opacity: .9 }, itemStyle: { color: '#2563eb' }, emphasis: { focus: 'series', lineStyle: { width: 1.8 } } },
+            { name: 'MA20', type: 'line', data: ma20, showSymbol: false, connectNulls: false, smooth: false, z: 22, lineStyle: { width: 1.2, color: '#9333ea', opacity: .9 }, itemStyle: { color: '#9333ea' }, emphasis: { focus: 'series', lineStyle: { width: 1.8 } } },
+             { name: '成交量（手）', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: volumes }
+          ]
+        });
+          requestAnimationFrame(function() { chart.resize(); });
+        }
+
+        var positionTable = document.querySelector('.portfolio-position-table');
+        if (positionTable) {
+          positionTable.addEventListener('click', function(event) {
+            var button = event.target.closest('.kline-popup-trigger');
+            if (!button) return;
+            backdrop.hidden = false;
+            document.body.style.overflow = 'hidden';
+            title.textContent = '个股 K线';
+            range.textContent = '正在加载...';
+            empty.hidden = true;
+            chartElement.hidden = false;
+            fetch(button.getAttribute('data-kline-url'))
+              .then(function(response) { if (!response.ok) throw new Error('request failed'); return response.json(); })
+              .then(renderKline)
+              .catch(function() {
+                range.textContent = '加载失败';
+                empty.textContent = 'K线数据加载失败，请稍后重试。';
+                empty.hidden = false;
+                chartElement.hidden = true;
+              });
+          });
+        }
+        closeButton.addEventListener('click', closeKline);
+        backdrop.addEventListener('click', function(event) { if (event.target === backdrop) closeKline(); });
+        document.addEventListener('keydown', function(event) { if (event.key === 'Escape' && !backdrop.hidden) closeKline(); });
+        window.addEventListener('resize', function() { if (chart) chart.resize(); });
+      }());
+      </script>
+
+      {% elif page == 'watchlist' %}
+      {% set ws = watchlist.summary %}
+      <section class="intro">
+        <div><span class="eyebrow">FOCUS WATCHLIST</span><p>集中跟踪值得持续观察的股票、最近交易日涨跌与关注逻辑。</p></div>
+        <div class="intro-actions"><form class="watchlist-sync-form" method="post" action="{{ url_for('sync_watchlist_prices') }}" data-loading="正在批量获取实时行情"><button class="button secondary">同步实时行情</button></form><form class="watchlist-sync-form" method="post" action="{{ url_for('sync_watchlist_history') }}" data-loading="正在并行同步历史K线"><button class="button secondary">同步历史行情</button></form><div class="portfolio-price-status"><b>自动同步：交易日每 30 秒</b><small>09:15-11:30 / 13:00-15:00{% if auto_sync.last_success_at %} · 最近 {{ auto_sync.last_success_at[11:19] }}{% endif %}{% if auto_sync.last_error %} · 最近失败{% endif %}</small><small id="watchlist-sync-status" aria-live="polite"></small></div><button class="button" id="watchlist-add-trigger" type="button">添加股票</button></div>
+      </section>
+      <section class="watchlist-compact-summary"><div><span>重点观察</span><b>{{ ws.total }}</b><small>只</small></div><div><span>高优先级</span><b>{{ ws.high }}</b><small>只</small></div><div><span>上涨</span><b class="gain">{{ ws.gainers }}</b><small>只</small></div><div><span>下跌</span><b class="loss">{{ ws.losers }}</b><small>只</small></div><div><span>行情覆盖</span><b>{{ ws.priced }}/{{ ws.total }}</b><small>{{ ws.latest_price_date or '--' }}</small></div></section>
+      {% set change_direction = 'asc' if watchlist.sort == 'change' and watchlist.direction == 'desc' else 'desc' %}
+      {% set priority_direction = 'asc' if watchlist.sort == 'priority' and watchlist.direction == 'desc' else 'desc' %}
+      <section class="panel watchlist-panel"><div class="watchlist-toolbar"><form method="get" action="{{ url_for('analysis_watchlist') }}"><input name="q" value="{{ watchlist.query }}" placeholder="搜索名称或代码"><select name="priority"><option value="all">全部优先级</option><option value="high" {{ 'selected' if watchlist.priority == 'high' else '' }}>高优先级</option><option value="medium" {{ 'selected' if watchlist.priority == 'medium' else '' }}>中优先级</option><option value="low" {{ 'selected' if watchlist.priority == 'low' else '' }}>低优先级</option></select><button class="button secondary" type="submit">筛选</button><a class="watchlist-reset" href="{{ url_for('analysis_watchlist') }}">重置</a></form></div>
+        <div class="table-wrap"><table><thead><tr><th><a class="watch-sort-link" href="{{ url_for('analysis_watchlist', q=watchlist.query, priority=watchlist.priority, sort='priority', direction=priority_direction) }}">优先级{% if watchlist.sort == 'priority' %} {{ '↑' if watchlist.direction == 'asc' else '↓' }}{% endif %}</a></th><th>证券</th><th>最新价</th><th>涨跌额</th><th><a class="watch-sort-link" href="{{ url_for('analysis_watchlist', q=watchlist.query, priority=watchlist.priority, sort='change', direction=change_direction) }}">涨幅{% if watchlist.sort == 'change' %} {{ '↑' if watchlist.direction == 'asc' else '↓' }}{% endif %}</a></th><th>行情日期</th><th>关注理由</th><th>状态</th><th>看K线</th><th>编辑</th><th>移除</th></tr></thead><tbody>{% for row in watchlist['items'] %}<tr><td><span class="watch-priority p{{ row.priority }}">{{ {3:'高',2:'中',1:'低'}[row.priority] }}</span></td><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{% if row.latest_price is not none %}<b>{{ row.latest_price|money }}</b><small>{{ row.price_fetched_at[:16]|replace('T',' ') }}</small>{% else %}<span class="muted-value">暂无行情</span>{% endif %}</td><td>{% if row.change_amount is not none %}<b class="{{ 'gain' if row.change_amount >= 0 else 'loss' }}">{{ '+' if row.change_amount > 0 else '' }}{{ row.change_amount|money }}</b>{% else %}--{% endif %}</td><td>{% if row.change_rate is not none %}<b class="{{ 'gain' if row.change_rate >= 0 else 'loss' }}">{{ '+' if row.change_rate > 0 else '' }}{{ row.change_rate|percent }}</b>{% else %}--{% endif %}</td><td>{{ row.price_date or '--' }}</td><td class="watch-note">{{ row.note or '--' }}</td><td>{% if row.is_held %}<span class="pill">当前持仓</span>{% else %}<span class="muted-value">仅观察</span>{% endif %}</td><td><button class="detail-link kline-popup-trigger" type="button" data-kline-url="{{ url_for('watchlist_kline', stock_code=row.stock_code) }}">看K线</button></td><td><button class="detail-link watch-edit-trigger" type="button" data-code="{{ row.stock_code }}" data-name="{{ row.stock_name }}" data-priority="{{ row.priority }}" data-note="{{ row.note }}">编辑</button></td><td><form method="post" action="{{ url_for('delete_watchlist_stock', watch_id=row.id) }}"><button class="detail-link watch-delete" type="submit">移除</button></form></td></tr>{% else %}<tr><td colspan="11" class="empty">还没有重点观察股票。添加后可同步行情查看涨幅。</td></tr>{% endfor %}</tbody></table></div></section>
+      <div class="review-modal-backdrop" id="watchlist-add-backdrop" hidden><div class="review-modal watchlist-add-modal" role="dialog" aria-modal="true" aria-labelledby="watchlist-add-title"><button type="button" class="review-modal-close" id="watchlist-add-close" aria-label="关闭">×</button><div class="review-modal-head"><b id="watchlist-add-title">添加重点观察</b><span>同一股票再次保存会更新</span></div><form id="watchlist-add-form" class="watchlist-modal-form" method="post" action="{{ url_for('save_watchlist_stock') }}"><label><span>证券代码</span><input id="watchlist-stock-code" name="stock_code" inputmode="numeric" maxlength="8" placeholder="例如 300540" required></label><label><span>证券名称</span><input id="watchlist-stock-name" name="stock_name" maxlength="50" placeholder="例如 深鉴科技" required></label><label><span>优先级</span><select id="watchlist-stock-priority" name="priority"><option value="3">高</option><option value="2" selected>中</option><option value="1">低</option></select></label><label class="wide"><span>关注理由</span><textarea id="watchlist-stock-note" name="note" rows="3" maxlength="500" placeholder="例如：等待突破关键位置"></textarea></label><div class="review-actions wide"><button class="button secondary neutral-action" id="watchlist-add-cancel" type="button">取消</button><button class="button" type="submit">保存观察项</button></div></form></div></div>
+      <div class="review-modal-backdrop" id="watchlist-kline-backdrop" hidden><div class="portfolio-kline-modal" role="dialog" aria-modal="true" aria-labelledby="watchlist-kline-title"><button type="button" class="review-modal-close" id="watchlist-kline-close" aria-label="关闭">×</button><div class="portfolio-kline-modal-head"><div><span class="eyebrow">PRICE ACTION</span><h3 id="watchlist-kline-title">个股 K线</h3></div><small id="watchlist-kline-range">正在加载...</small></div><div class="portfolio-ma-legend"><span class="ma5">MA5 五日线</span><span class="ma10">MA10 十日线</span><span class="ma20">MA20 二十日线</span></div><div id="watchlist-kline-empty" class="empty" hidden></div><div id="watchlist-kline-chart" class="portfolio-kline-chart"></div></div></div>
+      <script>(function(){var b=document.getElementById('watchlist-add-backdrop'),open=document.getElementById('watchlist-add-trigger'),close=document.getElementById('watchlist-add-close'),cancel=document.getElementById('watchlist-add-cancel'),form=document.getElementById('watchlist-add-form'),first=document.getElementById('watchlist-stock-code'),name=document.getElementById('watchlist-stock-name'),priority=document.getElementById('watchlist-stock-priority'),note=document.getElementById('watchlist-stock-note'),title=document.getElementById('watchlist-add-title');function hide(){b.hidden=true;document.body.style.overflow='';open.focus()}function show(){title.textContent='添加重点观察';form.reset();priority.value='2';b.hidden=false;document.body.style.overflow='hidden';requestAnimationFrame(function(){first.focus()})}function edit(button){title.textContent='编辑重点观察';first.value=button.dataset.code;name.value=button.dataset.name;priority.value=button.dataset.priority;note.value=button.dataset.note;b.hidden=false;document.body.style.overflow='hidden';requestAnimationFrame(function(){priority.focus()})}open.addEventListener('click',show);document.querySelector('.watchlist-panel').addEventListener('click',function(e){var button=e.target.closest('.watch-edit-trigger');if(button)edit(button)});close.addEventListener('click',hide);cancel.addEventListener('click',hide);b.addEventListener('click',function(e){if(e.target===b)hide()});document.addEventListener('keydown',function(e){if(e.key==='Escape'&&!b.hidden)hide()})}());</script>
+        <script>(function(){var table=document.querySelector('.watchlist-panel table');if(!table)return;function money(value){return Number(value).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})}function signed(value){return value>0?'+':''}function update(item){var row=Array.from(table.tBodies[0].rows).find(function(candidate){var code=candidate.cells[1].querySelector('small');return code&&code.textContent.trim()===item.stock_code});if(!row)return;var cells=row.cells;cells[2].innerHTML=item.latest_price===null?'<span class="muted-value">暂无行情</span>':'<b>'+money(item.latest_price)+'</b><small>'+item.price_fetched_at.slice(0,19).replace('T',' ')+'</small>';cells[3].innerHTML=item.change_amount===null?'--':'<b class="'+(item.change_amount>=0?'gain':'loss')+'">'+signed(item.change_amount)+money(item.change_amount)+'</b>';cells[4].innerHTML=item.change_rate===null?'--':'<b class="'+(item.change_rate>=0?'gain':'loss')+'">'+signed(item.change_rate)+(item.change_rate*100).toFixed(2)+'%</b>';cells[5].textContent=item.price_date||'--'}function refresh(){fetch('{{ url_for("watchlist_quotes", q=watchlist.query, priority=watchlist.priority, sort=watchlist.sort, direction=watchlist.direction) }}',{cache:'no-store'}).then(function(response){if(!response.ok)throw new Error();return response.json()}).then(function(payload){payload.items.forEach(update)}).catch(function(){})}refresh();var now=new Date(),delay=30000-now.getMilliseconds()-(now.getSeconds()%30)*1000+1000;window.setTimeout(function(){refresh();window.setInterval(refresh,30000)},delay)}());</script>
+       <script>(function(){var forms=document.querySelectorAll('.watchlist-sync-form'),status=document.getElementById('watchlist-sync-status');forms.forEach(function(form){form.addEventListener('submit',function(event){event.preventDefault();var button=form.querySelector('button'),label=button.textContent;forms.forEach(function(item){item.querySelector('button').disabled=true});button.textContent='正在同步...';status.textContent=form.dataset.loading+'，页面可以继续操作';fetch(form.action,{method:'POST',headers:{'X-Requested-With':'XMLHttpRequest'}}).then(function(response){if(!response.ok)throw new Error('同步请求失败');return response.json()}).then(function(result){status.textContent=result.message;button.textContent='同步完成';setTimeout(function(){window.location.reload()},500)}).catch(function(){status.textContent='同步失败，请稍后重试';forms.forEach(function(item){item.querySelector('button').disabled=false});button.textContent=label})})})}());</script>
+      <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script><script>(function(){var b=document.getElementById('watchlist-kline-backdrop'),c=document.getElementById('watchlist-kline-close'),t=document.getElementById('watchlist-kline-title'),r=document.getElementById('watchlist-kline-range'),e=document.getElementById('watchlist-kline-empty'),el=document.getElementById('watchlist-kline-chart'),chart=null;function ma(d,n){return d.map(function(x,i){if(i<n-1)return null;var s=0;for(var j=0;j<n;j++)s+=d[i-j].close;return +(s/n).toFixed(2)})}function close(){b.hidden=true;document.body.style.overflow=''}function draw(p){var d=p.data||[];t.textContent=p.stock_name+' · '+p.stock_code+' K线';if(!d.length){r.textContent='暂无历史行情';e.textContent='暂无该股票行情，请先同步观察行情。';e.hidden=false;el.hidden=true;return}e.hidden=true;el.hidden=false;r.textContent=d[0].date+' 至 '+d[d.length-1].date+' · '+d.length+' 个交易日';if(!chart)chart=echarts.init(el);chart.clear();var dates=d.map(function(x){return x.date}),m5=ma(d,5),m10=ma(d,10),m20=ma(d,20),volumes=d.map(function(x){return{value:x.volume,itemStyle:{color:x.close>=x.open?'#b95d4c':'#22654d'}}});chart.setOption({animation:false,legend:{top:0,data:['日K','MA5','MA10','MA20','成交量']},tooltip:{trigger:'axis',axisPointer:{type:'cross'},formatter:function(ps){var k=ps.find(function(x){return x.seriesName==='日K'});if(!k)return '';var i=k.dataIndex,x=d[i],p=i?d[i-1].close:null,chg=p?x.close-p:null,rate=p?chg/p*100:null,color=chg>=0?'#b95d4c':'#22654d',sign=chg>0?'+':'',volume=x.volume>=10000?(x.volume/10000).toFixed(2)+' 万股':x.volume.toFixed(0)+' 股',amount=x.amount>=100000000?(x.amount/100000000).toFixed(2)+' 亿元':(x.amount/10000).toFixed(2)+' 万元';return ['<b>'+x.date+'</b>','开盘：'+x.open.toFixed(2),'收盘：'+x.close.toFixed(2),'最高：'+x.high.toFixed(2),'最低：'+x.low.toFixed(2),'涨跌额：'+(chg===null?'--':'<span style="color:'+color+'">'+sign+chg.toFixed(2)+'</span>'),'涨幅：'+(rate===null?'--':'<span style="color:'+color+'">'+sign+rate.toFixed(2)+'%</span>'),'成交量：'+volume,'成交额：'+amount,'MA5：'+(m5[i]===null?'--':m5[i].toFixed(2)),'MA10：'+(m10[i]===null?'--':m10[i].toFixed(2)),'MA20：'+(m20[i]===null?'--':m20[i].toFixed(2))].join('<br>')}},grid:[{left:58,right:24,top:42,height:'58%'},{left:58,right:24,top:'73%',height:'13%'}],xAxis:[{type:'category',data:dates},{type:'category',gridIndex:1,data:dates,axisLabel:{show:false},axisTick:{show:false}}],yAxis:[{scale:true},{min:0,gridIndex:1,axisLabel:{formatter:function(v){return(v/10000).toFixed(0)+'万'},fontSize:10},splitLine:{show:false}}],dataZoom:[{type:'inside',xAxisIndex:[0,1],start:Math.max(0,100-6000/d.length),end:100},{type:'slider',xAxisIndex:[0,1],bottom:5,height:20,start:Math.max(0,100-6000/d.length),end:100}],series:[{name:'日K',type:'candlestick',data:d.map(function(x){return[x.open,x.close,x.low,x.high]}),itemStyle:{color:'#b95d4c',color0:'#22654d',borderColor:'#b95d4c',borderColor0:'#22654d'}},{name:'MA5',type:'line',data:m5,showSymbol:false,lineStyle:{width:1.2,color:'#f59e0b'}},{name:'MA10',type:'line',data:m10,showSymbol:false,lineStyle:{width:1.2,color:'#2563eb'}},{name:'MA20',type:'line',data:m20,showSymbol:false,lineStyle:{width:1.2,color:'#9333ea'}},{name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,data:volumes}]});requestAnimationFrame(function(){chart.resize()})}document.querySelector('.watchlist-panel').addEventListener('click',function(ev){var btn=ev.target.closest('.kline-popup-trigger');if(!btn)return;b.hidden=false;document.body.style.overflow='hidden';r.textContent='正在加载...';e.hidden=true;el.hidden=false;fetch(btn.dataset.klineUrl).then(function(x){if(!x.ok)throw Error();return x.json()}).then(draw).catch(function(){r.textContent='加载失败';e.textContent='K线数据加载失败，请稍后重试。';e.hidden=false;el.hidden=true})});c.addEventListener('click',close);b.addEventListener('click',function(ev){if(ev.target===b)close()});document.addEventListener('keydown',function(ev){if(ev.key==='Escape'&&!b.hidden)close()});window.addEventListener('resize',function(){if(chart)chart.resize()})}());</script>
+
+       <script>
+       (function() {
+         var panel = document.querySelector('.watchlist-panel');
+         if (!panel) return;
+         var backdrop = document.getElementById('watchlist-kline-backdrop');
+         var closeButton = document.getElementById('watchlist-kline-close');
+         var title = document.getElementById('watchlist-kline-title');
+         var range = document.getElementById('watchlist-kline-range');
+         var empty = document.getElementById('watchlist-kline-empty');
+         var element = document.getElementById('watchlist-kline-chart');
+         var chart = null;
+         function close() { backdrop.hidden = true; document.body.style.overflow = ''; }
+         panel.addEventListener('click', function(event) {
+           var button = event.target.closest('.kline-popup-trigger');
+           if (!button) return;
+           event.stopImmediatePropagation();
+           backdrop.hidden = false;
+           document.body.style.overflow = 'hidden';
+           fetch(button.getAttribute('data-kline-url')).then(function(response) { return response.json(); }).then(function(payload) {
+             var data = payload.data || [];
+             title.textContent = payload.stock_name + ' · ' + payload.stock_code + ' K线';
+              if (!data.length) { range.textContent = '暂无历史行情'; empty.textContent = '暂无该股票行情，请先同步观察行情。'; empty.hidden = false; element.hidden = true; return; }
+              empty.hidden = true; element.hidden = false;
+              range.textContent = data[0].date + ' 至 ' + data[data.length - 1].date + ' · ' + data.length + ' 个交易日';
+              chart = window.renderUnifiedKline(element, payload, { chart: chart });
+              return;
+              if (!chart) chart = echarts.init(element);
+             var points = payload.bs_points || [];
+             function markerPoints(action, edge) {
+               return points.filter(function(item) { return item.action === action; }).map(function(item) {
+                 var candle = data.find(function(row) { return row.date === item.date; });
+                  return { value: [item.date, candle ? candle[edge] : item.price], tradePrice: item.price };
+               });
+             }
+             chart.setOption({
+               animation: false,
+                legend: { top: 0, data: ['日K', '买入 B', '卖出 S', '成交量（手）'] },
+                tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, formatter: function(params) { var candle = params.find(function(param) { return param.seriesName === '日K'; }); if (!candle) return ''; var item = data[candle.dataIndex]; function compact(value) { return value >= 100000000 ? (value / 100000000).toFixed(2) + ' 亿手' : value >= 10000 ? (value / 10000).toFixed(2) + ' 万手' : value.toFixed(0) + ' 手'; } return ['<b>' + item.date + '</b>', '开盘：' + item.open.toFixed(2), '收盘：' + item.close.toFixed(2), '最高：' + item.high.toFixed(2), '最低：' + item.low.toFixed(2), '成交量：' + compact(item.volume)].join('<br>'); } },
+               grid: [{ left: 58, right: 24, top: 42, height: '58%' }, { left: 58, right: 24, top: '73%', height: '13%' }],
+               xAxis: [{ type: 'category', data: data.map(function(item) { return item.date; }), boundaryGap: true }, { type: 'category', gridIndex: 1, data: data.map(function(item) { return item.date; }), axisLabel: { show: false } }],
+                yAxis: [{ scale: true }, { min: 0, gridIndex: 1, axisLabel: { formatter: function(value) { return value >= 100000000 ? (value / 100000000).toFixed(1) + '亿' : value >= 10000 ? (value / 10000).toFixed(0) + '万' : value.toFixed(0); } } }],
+               dataZoom: [{ type: 'inside', xAxisIndex: [0, 1] }, { type: 'slider', xAxisIndex: [0, 1], bottom: 5, height: 20 }],
+               series: [
+                 { name: '日K', type: 'candlestick', data: data.map(function(item) { return [item.open, item.close, item.low, item.high]; }), itemStyle: { color: '#b95d4c', color0: '#22654d', borderColor: '#b95d4c', borderColor0: '#22654d' } },
+                  { name: '买入 B', type: 'scatter', data: markerPoints('BUY', 'low'), symbol: 'circle', symbolSize: 4, z: 10, label: { show: true, formatter: 'B', position: 'bottom', distance: 4, color: '#b95d4c', fontSize: 10, fontWeight: 'bold' }, itemStyle: { color: '#b95d4c', borderColor: '#fff', borderWidth: 1 } },
+                  { name: '卖出 S', type: 'scatter', data: markerPoints('SELL', 'high'), symbol: 'diamond', symbolSize: 4, z: 10, label: { show: true, formatter: 'S', position: 'top', distance: 4, color: '#22654d', fontSize: 10, fontWeight: 'bold' }, itemStyle: { color: '#22654d', borderColor: '#fff', borderWidth: 1 } }
+                 , { name: '成交量（手）', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: data.map(function(item) { return { value: item.volume, itemStyle: { color: item.close >= item.open ? '#b95d4c' : '#22654d' } }; }) }
+               ]
+             });
+             requestAnimationFrame(function() { chart.resize(); });
+           }).catch(function() { range.textContent = '加载失败'; empty.textContent = 'K线数据加载失败，请稍后重试。'; empty.hidden = false; element.hidden = true; });
+         }, true);
+         closeButton.addEventListener('click', close);
+         backdrop.addEventListener('click', function(event) { if (event.target === backdrop) close(); });
+         document.addEventListener('keydown', function(event) { if (event.key === 'Escape' && !backdrop.hidden) close(); });
+       }());
+       </script>
+
+       {% elif page == 'notifications' %}
+      {% set nd = notification_data %}
+      <section class="intro">
+        <div><span class="eyebrow">NOTIFICATIONS</span><p>查阅全部提醒通知。点击未读通知会自动标记为已读。</p></div>
+        <a class="button secondary" href="{{ url_for('alert_types_management') }}">提醒设置 →</a>
+      </section>
+      {% if nd.rows %}
+      <section class="panel notification-page-panel">
+        <div class="panel-title">提醒通知 <span class="pill">共 {{ nd.total }} 条 · {{ nd.unread }} 条未读</span></div>
+        <div class="notification-page-list">
+          {% for item in nd.rows %}
+          <button class="notification-page-item {{ 'unread' if not item.read_at else '' }}" type="button" data-id="{{ item.id }}">
+            <span class="notification-stage {{ item.stage|lower }}">{{ '候选' if item.stage == 'CANDIDATE' else '确认' }}</span>
+            <span class="notification-page-main"><b>{{ item.title }}</b><small>{{ item.content }}</small><span class="notification-page-meta"><span>{{ item.stock_name }} · {{ item.stock_code }}</span><time>{{ item.created_at[:16]|replace('T', ' ') }}</time></span></span>
+          </button>
+          {% endfor %}
+        </div>
+        {% if nd.total_pages > 1 %}<div class="pagination">{% if nd.page > 1 %}<a class="page-link" href="{{ url_for('notifications', page=nd.page - 1) }}">‹ 上一页</a>{% else %}<span class="page-link disabled">‹ 上一页</span>{% endif %}<span class="page-info">第 {{ nd.page }} / {{ nd.total_pages }} 页 · 共 {{ nd.total }} 条</span>{% if nd.page < nd.total_pages %}<a class="page-link" href="{{ url_for('notifications', page=nd.page + 1) }}">下一页 ›</a>{% else %}<span class="page-link disabled">下一页 ›</span>{% endif %}</div>{% endif %}
+      </section>
+      <script>(function(){var panel=document.querySelector('.notification-page-list');panel.addEventListener('click',function(event){var item=event.target.closest('.notification-page-item');if(!item||!item.classList.contains('unread'))return;fetch('/api/notifications/'+item.dataset.id+'/read',{method:'POST'}).then(function(response){if(response.ok)window.location.reload()})})}());</script>
+      {% else %}<section class="panel"><div class="empty">还没有提醒通知。开启“三日低吸”提醒后，盘中或收盘满足条件时会在这里生成通知。</div></section>{% endif %}
+
+      {% elif page == 'summary' %}
+       {% set s = data.summary %}{% set es = data.execution_summary %}
+      <section class="intro"><div><span class="eyebrow">SUMMARY</span><p>总体表现、月度盈亏与持仓概览。</p></div><a class="button secondary" href="{{ url_for('analysis_stocks') }}">进入个股分析 →</a></section>
+      <section class="metrics"><div class="metric"><span>已平仓批次</span><b>{{ s.trades }}</b><small>FIFO 匹配完成</small></div><div class="metric"><span>累计已实现盈亏</span><b class="{{ 'gain' if s.profit >= 0 else 'loss' }}">{{ s.profit|money }}</b><small>扣除交易费用</small></div><div class="metric"><span>胜率</span><b>{{ s.win_rate|percent }}</b><small>盈利批次 / 已平仓批次</small></div><div class="metric"><span>累计费用</span><b>{{ es.fees|money }}</b><small>佣金、印花税及杂费</small></div></section>
+       {% set ts = data.trading_system %}
+       <div class="summary-support-grid">
+       <section class="panel trading-system-card">
+        <div class="panel-title">我的交易系统 <span class="pill">完整交易周期口径</span></div>
+        <div class="metrics">
+          <div class="metric"><span>完整交易次数</span><b>{{ ts.total }}</b><small>已平仓交易周期</small></div>
+          <div class="metric"><span>平均盈利</span><b class="gain">{{ (ts.avg_win|money) if ts.avg_win is not none else '—' }}</b><small>盈利交易平均收益</small></div>
+          <div class="metric"><span>平均亏损</span><b class="loss">{{ (ts.avg_loss|money) if ts.avg_loss is not none else '—' }}</b><small>亏损交易平均亏损</small></div>
+          <div class="metric"><span>盈亏比</span><b>{{ ('%.2f'|format(ts.profit_factor)) if ts.profit_factor is not none else '—' }}</b><small>平均盈利 ÷ 平均亏损</small></div>
+          <div class="metric"><span>最大连续盈利</span><b class="gain">{{ ts.max_win_streak }}</b><small>连续盈利交易数</small></div>
+          <div class="metric"><span>最大连续亏损</span><b class="loss">{{ ts.max_loss_streak }}</b><small>连续亏损交易数</small></div>
+        </div>
+       </section>
+       <section class="panel review-progress-card">
+        <div class="panel-title">交易复盘完成度</div>
+        <div class="review-progress-row">
+          <div class="review-progress-number"><small>已平仓完整交易</small><b>{{ data.review_progress.total }}</b></div>
+          <div class="review-progress-number"><small>已复盘</small><b class="gain">{{ data.review_progress.completed }}</b></div>
+          <div class="review-progress-number warning"><small>未复盘</small><b>{{ data.review_progress.pending }}</b></div>
+          <div class="review-progress-number"><small>完成度</small><b>{{ data.review_progress.rate|percent }}</b></div>
+          <div class="review-progress-actions">
+            <a class="button secondary" href="{{ url_for('analysis_reviews', status='pending') }}">待复盘交易</a>
+            <a class="button" href="{{ url_for('analysis_reviews', status='completed') }}">已复盘交易</a>
+          </div>
+        </div>
+       </section>
+       </div>
+        {% set performance = data.performance %}
+        <section class="panel performance-panel">
+          <nav class="performance-tabs" aria-label="收益分析周期">
+            <a class="{{ 'active' if performance_period == 'day' else '' }}" href="{{ url_for('analysis_summary', period='day') }}">日盈亏</a>
+            <a class="{{ 'active' if performance_period == 'month' else '' }}" href="{{ url_for('analysis_summary', period='month') }}">月度盈亏</a>
+            <a class="{{ 'active' if performance_period == 'year' else '' }}" href="{{ url_for('analysis_summary', period='year') }}">年度盈亏</a>
+          </nav>
+          {% if performance_period == 'day' %}
+          <div class="performance-body day-performance">
+            <div class="calendar-panel">
+              <div class="calendar-heading"><button type="button" disabled>‹</button><strong>{{ performance.month_name }}</strong><button type="button" disabled>›</button></div>
+              <div class="calendar-weekdays">{% for label in ['日','一','二','三','四','五','六'] %}<span>{{ label }}</span>{% endfor %}</div>
+              <div class="profit-calendar">{% for week in performance.calendar_weeks %}{% for cell in week %}<div class="calendar-cell {{ 'empty-cell' if not cell.day else ('positive' if cell.profit is not none and cell.profit >= 0 else ('negative' if cell.profit is not none else '')) }}" {% if cell.profit is not none %}title="{{ cell.period }} · {{ cell.profit|money }}"{% endif %}>{% if cell.day %}<span>{{ '%02d'|format(cell.day) }}</span>{% if cell.profit is not none %}<b>{{ cell.profit|money }}</b>{% endif %}{% endif %}</div>{% endfor %}{% endfor %}</div>
+            </div>
+            <div class="performance-aside"><div><small>本月累计</small><b class="{{ 'gain' if performance.day_stats.profit >= 0 else 'loss' }}">{{ performance.day_stats.profit|money }}</b></div><div><small>交易日</small><b>{{ performance.day_stats.trading_days }}</b></div><div><small>最佳单日</small><b class="gain">{{ performance.day_stats.best.profit|money if performance.day_stats.best else '—' }}</b></div><div><small>最差单日</small><b class="loss">{{ performance.day_stats.worst.profit|money if performance.day_stats.worst else '—' }}</b></div></div>
+          </div>
+          {% elif performance_period == 'month' %}
+          <div class="performance-body heatmap-performance"><div class="heatmap-main"><div class="period-switcher"><a href="{{ url_for('analysis_summary', period='month', year=performance.selected_year - 1) }}">‹</a><strong>{{ performance.selected_year }}年</strong><a href="{{ url_for('analysis_summary', period='month', year=performance.selected_year + 1) }}">›</a></div><div class="month-heatmap">{% for row in performance.month_grid %}<div class="month-tile {{ 'positive' if row.profit is not none and row.profit >= 0 else ('negative' if row.profit is not none else 'empty') }}"><span>{{ row.label }}</span><b>{{ row.profit|money if row.profit is not none else '—' }}</b></div>{% endfor %}</div><div class="heatmap-summary"><span>年度收益 <b class="{{ 'gain' if performance.selected_year_profit >= 0 else 'loss' }}">{{ performance.selected_year_profit|money }}</b></span><span>交易笔数 <b>{{ performance.selected_year_trades }}</b></span><span>盈利月份 <b>{{ performance.selected_year_positive_months }}</b></span></div></div></div>
+          {% else %}
+          <div class="performance-body heatmap-performance"><div class="heatmap-main"><div class="period-switcher"><strong>年度收益</strong></div><div class="year-heatmap">{% for row in performance.yearly %}<a class="year-tile {{ 'positive' if row.profit >= 0 else 'negative' }}" href="{{ url_for('analysis_summary', period='month', year=row.period|int) }}"><span>{{ row.period }}年</span><b>{{ row.profit|money }}</b></a>{% else %}<div class="empty">暂无年度数据。</div>{% endfor %}</div><div class="heatmap-summary"><span>年度收益 <b class="{{ 'gain' if performance.stats.profit >= 0 else 'loss' }}">{{ performance.stats.profit|money }}</b></span><span>盈利年度 <b>{{ performance.yearly|selectattr('profit', 'gt', 0)|list|length }}</b></span><span>亏损年度 <b>{{ performance.yearly|selectattr('profit', 'lt', 0)|list|length }}</b></span></div></div></div>
+          {% endif %}
+        </section>
+
+      {% elif page == 'reviews' %}
+      <section class="intro">
+        <div>
+          <span class="eyebrow">TRADE REVIEWS</span>
+          <p>{{ '全部已平仓交易：无论是否复盘都展示。' if status_filter == 'all' else ('待复盘交易：已平仓但尚未完成复盘。' if status_filter == 'pending' else '已复盘交易：已经完成主观复盘。') }}</p>
+        </div>
+        <div class="intro-actions">
+          <a class="button {{ 'secondary' if status_filter != 'all' else '' }}" href="{{ url_for('analysis_reviews', status='all', start_date=start_date, end_date=end_date) }}">全部</a>
+          <a class="button {{ 'secondary' if status_filter != 'pending' else '' }}" href="{{ url_for('analysis_reviews', status='pending', start_date=start_date, end_date=end_date) }}">待复盘 {{ review_progress.pending }}</a>
+          <a class="button {{ 'secondary' if status_filter != 'completed' else '' }}" href="{{ url_for('analysis_reviews', status='completed', start_date=start_date, end_date=end_date) }}">已复盘 {{ review_progress.completed }}</a>
+        </div>
+      </section>
+      <section class="panel review-filter-panel">
+        <div class="panel-title">时间范围</div>
+        <form class="review-date-form" method="get" action="{{ url_for('analysis_reviews') }}">
+          <input type="hidden" name="status" value="{{ status_filter }}">
+          <label>从 <input type="date" name="start_date" value="{{ start_date }}" max="{{ end_date }}"></label>
+          <label>至 <input type="date" name="end_date" value="{{ end_date }}" min="{{ start_date }}"></label>
+          <button class="button" type="submit">查询</button>
+          <div class="review-date-quick">
+            {% for q in quick_ranges %}
+            <a class="days-tab {{ 'active' if start_date == q.start and end_date == q.end else '' }}" href="{{ url_for('analysis_reviews', status=status_filter, start_date=q.start, end_date=q.end) }}">{{ q.days }}天</a>
+            {% endfor %}
+            <a class="days-tab" href="{{ url_for('analysis_reviews', status=status_filter) }}">清除筛选</a>
+          </div>
+        </form>
+      </section>
+      <section class="review-range-summary">
+        <div><small>区间交易</small><b>{{ range_summary.trades }}</b></div>
+        <div><small>盈利笔数</small><b class="gain">{{ range_summary.wins }}</b></div>
+        <div><small>亏损笔数</small><b class="loss">{{ range_summary.trades - range_summary.wins }}</b></div>
+        <div><small>合计盈亏</small><b class="{{ 'gain' if range_summary.profit >= 0 else 'loss' }}">{{ range_summary.profit|money }}</b></div>
+      </section>
+      <section class="panel">
+        <div class="table-wrap"><table><thead><tr><th>证券</th><th>买入日期</th><th>卖出日期</th><th>持仓天数</th><th>累计盈亏</th><th>复盘状态</th><th></th></tr></thead><tbody>
+          {% for row in review_episodes %}
+          <tr><td><b>{{ row.stock_code }}</b><small>{{ row.stock_name }}</small></td><td>{{ row.opened_at[:10] }}</td><td>{{ row.closed_at[:10] }}</td><td>{{ row.holding_days }}</td><td class="{{ 'gain' if row.profit >= 0 else 'loss' }}">{{ row.profit|money }}</td><td>{% if row.review_status == 'COMPLETED' %}<button type="button" class="review-badge completed review-popup-trigger" data-review='{{ {'code': row.stock_code, 'name': row.stock_name, 'judgement': row.judgement_result, 'main_problem': row.main_problem, 'reason_types': row.reason_type_labels, 'completed_at': (row.completed_at[:10] if row.completed_at else ''), 'trade_reason': (row.trade_reason or ''), 'sell_reason': (row.sell_reason or ''), 'review_note': (row.review_note or ''), 'next_action': (row.next_action or ''), 'confidence': row.confidence_level, 'expected_profit_percent': row.expected_profit_percent, 'expected_target_price': row.expected_target_price, 'stop_loss_price': row.stop_loss_price, 'expected_holding_days': row.expected_holding_days}|tojson }}'>已复盘</button>{% elif row.review_status == 'PENDING' %}<span class="review-badge draft">草稿</span>{% else %}<span class="review-badge">未复盘</span>{% endif %}</td><td><a class="detail-link" href="{{ url_for('analysis_trade_detail', episode_id=row.id) }}">去复盘 →</a></td></tr>
+          {% else %}<tr><td colspan="7" class="empty">该时间段内{{ '没有待复盘的已平仓交易。' if status_filter == 'pending' else ('还没有已完成复盘的交易。' if status_filter == 'completed' else '没有已平仓交易。') }}</td></tr>{% endfor %}
+        </tbody></table></div>
+      </section>
+      <div class="review-modal-backdrop" id="review-modal-backdrop" hidden>
+        <div class="review-modal" role="dialog" aria-modal="true" aria-label="复盘信息">
+          <button type="button" class="review-modal-close" id="review-modal-close" aria-label="关闭">×</button>
+          <div id="review-modal-content"></div>
+        </div>
+      </div>
+      <script>
+      (function () {
+        var judgementLabels = {{ review_judgement_labels|tojson }};
+        var problemLabels = {{ review_main_problem_labels|tojson }};
+        var backdrop = document.getElementById('review-modal-backdrop');
+        var content = document.getElementById('review-modal-content');
+        var closeBtn = document.getElementById('review-modal-close');
+
+        function section(title, body) {
+          return body ? '<div class="review-modal-section"><h4>' + title + '</h4><p>' + body + '</p></div>' : '';
+        }
+        function esc(text) {
+          return String(text == null ? '' : text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function openReview(button) {
+          var d = JSON.parse(button.getAttribute('data-review'));
+          var html = '';
+          html += '<div class="review-modal-head"><b>' + esc(d.code) + ' ' + esc(d.name) + '</b><span>' + (d.completed_at ? '复盘日期 ' + esc(d.completed_at) : '') + '</span></div>';
+          html += '<div class="review-modal-meta">';
+          html += '<div><span>判断结论</span><b class="judgement ' + esc(d.judgement || '') + '">' + esc(judgementLabels[d.judgement] || '未填写') + '</b></div>';
+          html += '<div><span>主要问题</span><b>' + esc(problemLabels[d.main_problem] || '未填写') + '</b></div>';
+          html += '<div><span>信心评分</span><b>' + (d.confidence ? esc(d.confidence) + ' / 5' : '未填写') + '</b></div>';
+          html += '</div>';
+          if (d.reason_types && d.reason_types.length) {
+            html += '<div class="review-modal-reasons"><h4>交易类型</h4><div class="review-modal-reason-chips">' + d.reason_types.map(function (label) { return '<span>' + esc(label) + '</span>'; }).join('') + '</div></div>';
+          }
+          html += section('为什么买', esc(d.trade_reason));
+          html += section('为什么卖', esc(d.sell_reason));
+          html += section('复盘笔记', esc(d.review_note));
+          html += section('下一步行动', esc(d.next_action));
+          if (d.expected_profit_percent || d.expected_target_price || d.stop_loss_price || d.expected_holding_days) {
+            var plan = [];
+            if (d.expected_profit_percent) { plan.push('预期空间 ' + d.expected_profit_percent + '%'); }
+            if (d.expected_target_price) { plan.push('目标价 ' + d.expected_target_price); }
+            if (d.stop_loss_price) { plan.push('止损 ' + d.stop_loss_price); }
+            if (d.expected_holding_days) { plan.push('持有 ' + d.expected_holding_days + ' 天'); }
+            html += section('买入时计划', esc(plan.join(' · ')));
+          }
+          content.innerHTML = html;
+          backdrop.hidden = false;
+          document.body.style.overflow = 'hidden';
+        }
+        function closeReview() {
+          backdrop.hidden = true;
+          document.body.style.overflow = '';
+        }
+        document.querySelectorAll('.review-popup-trigger').forEach(function (btn) {
+          btn.addEventListener('click', function () { openReview(btn); });
+        });
+        closeBtn.addEventListener('click', closeReview);
+        backdrop.addEventListener('click', function (e) { if (e.target === backdrop) { closeReview(); } });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { closeReview(); } });
+      })();
+      </script>
+
+      {% elif page == 'recent' %}
+      {% set s = recent.summary %}
+      {% set a = recent.all_summary %}
+      <section class="intro">
+        <div>
+          <span class="eyebrow">RECENT PERFORMANCE</span>
+          <p>追踪最近交易状态，发现新趋势和新问题。</p>
+        </div>
+        <div class="days-tabs">
+          {% for d in [7, 15, 30, 60] %}
+          <a href="{{ url_for('analysis_recent', days=d) }}" class="days-tab {{ 'active' if days == d else '' }}">{{ d }}天</a>
+          {% endfor %}
+        </div>
+      </section>
+
+      {# 对比卡片 #}
+      <section class="metrics">
+        {% set wr_diff = s.win_rate - a.win_rate %}
+        {% set ap_diff = s.avg_profit - a.avg_profit %}
+        {% set ah_diff = s.avg_hold - a.avg_hold %}
+        <div class="metric {{ 'metric-success' if wr_diff >= 0 else 'metric-warning' }}">
+          <span>近{{ days }}天 · 胜率</span>
+          <b>{{ (s.win_rate * 100)|round(1) }}%</b>
+          <small>历史 {{ (a.win_rate * 100)|round(1) }}%
+            {{ '▲' if wr_diff >= 0 else '▼' }}{{ (wr_diff * 100)|abs|round(1) }}%</small>
+        </div>
+        <div class="metric {{ 'metric-success' if ap_diff >= 0 else 'metric-warning' }}">
+          <span>近{{ days }}天 · 均盈亏</span>
+          <b class="{{ 'gain' if s.avg_profit >= 0 else 'loss' }}">{{ s.avg_profit|money }}</b>
+          <small>历史 {{ a.avg_profit|money }}
+            {{ '▲' if ap_diff >= 0 else '▼' }}{{ ap_diff|abs|money }}</small>
+        </div>
+        <div class="metric">
+          <span>近{{ days }}天 · 交易笔数</span>
+          <b>{{ s.trades }}</b>
+          <small>盈利 {{ s.wins }} 笔 · 亏损 {{ s.trades - s.wins }} 笔</small>
+        </div>
+        <div class="metric {{ 'metric-success' if ah_diff >= 0 else 'metric-warning' }}">
+          <span>近{{ days }}天 · 均持仓</span>
+          <b>{{ s.avg_hold|round(1) }} 天</b>
+          <small>历史 {{ a.avg_hold|round(1) }} 天
+            {{ '▲' if ah_diff >= 0 else '▼' }}{{ ah_diff|abs|round(1) }} 天</small>
+        </div>
+      </section>
+
+      {# 每日盈亏图 #}
+      <section class="panel">
+        <div class="panel-title">每日盈亏走势 · 近{{ days }}天</div>
+        {% if recent.daily %}
+        <div id="recent-daily-chart" style="width:100%;height:320px;"></div>
+        {% else %}
+        <div class="empty">近 {{ days }} 天暂无已平仓交易。</div>
+        {% endif %}
+      </section>
+
+      {# 个股好坏对比 #}
+      {% if recent.stocks %}
+      <section class="analysis-grid">
+        <div class="panel">
+          <div class="panel-title">🌟 本期最佳个股</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>股票</th><th>笔数</th><th>胜率</th><th>盈亏</th></tr></thead>
+              <tbody>
+                {% for row in recent.best_stocks %}
+                {% if row.profit > 0 %}
+                <tr>
+                  <td><b>{{ row.stock_code }}</b><small>{{ row.stock_name }}</small></td>
+                  <td>{{ row.trades }}</td>
+                  <td>{{ (row.win_rate * 100)|round(0)|int }}%</td>
+                  <td class="gain">+{{ row.profit|money }}</td>
+                </tr>
+                {% endif %}
+                {% else %}
+                <tr><td colspan="4" class="empty">本期暂无盈利个股。</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">💔 本期最差个股</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>股票</th><th>笔数</th><th>胜率</th><th>盈亏</th></tr></thead>
+              <tbody>
+                {% for row in recent.worst_stocks %}
+                {% if row.profit < 0 %}
+                <tr>
+                  <td><b>{{ row.stock_code }}</b><small>{{ row.stock_name }}</small></td>
+                  <td>{{ row.trades }}</td>
+                  <td>{{ (row.win_rate * 100)|round(0)|int }}%</td>
+                  <td class="loss">{{ row.profit|money }}</td>
+                </tr>
+                {% endif %}
+                {% else %}
+                <tr><td colspan="4" class="empty">本期暂无亏损个股。</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+      {% endif %}
+
+      {# 最差单日复盘 #}
+      {% if recent.worst_day and recent.worst_day.loss < 0 %}
+      <section class="panel warning-panel">
+        <div class="panel-title">⚠️ 最差单日复盘 · {{ recent.worst_day.sell_date }}</div>
+        <p>当日 {{ recent.worst_day.trades }} 笔交易，盈利 {{ recent.worst_day.wins }} 笔，亏损 {{ recent.worst_day.trades - recent.worst_day.wins }} 笔，合计 <b class="loss">{{ recent.worst_day.loss|money }}</b> 元。</p>
+        {% if recent.worst_day_trades %}
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>股票</th><th>名称</th><th>买入日</th><th>笔数</th><th>盈亏</th></tr></thead>
+            <tbody>
+              {% for row in recent.worst_day_trades %}
+              <tr>
+                <td><b>{{ row.stock_code }}</b></td>
+                <td>{{ row.stock_name }}</td>
+                <td>{{ row.buy_date }}</td>
+                <td>{{ row.matches }}</td>
+                <td class="{{ 'gain' if row.profit >= 0 else 'loss' }}">{{ row.profit|money }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% endif %}
+        <p class="hint">💡 建议：复盘当天的市场环境和情绪状态，找出是否存在追跌或情绪化操作。</p>
+      </section>
+      {% endif %}
+
+      {# 智能建议 #}
+      <section class="panel insight-box" style="border-left:none;border:1px solid var(--line);">
+        <div class="panel-title">💡 近{{ days }}天智能建议</div>
+        {% set wr_diff = s.win_rate - a.win_rate %}
+        {% set ap_diff = s.avg_profit - a.avg_profit %}
+        <ul class="insights-list">
+          {% if wr_diff >= 0.05 %}
+          <li class="insight-good">✅ 胜率 {{ (s.win_rate*100)|round(1) }}%，比历史高 {{ (wr_diff*100)|round(1) }}%，近期状态不错，保持节奏。</li>
+          {% elif wr_diff < -0.05 %}
+          <li class="insight-bad">⚠️ 胜率 {{ (s.win_rate*100)|round(1) }}%，比历史低 {{ (wr_diff*100)|abs|round(1) }}%，近期手感偏差，考虑降低交易频率。</li>
+          {% else %}
+          <li class="insight-neutral">📊 胜率 {{ (s.win_rate*100)|round(1) }}%，与历史持平，状态稳定。</li>
+          {% endif %}
+          {% if ap_diff < -20 %}
+          <li class="insight-bad">⚠️ 单笔均亏比历史扩大 {{ ap_diff|abs|money }} 元，止损纪律需要加强，避免单笔大亏。</li>
+          {% elif ap_diff > 20 %}
+          <li class="insight-good">✅ 单笔均盈亏比历史改善 {{ ap_diff|money }} 元，交易质量提升。</li>
+          {% endif %}
+          {% if s.avg_hold > a.avg_hold %}
+          <li class="insight-good">✅ 持仓天数延长至 {{ s.avg_hold|round(1) }} 天（历史 {{ a.avg_hold|round(1) }} 天），更有耐心。</li>
+          {% endif %}
+          {% if recent.worst_day and recent.worst_day.loss < -500 %}
+          <li class="insight-bad">⚠️ {{ recent.worst_day.sell_date }} 单日亏损 {{ recent.worst_day.loss|money }} 元，需要分析当天情绪状态。</li>
+          {% endif %}
+          {% for row in recent.worst_stocks %}
+          {% if row.profit < -500 and row.trades >= 3 %}
+          <li class="insight-bad">⚠️ {{ row.stock_code }}（{{ row.stock_name }}）近期亏损 {{ row.profit|money }} 元，{{ row.trades }} 笔，考虑暂时回避。</li>
+          {% endif %}
+          {% endfor %}
+          {% if s.trades == 0 %}
+          <li class="insight-neutral">📊 近 {{ days }} 天暂无已平仓交易。</li>
+          {% endif %}
+        </ul>
+        <p style="margin-top:14px;"><a class="button secondary" style="font-size:12px;" href="{{ url_for('analysis_discipline') }}">查看长期情绪纪律分析 →</a></p>
+      </section>
+
+      {% if recent.daily %}
+      <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+      <script>
+      var dailyChart = echarts.init(document.getElementById('recent-daily-chart'));
+      var dailyDates  = [{% for row in recent.daily %}'{{ row.sell_date }}'{{ ',' if not loop.last else '' }}{% endfor %}];
+      var dailyProfit = [{% for row in recent.daily %}{{ row.profit }}{{ ',' if not loop.last else '' }}{% endfor %}];
+      var dailyTrades = [{% for row in recent.daily %}{{ row.trades }}{{ ',' if not loop.last else '' }}{% endfor %}];
+      var dailyWins   = [{% for row in recent.daily %}{{ row.wins }}{{ ',' if not loop.last else '' }}{% endfor %}];
+
+      // 找最好日/最差日索引
+      var maxIdx = dailyProfit.indexOf(Math.max.apply(null, dailyProfit));
+      var minIdx = dailyProfit.indexOf(Math.min.apply(null, dailyProfit));
+
+      var markPoints = [];
+      if (dailyProfit[maxIdx] > 0) {
+        markPoints.push({ coord: [dailyDates[maxIdx], dailyProfit[maxIdx]], name: '最佳', symbol: 'pin', symbolSize: 30, itemStyle: { color: '#22654d' } });
+      }
+      if (dailyProfit[minIdx] < 0) {
+        markPoints.push({ coord: [dailyDates[minIdx], dailyProfit[minIdx]], name: '最差', symbol: 'pin', symbolSize: 30, itemStyle: { color: '#b95d4c' } });
+      }
+
+      dailyChart.setOption({
+        tooltip: {
+          trigger: 'axis',
+          axisPointer: { type: 'cross' },
+          formatter: function(params) {
+            var idx = params[0].dataIndex;
+            var wr = dailyTrades[idx] > 0 ? (dailyWins[idx] / dailyTrades[idx] * 100).toFixed(0) : 0;
+            return params[0].name +
+              '<br/>盈亏: <b>' + (dailyProfit[idx] >= 0 ? '+' : '') + dailyProfit[idx].toFixed(2) + ' 元</b>' +
+              '<br/>交易: ' + dailyTrades[idx] + ' 笔 · 胜率: ' + wr + '%';
+          }
+        },
+        xAxis: { type: 'category', data: dailyDates, axisLabel: { rotate: 30 } },
+        yAxis: [
+          { type: 'value', name: '盈亏（元）', position: 'left' },
+          { type: 'value', name: '交易笔数', position: 'right', splitLine: { show: false } }
+        ],
+        series: [
+          {
+            name: '当日盈亏',
+            type: 'bar',
+            data: dailyProfit.map(function(v) {
+              return { value: v, itemStyle: { color: v >= 0 ? '#22654d' : '#b95d4c' } };
+            }),
+            markPoint: { data: markPoints, label: { fontSize: 11 } }
+          },
+          {
+            name: '交易笔数',
+            type: 'line',
+            yAxisIndex: 1,
+            data: dailyTrades,
+            lineStyle: { color: '#d88748', type: 'dashed', width: 1.5 },
+            itemStyle: { color: '#d88748' },
+            symbol: 'circle', symbolSize: 5
+          }
+        ],
+        legend: { data: ['当日盈亏', '交易笔数'], top: 5 },
+        grid: { left: 65, right: 55, top: 45, bottom: 55 }
+      });
+
+      window.addEventListener('resize', function() { dailyChart.resize(); });
+      </script>
+      {% endif %}
+
+      {% elif page == 'strategy' %}
+      {% set s = strategy.summary %}{% set b = strategy.baseline %}
+      <section class="intro">
+        <div><span class="eyebrow">STRATEGY LAB</span><p>组合历史成交条件，验证想法是否有足够样本和真实收益。</p></div>
+        <a class="button secondary" href="{{ url_for('analysis_timing') }}">查看时机分析 →</a>
+      </section>
+
+      <section class="strategy-presets">
+        <span>快速验证</span>
+        <a href="{{ url_for('analysis_strategy', buy_session='close', sell_session='open', min_days=1, max_days=1) }}">尾盘买 · 次日开盘卖</a>
+        <a href="{{ url_for('analysis_strategy', min_days=2, max_days=2) }}">只做 T+2</a>
+        <a href="{{ url_for('analysis_strategy', sell_session='close', min_days=0, max_days=30) }}">只在尾盘卖</a>
+      </section>
+
+      <section class="panel reason-stats-panel">
+        <div class="panel-title">我的策略类型统计 <span class="pill">基于交易复盘逻辑</span></div>
+        <div class="table-wrap"><table><thead><tr><th>交易逻辑</th><th>交易次数</th><th>胜率</th><th>平均收益率</th><th>平均盈利</th><th>平均亏损</th><th>盈亏比</th><th>平均持仓</th><th>累计盈亏</th></tr></thead><tbody>
+          {% for row in reason_stats %}
+          <tr><td><b>{{ reason_labels.get(row.reason_type, row.reason_type) }}</b></td><td>{{ row.trades }}</td><td>{{ row.win_rate|percent }}</td><td class="{{ 'gain' if row.avg_return >= 0 else 'loss' }}">{{ row.avg_return|percent }}</td><td class="gain">{{ (row.avg_win|money) if row.avg_win else '—' }}</td><td class="loss">{{ (row.avg_loss|money) if row.avg_loss else '—' }}</td><td>{{ ('%.2f'|format(row.profit_factor)) if row.profit_factor is not none else '—' }}</td><td>{{ '%.0f'|format(row.avg_holding) }} 天</td><td class="{{ 'gain' if row.total_profit >= 0 else 'loss' }}">{{ row.total_profit|money }}</td></tr>
+          {% else %}<tr><td colspan="9" class="empty">还没有记录交易逻辑的复盘。在交易复盘详情中填写“交易逻辑类型”后，这里会统计你的交易方式表现。</td></tr>{% endfor %}
+        </tbody></table></div>
+      </section>
+
+      <section class="panel strategy-filter-panel">
+        <div class="panel-title">回测条件</div>
+        <form class="strategy-form" method="get" action="{{ url_for('analysis_strategy') }}">
+          <label><span>历史区间</span><select name="period">
+            {% for value, label in [(0, '全部历史'), (30, '近 30 天'), (60, '近 60 天'), (90, '近 90 天'), (180, '近 180 天'), (365, '近 1 年')] %}
+            <option value="{{ value }}" {{ 'selected' if strategy_filters.period == value else '' }}>{{ label }}</option>{% endfor %}
+          </select></label>
+          <label><span>买入时段</span><select name="buy_session"><option value="all">不限</option>
+            {% for value, label in strategy_sessions.items() %}<option value="{{ value }}" {{ 'selected' if strategy_filters.buy_session == value else '' }}>{{ label }}</option>{% endfor %}
+          </select></label>
+          <label><span>卖出时段</span><select name="sell_session"><option value="all">不限</option>
+            {% for value, label in strategy_sessions.items() %}<option value="{{ value }}" {{ 'selected' if strategy_filters.sell_session == value else '' }}>{{ label }}</option>{% endfor %}
+          </select></label>
+          <label><span>最短持仓</span><input type="number" name="min_days" min="0" max="3650" value="{{ strategy_filters.min_days }}"></label>
+          <label><span>最长持仓</span><input type="number" name="max_days" min="0" max="3650" value="{{ strategy_filters.max_days }}"></label>
+          <label><span>买入星期</span><select name="buy_weekday"><option value="0">不限</option>
+            {% for value, label in strategy_weekdays.items() %}<option value="{{ value }}" {{ 'selected' if strategy_filters.buy_weekday == value else '' }}>{{ label }}</option>{% endfor %}
+          </select></label>
+          <label><span>卖出星期</span><select name="sell_weekday"><option value="0">不限</option>
+            {% for value, label in strategy_weekdays.items() %}<option value="{{ value }}" {{ 'selected' if strategy_filters.sell_weekday == value else '' }}>{{ label }}</option>{% endfor %}
+          </select></label>
+          <button class="button" type="submit">开始验证</button>
+        </form>
+      </section>
+
+      <div class="strategy-query">{% for label in strategy.labels %}<span>{{ label }}</span>{% endfor %}</div>
+      {% if strategy.sample_warning %}<div class="strategy-warning">样本仅 {{ s.trades }} 笔，结论容易受个别交易影响。建议至少积累 30 笔后再决定是否采用。</div>{% endif %}
+
+      <section class="metrics">
+        <div class="metric"><span>命中样本</span><b>{{ s.trades }}</b><small>历史平仓批次 {{ b.trades }}</small></div>
+        <div class="metric {{ 'metric-success' if s.win_rate >= b.win_rate else 'metric-warning' }}"><span>策略胜率</span><b>{{ s.win_rate|percent }}</b><small>历史 {{ b.win_rate|percent }} · {{ '%+.1f'|format((s.win_rate-b.win_rate)*100) }}%</small></div>
+        <div class="metric {{ 'metric-success' if s.avg_profit >= b.avg_profit else 'metric-warning' }}"><span>单笔均盈亏</span><b class="{{ 'gain' if s.avg_profit >= 0 else 'loss' }}">{{ s.avg_profit|money }}</b><small>历史 {{ b.avg_profit|money }}</small></div>
+        <div class="metric"><span>收益因子</span><b>{% if strategy.profit_factor == none %}-{% elif strategy.profit_factor > 999 %}∞{% else %}{{ strategy.profit_factor|round(2) }}{% endif %}</b><small>盈利总额 / 亏损总额</small></div>
+      </section>
+
+      <section class="analysis-grid">
+        <div class="panel"><div class="panel-title">策略与历史基准</div><div id="strategy-chart" style="width:100%;height:300px"></div></div>
+        <div class="panel strategy-verdict">
+          <div class="panel-title">数据结论</div>
+          <strong class="{{ 'gain' if s.profit >= 0 else 'loss' }}">累计 {{ s.profit|money }} 元</strong>
+          <p>平均盈利 {{ s.avg_win|money }} 元，平均亏损 {{ s.avg_loss|money }} 元，平均持仓 {{ s.avg_holding|round(1) }} 天。</p>
+          {% if s.trades >= 30 and s.win_rate > b.win_rate and s.avg_profit > b.avg_profit and s.profit > 0 %}
+          <div class="verdict good">该组合同时改善胜率与单笔收益，历史数据提供正向证据。仍需用后续新交易做样本外验证。</div>
+          {% elif s.trades < 30 %}<div class="verdict neutral">目前只能视作线索，不能视作有效策略。</div>
+          {% else %}<div class="verdict bad">该组合尚未同时改善收益和胜率，不建议据此增加仓位。</div>{% endif %}
+        </div>
+      </section>
+
+      <section class="panel"><div class="panel-title">命中交易 <span class="pill">最多显示 100 条</span></div>
+        <div class="table-wrap"><table><thead><tr><th>股票</th><th>买入</th><th>卖出</th><th>持仓</th><th>数量</th><th>盈亏</th><th>收益率</th></tr></thead><tbody>
+          {% for row in strategy.trades %}<tr><td><b>{{ row.stock_code }}</b><small>{{ row.stock_name }}</small></td><td>{{ row.buy_date }}<small>{{ row.buy_time }}</small></td><td>{{ row.sell_date }}<small>{{ row.sell_time }}</small></td><td>T+{{ row.holding_days }}</td><td>{{ row.quantity|money }}</td><td class="{{ 'gain' if row.profit >= 0 else 'loss' }}">{{ row.profit|money }}</td><td class="{{ 'gain' if row.profit >= 0 else 'loss' }}">{{ row.profit_rate|percent }}</td></tr>
+          {% else %}<tr><td colspan="7" class="empty">没有符合当前条件的历史交易，请放宽条件。</td></tr>{% endfor %}
+        </tbody></table></div>
+      </section>
+
+      <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script><script>
+      var strategyChart = echarts.init(document.getElementById('strategy-chart'));
+      strategyChart.setOption({tooltip:{trigger:'axis'},legend:{data:['当前策略','历史基准']},grid:{left:55,right:20,top:50,bottom:40},xAxis:{type:'category',data:['胜率(%)','单笔盈亏']},yAxis:{type:'value'},series:[{name:'当前策略',type:'bar',data:[{{ s.win_rate*100 }},{{ s.avg_profit }}],itemStyle:{color:'#22654d'}},{name:'历史基准',type:'bar',data:[{{ b.win_rate*100 }},{{ b.avg_profit }}],itemStyle:{color:'#d88748'}}]});
+      window.addEventListener('resize',function(){strategyChart.resize()});
+      </script>
+
+      {% elif page == 'timing' %}
+      <section class="intro">
+        <div>
+          <span class="eyebrow">TIMING ANALYSIS</span>
+          <p>找到最佳买卖时段，优化交易时机，提升胜率。</p>
+        </div>
+        <a class="button secondary" href="{{ url_for('analysis_discipline') }}">情绪纪律 →</a>
+      </section>
+
+      {# 买入时段分析 #}
+      <section class="panel">
+        <div class="panel-title">买入时段胜率分析</div>
+        <div id="timing-buy-chart" style="width:100%;height:300px;"></div>
+      </section>
+
+      {# 卖出时段分析 #}
+      <section class="panel">
+        <div class="panel-title">卖出时段胜率分析</div>
+        <div id="timing-sell-chart" style="width:100%;height:300px;"></div>
+      </section>
+
+      {# 开盘尾盘对比 #}
+      <section class="analysis-grid">
+        <div class="panel">
+          <div class="panel-title">时段策略 · 买入</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>时段</th><th>笔数</th><th>胜率</th><th>均盈亏</th><th>总盈亏</th></tr></thead>
+              <tbody>
+                {% for row in timing.session_buy %}
+                <tr>
+                  <td><b>{{ row.session }}</b></td>
+                  <td>{{ row.trades }}</td>
+                  <td>{{ (row.win_rate * 100)|round(1) }}%</td>
+                  <td class="{{ 'gain' if row.avg_profit >= 0 else 'loss' }}">{{ row.avg_profit|money }}</td>
+                  <td class="{{ 'gain' if row.total_profit >= 0 else 'loss' }}">{{ row.total_profit|money }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <div class="insight-box" style="margin-top:14px;">
+            {% set best_buy = timing.session_buy|sort(attribute='win_rate', reverse=True)|first %}
+            {% set worst_buy = timing.session_buy|sort(attribute='avg_profit')|first %}
+            {% if best_buy %}
+            <p><strong>💡 买入建议：</strong></p>
+            <p>{{ best_buy.session }}买入胜率最高（{{ (best_buy.win_rate*100)|round(1) }}%），
+            {% if worst_buy and worst_buy.session != best_buy.session %}
+            建议避免{{ worst_buy.session }}买入（均亏 {{ worst_buy.avg_profit|money }}）。
+            {% else %}
+            建议优先选择此时段。
+            {% endif %}
+            </p>
+            {% endif %}
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">时段策略 · 卖出</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>时段</th><th>笔数</th><th>胜率</th><th>均盈亏</th><th>总盈亏</th></tr></thead>
+              <tbody>
+                {% for row in timing.session_sell %}
+                <tr>
+                  <td><b>{{ row.session }}</b></td>
+                  <td>{{ row.trades }}</td>
+                  <td>{{ (row.win_rate * 100)|round(1) }}%</td>
+                  <td class="{{ 'gain' if row.avg_profit >= 0 else 'loss' }}">{{ row.avg_profit|money }}</td>
+                  <td class="{{ 'gain' if row.total_profit >= 0 else 'loss' }}">{{ row.total_profit|money }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <div class="insight-box" style="margin-top:14px;">
+            {% set best_sell = timing.session_sell|sort(attribute='avg_profit', reverse=True)|first %}
+            {% set worst_sell = timing.session_sell|sort(attribute='avg_profit')|first %}
+            {% if best_sell %}
+            <p><strong>💡 卖出建议：</strong></p>
+            <p>{{ best_sell.session }}卖出效果最好（均盈 {{ best_sell.avg_profit|money }}），
+            {% if worst_sell and worst_sell.session != best_sell.session %}
+            避免{{ worst_sell.session }}卖出（均亏 {{ worst_sell.avg_profit|money }}）。
+            {% else %}
+            建议优先选择此时段。
+            {% endif %}
+            </p>
+            {% endif %}
+          </div>
+        </div>
+      </section>
+
+      {# 星期效应 #}
+      <section class="panel">
+        <div class="panel-title">星期效应分析 · 按卖出日期</div>
+        <div id="timing-weekday-chart" style="width:100%;height:280px;"></div>
+        <div class="insight-box" style="margin-top:14px;">
+          {% set best_day = timing.weekday|sort(attribute='win_rate', reverse=True)|first %}
+          {% set worst_day = timing.weekday|sort(attribute='avg_profit')|first %}
+          {% if best_day %}
+          <p><strong>💡 星期规律：</strong></p>
+          <p>{{ best_day.label }}卖出胜率最高（{{ (best_day.win_rate*100)|round(1) }}%），
+          {% if worst_day and worst_day.label != best_day.label %}
+          {{ worst_day.label }}表现最差（均亏 {{ worst_day.avg_profit|money }}）。
+          {% endif %}
+          可能与周度市场规律或个人习惯有关。
+          </p>
+          {% endif %}
+        </div>
+      </section>
+
+      <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+      <script>
+      // 买入时段图表
+      var buyChart = echarts.init(document.getElementById('timing-buy-chart'));
+      buyChart.setOption({
+        tooltip: {
+          trigger: 'axis',
+          axisPointer: { type: 'shadow' },
+          formatter: function(params) {
+            var bar = params[0], line = params[1];
+            var wr = (line.value * 100).toFixed(1);
+            return bar.name + '点买入<br/>' +
+              '交易: ' + bar.value + ' 笔<br/>' +
+              '胜率: ' + wr + '%<br/>' +
+              '均盈亏: ' + params[2].value.toFixed(2) + ' 元';
+          }
+        },
+        xAxis: {
+          type: 'category',
+          data: [{% for row in timing.buy_by_hour %}'{{ row.hour }}'{{ ',' if not loop.last else '' }}{% endfor %}],
+          name: '买入小时'
+        },
+        yAxis: [
+          { type: 'value', name: '交易笔数', position: 'left' },
+          { type: 'value', name: '胜率', position: 'right', max: 1, axisLabel: { formatter: '{value}' } }
+        ],
+        series: [
+          {
+            name: '交易数',
+            type: 'bar',
+            data: [{% for row in timing.buy_by_hour %}{{ row.trades }}{{ ',' if not loop.last else '' }}{% endfor %}],
+            itemStyle: { color: '#e4e0d6' }
+          },
+          {
+            name: '胜率',
+            type: 'line',
+            yAxisIndex: 1,
+            data: [{% for row in timing.buy_by_hour %}{{ row.win_rate }}{{ ',' if not loop.last else '' }}{% endfor %}],
+            lineStyle: { color: '#22654d', width: 2 },
+            itemStyle: { color: '#22654d' },
+            symbolSize: 6
+          },
+          {
+            name: '均盈亏',
+            type: 'line',
+            yAxisIndex: 0,
+            data: [{% for row in timing.buy_by_hour %}{{ row.avg_profit }}{{ ',' if not loop.last else '' }}{% endfor %}],
+            lineStyle: { color: '#d88748', width: 2, type: 'dashed' },
+            itemStyle: { color: '#d88748' },
+            symbolSize: 4
+          }
+        ],
+        legend: { data: ['交易数', '胜率', '均盈亏'], top: 5 },
+        grid: { left: 60, right: 55, top: 45, bottom: 40 }
+      });
+
+      // 卖出时段图表
+      var sellChart = echarts.init(document.getElementById('timing-sell-chart'));
+      sellChart.setOption({
+        tooltip: {
+          trigger: 'axis',
+          axisPointer: { type: 'shadow' },
+          formatter: function(params) {
+            var bar = params[0], line = params[1];
+            var wr = (line.value * 100).toFixed(1);
+            return bar.name + '点卖出<br/>' +
+              '交易: ' + bar.value + ' 笔<br/>' +
+              '胜率: ' + wr + '%<br/>' +
+              '均盈亏: ' + params[2].value.toFixed(2) + ' 元';
+          }
+        },
+        xAxis: {
+          type: 'category',
+          data: [{% for row in timing.sell_by_hour %}'{{ row.hour }}'{{ ',' if not loop.last else '' }}{% endfor %}],
+          name: '卖出小时'
+        },
+        yAxis: [
+          { type: 'value', name: '交易笔数', position: 'left' },
+          { type: 'value', name: '胜率', position: 'right', max: 1 }
+        ],
+        series: [
+          {
+            name: '交易数',
+            type: 'bar',
+            data: [{% for row in timing.sell_by_hour %}{{ row.trades }}{{ ',' if not loop.last else '' }}{% endfor %}],
+            itemStyle: { color: '#e4e0d6' }
+          },
+          {
+            name: '胜率',
+            type: 'line',
+            yAxisIndex: 1,
+            data: [{% for row in timing.sell_by_hour %}{{ row.win_rate }}{{ ',' if not loop.last else '' }}{% endfor %}],
+            lineStyle: { color: '#b95d4c', width: 2 },
+            itemStyle: { color: '#b95d4c' },
+            symbolSize: 6
+          },
+          {
+            name: '均盈亏',
+            type: 'line',
+            yAxisIndex: 0,
+            data: [{% for row in timing.sell_by_hour %}{{ row.avg_profit }}{{ ',' if not loop.last else '' }}{% endfor %}],
+            lineStyle: { color: '#d88748', width: 2, type: 'dashed' },
+            itemStyle: { color: '#d88748' },
+            symbolSize: 4
+          }
+        ],
+        legend: { data: ['交易数', '胜率', '均盈亏'], top: 5 },
+        grid: { left: 60, right: 55, top: 45, bottom: 40 }
+      });
+
+      // 星期效应雷达图
+      var weekdayChart = echarts.init(document.getElementById('timing-weekday-chart'));
+      weekdayChart.setOption({
+        tooltip: { trigger: 'item' },
+        radar: {
+          indicator: [
+            {% for row in timing.weekday %}
+            { name: '{{ row.label }}', max: 1 }{{ ',' if not loop.last else '' }}
+            {% endfor %}
+          ],
+          radius: '65%'
+        },
+        series: [{
+          name: '星期效应',
+          type: 'radar',
+          data: [
+            {
+              value: [{% for row in timing.weekday %}{{ row.win_rate }}{{ ',' if not loop.last else '' }}{% endfor %}],
+              name: '胜率',
+              lineStyle: { color: '#22654d', width: 2 },
+              itemStyle: { color: '#22654d' },
+              areaStyle: { color: 'rgba(34, 101, 77, 0.2)' }
+            }
+          ]
+        }]
+      });
+
+      window.addEventListener('resize', function() {
+        buyChart.resize();
+        sellChart.resize();
+        weekdayChart.resize();
+      });
+      </script>
+
+      {% elif page == 'discipline' %}
+      <section class="intro">
+        <div>
+          <span class="eyebrow">TRADING DISCIPLINE</span>
+          <p>数据揭示你的交易心理状态，帮助建立纪律意识。</p>
+        </div>
+        <a class="button secondary" href="{{ url_for('analysis_summary') }}">查看汇总 →</a>
+      </section>
+
+      <section class="panel mistake-panel">
+        <div class="panel-title">我的交易错误排行榜 <span class="pill">基于复盘主要问题</span></div>
+        {% if mistake_stats['items'] %}
+        <div class="table-wrap"><table><thead><tr><th>排名</th><th>主要问题</th><th>发生次数</th><th>相关累计盈亏</th><th>发生比例</th></tr></thead><tbody>
+          {% for row in mistake_stats['items'] %}
+          <tr><td>{{ loop.index }}</td><td><b>{{ mistake_labels.get(row.main_problem, row.main_problem) }}</b></td><td>{{ row.count }}</td><td class="{{ 'gain' if row.total_profit >= 0 else 'loss' }}">{{ row.total_profit|money }}</td><td>{{ row.rate|percent }}</td></tr>
+          {% endfor %}
+        </tbody></table></div>
+        {% else %}
+        <div class="empty">还没有完成包含“主要问题”的复盘。完成交易复盘后，这里会统计你最常犯的错误。</div>
+        {% endif %}
+      </section>
+
+      <section class="metrics">
+        {% for row in discipline.streak %}
+        <div class="metric {{ 'metric-warning' if row.prev_state == 'after_loss' else 'metric-success' }}">
+          <span>{{ '盈利后的交易' if row.prev_state == 'after_win' else '亏损后的交易' }}</span>
+          <b>{{ (row.win_rate * 100)|round(1) }}%</b>
+          <small>{{ row.trades }} 笔 · 平均 {{ row.avg_profit|money }}</small>
+        </div>
+        {% endfor %}
+        {% set t1_count = discipline.holding|selectattr('holding_days', 'equalto', 1)|map(attribute='count')|sum %}
+        <div class="metric">
+          <span>T+1 持仓占比</span>
+          <b>{{ ((t1_count / summary.trades * 100) if summary.trades > 0 else 0)|round(1) }}%</b>
+          <small>考虑延长持仓周期</small>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">累计盈亏曲线 · 情绪波动追踪</div>
+        <div id="discipline-trend-chart" style="width: 100%; height: 350px;"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">持仓周期效率分析</div>
+        <div id="holding-chart" style="width: 100%; height: 320px;"></div>
+        <div class="insight-box">
+          <p><strong>💡 数据洞察：</strong></p>
+          {% set t1 = discipline.holding|selectattr('holding_days', 'equalto', 1)|first %}
+          {% set t2 = discipline.holding|selectattr('holding_days', 'equalto', 2)|first %}
+          {% if t1 and t2 and t2.avg_profit > t1.avg_profit %}
+          <p>你的 T+2 持仓平均盈利 <b class="gain">{{ t2.avg_profit|money }}</b>，明显优于 T+1 的 <b class="loss">{{ t1.avg_profit|money }}</b>。建议减少过早卖出。</p>
+          {% endif %}
+        </div>
+      </section>
+
+      {% if discipline.revenge %}
+      <section class="panel warning-panel">
+        <div class="panel-title">⚠️ 报复性交易警示</div>
+        <p>以下股票在亏损后你立即再次买入（间隔 ≤1 天），平均表现更差：</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>股票</th><th>名称</th><th>报复次数</th><th>平均亏损</th></tr>
+            </thead>
+            <tbody>
+              {% for row in discipline.revenge %}
+              <tr>
+                <td><b>{{ row.stock_code }}</b></td>
+                <td>{{ row.stock_name }}</td>
+                <td>{{ row.revenge_count }} 次</td>
+                <td class="loss">{{ row.avg_loss|money }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <p class="hint">💡 建议：亏损后休息至少 1 个交易日，避免情绪化决策。</p>
+      </section>
+      {% endif %}
+
+      <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+      <script>
+      // 累计盈亏曲线
+      var trendChart = echarts.init(document.getElementById('discipline-trend-chart'));
+      var trendData = [
+        {% for row in discipline.trend %}
+        {
+          value: ['{{ row.sell_date }}', {{ row.cumulative_profit }}],
+          profit: {{ row.profit }},
+          isWin: {{ row.is_win }}
+        }{{ ',' if not loop.last else '' }}
+        {% endfor %}
+      ];
+
+      trendChart.setOption({
+        tooltip: {
+          trigger: 'axis',
+          formatter: function(params) {
+            var p = params[0];
+            var item = trendData[p.dataIndex];
+            return p.name + '<br/>累计盈亏: ' + p.value[1].toFixed(2) + 
+                   '<br/>本笔: ' + (item.isWin ? '✅ +' : '❌ ') + item.profit.toFixed(2);
+          }
+        },
+        xAxis: { type: 'time', boundaryGap: false },
+        yAxis: { type: 'value', name: '累计盈亏（元）' },
+        series: [{
+          data: trendData.map(d => d.value),
+          type: 'line',
+          smooth: true,
+          areaStyle: {
+            color: {
+              type: 'linear',
+              x: 0, y: 0, x2: 0, y2: 1,
+              colorStops: [
+                { offset: 0, color: 'rgba(184, 93, 76, 0.2)' },
+                { offset: 1, color: 'rgba(184, 93, 76, 0.05)' }
+              ]
+            }
+          },
+          lineStyle: { color: '#b95d4c', width: 2 }
+        }],
+        grid: { left: 60, right: 30, top: 30, bottom: 40 }
+      });
+
+      // 持仓周期柱状图
+      var holdingChart = echarts.init(document.getElementById('holding-chart'));
+      holdingChart.setOption({
+        tooltip: {
+          trigger: 'axis',
+          axisPointer: { type: 'shadow' },
+          formatter: function(params) {
+            var bar = params[0], line = params[1];
+            return 'T+' + bar.name + '<br/>' +
+                   '交易数: ' + bar.value + ' 笔<br/>' +
+                   '平均盈亏: ' + (line.value >= 0 ? '+' : '') + line.value.toFixed(2) + ' 元<br/>' +
+                   '胜率: ' + (params[2].value * 100).toFixed(1) + '%';
+          }
+        },
+        legend: { data: ['交易数量', '平均盈亏', '胜率'] },
+        xAxis: { 
+          type: 'category', 
+          data: [{% for row in discipline.holding %}'{{ row.holding_days }}'{{ ',' if not loop.last else '' }}{% endfor %}],
+          name: '持仓天数'
+        },
+        yAxis: [
+          { type: 'value', name: '交易数量', position: 'left' },
+          { type: 'value', name: '平均盈亏（元）', position: 'right' }
+        ],
+        series: [
+          {
+            name: '交易数量',
+            type: 'bar',
+            data: [{% for row in discipline.holding %}{{ row.count }}{{ ',' if not loop.last else '' }}{% endfor %}],
+            itemStyle: { color: '#e4e0d6' }
+          },
+          {
+            name: '平均盈亏',
+            type: 'line',
+            yAxisIndex: 1,
+            data: [{% for row in discipline.holding %}{{ row.avg_profit }}{{ ',' if not loop.last else '' }}{% endfor %}],
+            itemStyle: {
+              color: function(params) {
+                return params.value >= 0 ? '#b95d4c' : '#22654d';
+              }
+            },
+            lineStyle: { width: 3 }
+          },
+          {
+            name: '胜率',
+            type: 'line',
+            yAxisIndex: 1,
+            data: [{% for row in discipline.holding %}{{ row.win_rate }}{{ ',' if not loop.last else '' }}{% endfor %}],
+            itemStyle: { color: '#d88748' },
+            lineStyle: { width: 2, type: 'dashed' }
+          }
+        ],
+        grid: { left: 60, right: 60, top: 50, bottom: 40 }
+      });
+
+      window.addEventListener('resize', function() {
+        trendChart.resize();
+        holdingChart.resize();
+      });
+      </script>
+
+      {% elif page == 'intraday_rebound' %}
+      <section class="intro">
+        <div><span class="eyebrow">ALERTS / INTRADAY REBOUND</span><p>只在急跌后形成更高低点、并放量突破第一波反弹高点时提示；不是预测最低点，也不自动下单。</p></div>
+        <a class="button secondary" href="{{ url_for('analysis_watchlist') }}">查看重点观察</a>
+      </section>
+      <section class="panel alert-settings">
+        <div class="panel-title">日内反弹 <span class="pill">分钟级提醒</span></div>
+        <p class="hint">交易时段每 30 秒同步，按交易所分钟归档；最低点本身不触发，需等待结构和突破确认。</p>
+        <form method="post" action="{{ url_for('save_intraday_rebound_alert_type') }}">
+          <label class="alert-toggle"><input type="checkbox" name="enabled" {{ 'checked' if alert_type.enabled and alert_params.enabled else '' }}><span><b>启用日内反弹</b><small>应用于所有用户各自的重点观察股票</small></span></label>
+          <div class="alert-field-grid">
+            <label><span>观察窗口</span><div class="input-suffix"><input name="lookback_minutes" type="number" min="20" max="240" value="{{ alert_params.lookback_minutes }}" required><i>分</i></div></label>
+            <label><span>急跌幅度至少</span><div class="input-suffix"><input name="min_drop_percent" type="number" min="0.1" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.min_drop_ratio * 100) }}" required><i>%</i></div></label>
+            <label><span>低点反弹至少</span><div class="input-suffix"><input name="min_rebound_percent" type="number" min="0.1" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.min_rebound_ratio * 100) }}" required><i>%</i></div></label>
+            <label><span>低点确认等待</span><div class="input-suffix"><input name="min_trough_age_minutes" type="number" min="3" max="30" value="{{ alert_params.min_trough_age_minutes }}" required><i>分</i></div></label>
+            <label><span>突破分钟量比至少</span><input name="min_volume_multiple" type="number" min="0" max="10" step="0.1" value="{{ '%.1f'|format(alert_params.min_volume_multiple) }}" required></label>
+          </div>
+          <button class="button" type="submit">保存提醒参数</button>
+        </form>
+      </section>
+      <section class="panel alert-backtest-panel">
+        <div class="alert-backtest-head"><div><span class="eyebrow">LIVE WATCH</span><div class="panel-title">重点观察实时状态</div><p class="hint">触发后会在通知中心生成“日内反弹·候选”；当日只提示一次。</p></div></div>
+        {% if intraday_states %}
+        <div class="table-wrap"><table class="sample-table"><thead><tr><th>证券</th><th>最新分钟价</th><th>分钟时间</th><th>检测状态</th><th>候选触发时间</th></tr></thead><tbody>{% for row in intraday_states %}<tr><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ row.price|money if row.price is not none else '--' }}</td><td>{{ row.quote_minute[11:16] if row.quote_minute else '--' }}</td><td>{% if row.last_matched %}<span class="pill gain">日内反弹候选</span>{% elif row.last_evaluated_at %}<span class="muted-value">观察中</span>{% else %}<span class="muted-value">等待分钟行情</span>{% endif %}</td><td>{{ row.candidate_triggered_at[11:16] if row.candidate_triggered_at else '--' }}</td></tr>{% endfor %}</tbody></table></div>
+        {% else %}<div class="empty">当前用户还没有重点观察股票，请先添加要跟踪的 ETF 或股票。</div>{% endif %}
+      </section>
+      <section class="panel alert-backtest-panel">
+        <div class="panel-title">最近触发</div>
+        {% if intraday_notifications %}<div class="table-wrap"><table class="sample-table"><thead><tr><th>时间</th><th>证券</th><th>信号内容</th></tr></thead><tbody>{% for row in intraday_notifications %}<tr><td>{{ row.quote_time[:16]|replace('T', ' ') }}</td><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ row.content }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="empty">还没有日内反弹候选。</div>{% endif %}
+      </section>
+
+      {% elif page == 'three_day_dip' %}
+      <nav class="alert-page-tabs" aria-label="三日低吸功能"><a class="active" href="{{ url_for('three_day_dip_management') }}">规则参数</a><a href="{{ url_for('three_day_dip_pool') }}">样本池</a></nav>
+      <section class="intro">
+        <div><span class="eyebrow">ALERTS / THREE DAY DIP</span><p>共同急跌条件成立后，按衰竭止跌、下影止跌或强修复分类；下影止跌只作为观察候选。</p></div>
+        <a class="button secondary" href="{{ url_for('analysis_watchlist') }}">查看重点观察</a>
+      </section>
+      <section class="panel alert-settings">
+          <div class="panel-title">三日低吸 <span class="pill">买点提醒</span></div>
+          <p class="hint">盘中候选暂不使用成交量硬条件；收盘确认会完整判断缩量。</p>
+          <form method="post" action="{{ url_for('save_three_day_dip_alert_type') }}">
+            <label class="alert-toggle"><input type="checkbox" name="enabled" {{ 'checked' if alert_type.enabled else '' }}><span><b>启用三日低吸</b><small>应用于所有用户各自的重点观察股票</small></span></label>
+          <div class="alert-field-grid">
+              <label><span>前置下跌天数</span><input name="decline_days" type="number" min="1" max="5" value="{{ alert_params.decline_days }}" required></label>
+              <label><span>共同累计跌幅至少</span><div class="input-suffix"><input name="min_decline_percent" type="number" min="0" max="100" step="0.1" value="{{ '%.1f'|format(alert_params.min_decline_ratio * 100) }}" required><i>%</i></div></label>
+              <label><span>信号日最低价高于前低最多</span><div class="input-suffix"><input name="max_signal_low_above_prior_percent" type="number" min="0" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.max_signal_low_above_prior_ratio * 100) }}" required><i>%</i></div></label>
+              <label><span>止跌型量比最多</span><div class="input-suffix"><input name="max_volume_percent" type="number" min="0" max="200" step="0.1" value="{{ '%.1f'|format(alert_params.max_volume_ratio * 100) }}" required><i>%</i></div></label>
+            </div>
+            <div class="alert-rule-branches">
+              <fieldset><legend>衰竭止跌型</legend><div class="alert-field-grid">
+                <label><span>低点修复至少</span><div class="input-suffix"><input name="exhaustion_min_repair_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.exhaustion_min_repair_ratio * 100) }}"><i>%</i></div></label>
+                <label><span>实体占振幅最多</span><div class="input-suffix"><input name="exhaustion_max_body_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.exhaustion_max_body_range_ratio * 100) }}"><i>%</i></div></label>
+                <label><span>信号日最低涨跌</span><div class="input-suffix"><input name="exhaustion_min_change_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.exhaustion_min_change_ratio * 100) }}"><i>%</i></div></label>
+                <label><span>信号日最高涨跌</span><div class="input-suffix"><input name="exhaustion_max_change_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.exhaustion_max_change_ratio * 100) }}"><i>%</i></div></label>
+              </div></fieldset>
+              <fieldset><legend>下影止跌型 · 仅候选</legend><div class="alert-field-grid">
+                <label><span>低点修复至少</span><div class="input-suffix"><input name="shadow_min_repair_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.shadow_min_repair_ratio * 100) }}"><i>%</i></div></label>
+                <label><span>实体占振幅最多</span><div class="input-suffix"><input name="shadow_max_body_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.shadow_max_body_range_ratio * 100) }}"><i>%</i></div></label>
+                <label><span>下影/实体至少</span><input name="shadow_min_lower_shadow_body_ratio" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.shadow_min_lower_shadow_body_ratio) }}"></label>
+                <label><span>信号日最低涨跌</span><div class="input-suffix"><input name="shadow_min_change_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.shadow_min_change_ratio * 100) }}"><i>%</i></div></label>
+                <label><span>信号日最高涨跌</span><div class="input-suffix"><input name="shadow_max_change_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.shadow_max_change_ratio * 100) }}"><i>%</i></div></label>
+              </div></fieldset>
+              <fieldset><legend>强修复型</legend><div class="alert-field-grid">
+                <label><span>前两日累计跌幅至少</span><div class="input-suffix"><input name="reversal_min_decline_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.reversal_min_decline_ratio * 100) }}"><i>%</i></div></label>
+                <label><span>低点修复至少</span><div class="input-suffix"><input name="reversal_min_repair_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.reversal_min_repair_ratio * 100) }}"><i>%</i></div></label>
+                <label><span>收回振幅至少</span><div class="input-suffix"><input name="reversal_min_recovery_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.reversal_min_recovery_range_ratio * 100) }}"><i>%</i></div></label>
+                <label><span>信号日涨幅至少</span><div class="input-suffix"><input name="reversal_min_change_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.reversal_min_change_ratio * 100) }}"><i>%</i></div></label>
+                <label><span>量比最多</span><div class="input-suffix"><input name="reversal_max_volume_percent" type="number" step="0.1" value="{{ '%.1f'|format(alert_params.reversal_max_volume_ratio * 100) }}"><i>%</i></div></label>
+              </div></fieldset>
+            </div>
+            <div class="alert-check-grid">
+              <label><input type="checkbox" name="require_bearish_candles" {{ 'checked' if alert_params.require_bearish_candles else '' }}> 前置交易日必须收阴</label>
+              <label><input type="checkbox" name="require_declining_closes" {{ 'checked' if alert_params.require_declining_closes else '' }}> 收盘价必须逐日走低</label>
+              <label><input type="checkbox" name="intraday_candidate_enabled" {{ 'checked' if alert_params.intraday_candidate_enabled else '' }}> 发送盘中候选提醒</label>
+              <label><input type="checkbox" name="close_confirmation_enabled" {{ 'checked' if alert_params.close_confirmation_enabled else '' }}> 发送收盘确认提醒</label>
+            </div>
+            <button class="button" type="submit">保存提醒参数</button>
+          </form>
+      </section>
+      <section class="panel alert-backtest-panel">
+        <div class="alert-backtest-head"><div><span class="eyebrow">HISTORICAL TEST</span><div class="panel-title">重点观察历史命中测试</div><p class="hint">请输入三日形态的开始和截止日期，系统会自动读取开始日期之前的一个交易日作为前收基准。测试只读取已有行情，不生成通知。</p></div>{% if alert_watchlist %}<a class="button secondary" href="{{ url_for('analysis_watchlist') }}">同步历史行情</a>{% endif %}</div>
+        {% if alert_watchlist %}
+        <form class="alert-backtest-form" method="get" action="{{ url_for('three_day_dip_management') }}">
+          <input type="hidden" name="run_test" value="1">
+          <label><span>重点观察股票</span><select name="stock_code" required><option value="">请选择股票</option>{% for stock in alert_watchlist %}<option value="{{ stock.stock_code }}" {{ 'selected' if stock.stock_code == selected_stock_code else '' }}>{{ stock.stock_name }} · {{ stock.stock_code }}</option>{% endfor %}</select></label>
+          <label><span>开始日期</span><input name="start_date" type="date" value="{{ test_start_date }}" required></label>
+          <label><span>截止日期</span><input name="end_date" type="date" value="{{ test_end_date }}" required></label>
+          <button class="button" type="submit">测试是否命中</button>
+        </form>
+        {% else %}<div class="empty">当前用户还没有重点观察股票，请先到“重点观察”添加股票并同步历史行情。</div>{% endif %}
+
+        {% if backtest_error %}<div class="backtest-message error">{{ backtest_error }}</div>{% endif %}
+        {% if backtest %}
+        <div class="backtest-summary">
+          <div><span>测试股票</span><b>{{ backtest.stock_name }}</b><small>{{ backtest.stock_code }}</small></div>
+          <div><span>信号日范围</span><b>{{ backtest.start_date }}</b><small>至 {{ backtest.end_date }}</small></div>
+          <div><span>参与扫描</span><b>{{ backtest.scanned_days }}</b><small>个交易日</small></div>
+          <div class="{{ 'hit' if backtest.hits else '' }}"><span>命中次数</span><b>{{ backtest.hits|length }}</b><small>次</small></div>
+        </div>
+        {% if backtest.insufficient %}
+        <div class="backtest-message warning"><b>历史行情不足，无法完成测试。</b><span>所选范围内没有具备完整前置 K 线的信号日。数据库行情范围：{{ backtest.first_price_date or '无' }} 至 {{ backtest.last_price_date or '无' }}。请先到重点观察同步历史行情。</span></div>
+        {% elif not backtest.hits %}
+        <div class="backtest-message neutral"><b>所选日期范围内没有命中“三日低吸”。</b><span>已扫描 {{ backtest.scanned_days }} 个交易日。</span></div>
+        {% else %}
+        <div class="backtest-hit-list">
+          {% for hit in backtest.hits %}
+          <details class="backtest-hit" open>
+            <summary><div><span class="backtest-hit-date">{{ hit.signal_date }}</span><b>{{ {'STRONG_REVERSAL':'强修复型','SHADOW_STOP':'下影止跌型','EXHAUSTION':'衰竭止跌型'}[hit.pattern_type] }}</b></div><div><span>低点修复 <b>{{ '%.1f'|format(hit.repair_ratio * 100) }}%</b></span></div></summary>
+            <div class="backtest-checks"><span class="pass">✓ 前置日收阴</span><span class="pass">✓ 收盘逐日走低</span><span class="pass">✓ 信号日处于前低附近</span><span class="pass">✓ 缩量修复达标</span></div>
+            <div class="table-wrap"><table class="backtest-candles"><thead><tr><th>日期</th><th>用途</th><th>开盘</th><th>最高</th><th>最低</th><th>收盘</th></tr></thead><tbody>{% for candle in hit.candles %}<tr><td>{{ candle.trade_date }}</td><td>{% if loop.first %}前收基准{% elif loop.last %}信号日{% else %}第 {{ loop.index - 1 }} 个下跌日{% endif %}</td><td>{{ candle.open|money }}</td><td>{{ candle.high|money }}</td><td>{{ candle.low|money }}</td><td>{{ candle.close|money }}</td></tr>{% endfor %}</tbody></table></div>
+          </details>
+          {% endfor %}
+        </div>
+        {% endif %}
+        {% endif %}
+      </section>
+
+      {% elif page == 'three_day_dip_pool' %}
+      <nav class="alert-page-tabs" aria-label="三日低吸功能"><a href="{{ url_for('three_day_dip_management') }}">规则参数</a><a class="active" href="{{ url_for('three_day_dip_pool') }}">样本池</a></nav>
+      <section class="intro"><div><span class="eyebrow">RESEARCH / SAMPLE POOL</span><p>系统候选与人工金标准分开沉淀，用真实后续表现持续优化规则。</p></div></section>
+      {% set ps = signal_pool.summary %}
+      <section class="signal-pool-tools">
+        <form class="panel signal-pool-form" method="post" action="{{ url_for('add_three_day_dip_sample') }}"><div class="panel-title">手工加入样本</div><p class="hint">允许加入非重点观察股票；行情缺失时自动读取。</p><div><label><span>股票代码</span><input name="stock_code" required></label><label><span>股票名称</span><input name="stock_name" required></label><label><span>信号日</span><input name="signal_date" type="date" required></label><label><span>形态类型</span><select name="pattern_type"><option value="">自动识别</option><option value="EXHAUSTION">衰竭止跌型</option><option value="SHADOW_STOP">下影止跌型</option><option value="STRONG_REVERSAL">强修复型</option></select></label><label class="wide"><span>备注</span><input name="note" maxlength="500"></label><button class="button" type="submit">确认加入</button></div></form>
+        <form class="panel signal-pool-scan" method="post" action="{{ url_for('scan_three_day_dip_history') }}"><div class="panel-title">扫描重点观察历史</div><p class="hint">命中结果进入待确认池，不生成通知。</p><label><span>开始日期</span><input name="start_date" type="date" required></label><label><span>截止日期</span><input name="end_date" type="date" required></label><button class="button secondary" type="submit">开始扫描</button></form>
+      </section>
+      <section class="panel signal-pool-panel"><div class="signal-pool-heading"><div class="panel-title">样本记录 <span class="pill">规则版本可追溯</span></div><div class="signal-pool-counts"><span>全部 <b>{{ ps.total }}</b></span><span>待确认 <b>{{ ps.pending }}</b></span><span>已确认 <b>{{ ps.confirmed }}</b></span><span>已否决 <b>{{ ps.rejected }}</b></span></div></div><div class="table-wrap"><table><thead><tr><th>信号日</th><th>股票</th><th>类型</th><th>来源/状态</th><th>前置跌幅</th><th>低点修复</th><th>实体占比</th><th>量比</th><th>次日</th><th>3日</th><th>5日</th><th>备注</th><th>操作</th></tr></thead><tbody>
+      {% for row in signal_pool.rows %}<tr><td>{{ row.signal_date }}</td><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ {'STRONG_REVERSAL':'强修复','SHADOW_STOP':'下影止跌','EXHAUSTION':'衰竭止跌'}[row.pattern_type] }}</td><td>{{ '手工' if row.source == 'MANUAL' else '系统' }}<br><span class="episode-status {{ 'closed' if row.review_status == 'CONFIRMED' else 'open' if row.review_status == 'PENDING' else 'pending' }}">{{ {'PENDING':'待确认','CONFIRMED':'已确认','REJECTED':'已否决'}[row.review_status] }}</span></td><td>{{ '%.1f'|format(row.metrics.decline_ratio * 100) }}%</td><td>{{ '%.1f'|format(row.metrics.repair_ratio * 100) }}%</td><td>{{ '%.1f'|format(row.metrics.body_range_ratio * 100) }}%</td><td>{{ ('%.1f'|format(row.metrics.volume_ratio * 100) ~ '%') if row.metrics.volume_ratio is not none else '--' }}</td><td>{{ (row.day_1_close_return|percent) if row.day_1_close_return is not none else '--' }}</td><td>{{ (row.day_3_close_return|percent) if row.day_3_close_return is not none else '--' }}</td><td>{{ (row.day_5_close_return|percent) if row.day_5_close_return is not none else '--' }}</td><td class="pool-note"><input form="sample-review-{{ row.id }}" name="note" value="{{ row.note }}" maxlength="500" placeholder="备注"></td><td class="pool-actions"><form id="sample-review-{{ row.id }}" method="post" action="{{ url_for('review_three_day_dip_sample', sample_id=row.id) }}"></form><button form="sample-review-{{ row.id }}" name="review_status" value="CONFIRMED">确认</button><button form="sample-review-{{ row.id }}" class="reject" name="review_status" value="REJECTED">否决</button></td></tr>
+      {% else %}<tr><td colspan="13" class="empty">样本池为空。可手工加入金标准，或扫描重点观察历史行情。</td></tr>{% endfor %}
+      </tbody></table></div></section>
+
+      {% elif page == 'account' %}
+      <section class="intro">
+        <div><span class="eyebrow">BACK OFFICE / ACCOUNT</span><p>手动维护账户资金快照，独立记录账户资产，不参与持仓分析页计算。</p></div>
+        <a class="button secondary" href="{{ url_for('analysis_portfolio') }}">查看持仓分析 →</a>
+      </section>
+      <section class="account-management-grid">
+        <div class="panel account-fund-form">
+          <div class="panel-title">记录当前资金</div>
+          <p class="hint">账户总资产以券商账户显示金额为准；可用资金可选填。同一天再次保存会更新当天快照。</p>
+          <form method="post" action="{{ url_for('save_account_snapshot') }}">
+            <label><span>快照日期</span><input name="snapshot_date" type="date" value="{{ today }}" required></label>
+            <label><span>账户总资产</span><input name="total_assets" type="number" min="0.01" step="0.01" value="{{ latest_snapshot.total_assets if latest_snapshot else '' }}" placeholder="例如 286420.00" required><small>现金 + 股票市值 + 账户内其他资产</small></label>
+            <label><span>可用资金（可选）</span><input name="available_cash" type="number" min="0" step="0.01" value="{{ latest_snapshot.available_cash if latest_snapshot and latest_snapshot.available_cash is not none else '' }}" placeholder="券商显示的可用金额"></label>
+            <label><span>备注（可选）</span><textarea name="note" rows="3" maxlength="200" placeholder="例如：收盘后账户资产">{{ latest_snapshot.note if latest_snapshot else '' }}</textarea></label>
+            <button class="button" type="submit">保存资金快照</button>
+          </form>
+        </div>
+        <div class="panel account-latest-card">
+          <div class="panel-title">最新账户状态</div>
+          {% if latest_snapshot %}
+          <span class="account-snapshot-date">{{ latest_snapshot.snapshot_date }}</span>
+          <strong>{{ latest_snapshot.total_assets|money }}<small>元</small></strong>
+          <div><span>可用资金</span><b>{{ (latest_snapshot.available_cash|money ~ ' 元') if latest_snapshot.available_cash is not none else '未填写' }}</b></div>
+          <p>{{ latest_snapshot.note or '无备注' }}</p>
+          {% else %}<div class="empty">还没有账户资金快照。填写左侧表单后，持仓分析会计算真实账户仓位。</div>{% endif %}
+        </div>
+      </section>
+      <section class="panel account-history">
+        <div class="panel-title">资金快照历史 <span class="pill">最近 {{ snapshots|length }} 条</span></div>
+        <div class="table-wrap"><table><thead><tr><th>日期</th><th>账户总资产</th><th>可用资金</th><th>备注</th><th>更新时间</th></tr></thead><tbody>
+          {% for row in snapshots %}<tr><td><b>{{ row.snapshot_date }}</b></td><td>{{ row.total_assets|money }} 元</td><td>{{ (row.available_cash|money ~ ' 元') if row.available_cash is not none else '--' }}</td><td>{{ row.note or '--' }}</td><td>{{ row.updated_at[:16]|replace('T', ' ') }}</td></tr>{% else %}<tr><td colspan="5" class="empty">暂无资金快照。</td></tr>{% endfor %}
+        </tbody></table></div>
+      </section>
+
+      {% elif page == 'statements' %}
+      <section class="intro">
+        <div><span class="eyebrow">BACK OFFICE / STATEMENTS</span><p>共 {{ total }} 条成交记录，按成交日期、时间倒序排列。</p></div>
+        <div class="intro-actions">
+          <form method="post" action="{{ url_for('rebuild') }}"><button class="button secondary">重新计算 FIFO</button></form>
+          <a class="button" href="{{ url_for('import_view') }}">导入交割单</a>
+        </div>
+      </section>
+      <details class="panel manual-entry">
+        <summary><div><span class="eyebrow">TODAY / MANUAL</span><b>补录当天成交</b><small>交割单尚未生成时先补录，次日导入正式交割单会自动对账转正</small></div><span>填写成交</span></summary>
+        <form class="manual-form" method="post" action="{{ url_for('create_manual_execution') }}">
+          <label><span>成交日期</span><input name="trade_date" type="date" value="{{ today }}" required></label>
+          <label><span>成交时间</span><input name="trade_time" type="time" step="1" value="15:00:00" required></label>
+          <label><span>证券代码</span><input name="stock_code" inputmode="numeric" maxlength="8" placeholder="例如 300209" required></label>
+          <label><span>证券名称</span><input name="stock_name" maxlength="50" placeholder="例如 行云科技" required></label>
+          <label><span>买卖方向</span><select name="action" required><option value="BUY">买入</option><option value="SELL">卖出</option></select></label>
+          <label><span>成交数量</span><input name="quantity" type="number" min="0.000001" step="any" placeholder="股数" required></label>
+          <label><span>成交价格</span><input name="deal_price" type="number" min="0.000001" step="any" placeholder="每股价格" required></label>
+          <label><span>佣金（可选）</span><input name="commission" type="number" min="0" step="any" value="0"></label>
+          <label><span>印花税（可选）</span><input name="stamp_tax" type="number" min="0" step="any" value="0"></label>
+          <label><span>过户费（可选）</span><input name="transfer_fee" type="number" min="0" step="any" value="0"></label>
+          <button class="button" type="submit">保存并重新计算</button>
+        </form>
+        <div class="paste-divider"><span>或批量粘贴券商当日成交</span></div>
+        <form class="paste-form" method="post" action="{{ url_for('paste_manual_executions') }}">
+          <label><span>成交日期</span><input name="trade_date" type="date" value="{{ today }}" required></label>
+          <label class="paste-trades"><span>成交文本</span><textarea name="trades" rows="7" placeholder="直接粘贴包含表头的成交记录，支持 Excel 或券商页面复制的制表符文本" required></textarea></label>
+          <button class="button" type="submit">识别并批量补录</button>
+        </form>
+        <div class="hint">自动对账条件：用户、日期、证券代码、买卖方向、数量和成交价格一致。正式交割单中的时间、费用和成交编号会覆盖补录值。</div>
+      </details>
+      <section class="panel">
+        <div class="table-wrap"><table><thead><tr><th>日期</th><th>时间</th><th>代码 / 名称</th><th>操作</th><th>数量</th><th>价格</th><th>成交金额</th><th>来源 / 市场</th></tr></thead><tbody>{% for row in executions %}<tr><td>{{ row.trade_date }}</td><td>{{ row.trade_time }}</td><td><b>{{ row.stock_code }}</b><small>{{ row.stock_name }}</small></td><td><span class="action {{ row.action }}">{{ '买入' if row.action == 'BUY' else '卖出' }}</span></td><td>{{ row.quantity|money }}</td><td>{{ row.deal_price|money }}</td><td>{{ row.deal_amount|money }}</td><td>{% if row.source == 'MANUAL' %}<span class="manual-badge">临时补录</span>{% else %}{{ row.market or '-' }}{% endif %}</td></tr>{% else %}<tr><td colspan="8" class="empty">还没有成交记录，请先导入交割单或补录当天成交。</td></tr>{% endfor %}</tbody></table></div>
+        {% if total_pages > 1 %}<div class="pagination">{% if current_page > 1 %}<a class="page-link" href="{{ url_for('statements', page=current_page - 1) }}">‹ 上一页</a>{% else %}<span class="page-link disabled">‹ 上一页</span>{% endif %}<span class="page-info">第 {{ current_page }} / {{ total_pages }} 页 · 共 {{ total }} 条</span>{% if current_page < total_pages %}<a class="page-link" href="{{ url_for('statements', page=current_page + 1) }}">下一页 ›</a>{% else %}<span class="page-link disabled">下一页 ›</span>{% endif %}</div>{% endif %}
+      </section>
+
+      {% elif page == 'import' %}
+      <section class="intro">
+        <div><span class="eyebrow">BACK OFFICE / IMPORT</span><p>按“选择文件、解析预览、确认写入”三步完成，预览不会修改现有数据。</p></div>
+        <a class="button secondary neutral-action" href="{{ url_for('statements') }}">← 返回列表</a>
+      </section>
+      <ol class="import-steps" aria-label="导入进度">
+        <li class="active"><span>1</span><div><b>选择文件</b><small>本机交割单</small></div></li>
+        <li class="{{ 'active' if preview is defined else '' }}"><span>2</span><div><b>解析预览</b><small>检查识别结果</small></div></li>
+        <li><span>3</span><div><b>确认写入</b><small>生成分析数据</small></div></li>
+      </ol>
+      <section class="panel upload-panel">
+        <div class="panel-title">第 1 步：选择交割单文件</div>
+        <form id="preview-form" class="import-form" method="post" enctype="multipart/form-data" action="{{ url_for('preview_import') }}">
+          <label class="dropzone" id="statement-dropzone" for="statement-file">
+            <input id="statement-file" type="file" name="statement" accept=".xlsx,.xls,.csv,.txt" required>
+            <span class="upload-icon">↥</span>
+            <strong id="file-title">点击选择文件</strong>
+            <small id="file-detail">支持 .xlsx、.xls、.csv、.txt，文件仅在本机处理</small>
+          </label>
+          <div class="import-submit-row">
+            <span id="parse-status" class="parse-status" role="status" aria-live="polite">选择文件后即可解析</span>
+            <button id="preview-button" class="button" type="submit" disabled>解析并预览</button>
+          </div>
+        </form>
+        <div class="hint">解析规则：代码不足 6 位自动补零；卖出负数转为展示数量；按成交日期、时间执行 FIFO；重复流水按指纹跳过。</div>
+      </section>
+      {% if preview is defined %}
+      <section id="import-preview" class="panel preview" tabindex="-1">
+        <div class="preview-heading"><div><span class="eyebrow">STEP 2 / PREVIEW</span><div class="panel-title">解析完成 <span class="pill">{{ filename }}</span></div></div><span class="preview-ready">可以确认导入</span></div>
+        <div class="import-summary">
+          <div><small>文件数据行</small><b>{{ total_rows }}</b></div>
+          <div><small>有效记录</small><b>{{ valid_rows }}</b></div>
+          <div class="{{ 'warning' if errors else '' }}"><small>异常记录</small><b>{{ errors|length }}</b></div>
+          <div><small>忽略非买卖</small><b>{{ ignored|length }}</b></div>
+          <div class="{{ 'warning' if duplicate_rows else '' }}"><small>数据库重复</small><b>{{ duplicate_rows }}</b></div>
+          <div class="accent"><small>预计新增</small><b>{{ importable_rows }}</b></div>
+        </div>
+        <div class="notice">解析成功。下方展示前 {{ preview|length }} 条有效记录，请核对日期、证券、买卖方向、数量和价格。</div>
+        {% if ignored %}<details class="errors ignored"><summary>查看 {{ ignored|length }} 条自动忽略的非买卖记录</summary>{% for item in ignored %}<div>{{ item }}</div>{% endfor %}</details>{% endif %}
+        {% if errors %}<details class="errors"><summary>查看 {{ errors|length }} 条异常记录（异常行不会导入）</summary>{% for error in errors %}<div>{{ error }}</div>{% endfor %}</details>{% endif %}
+        <div class="table-wrap"><table><thead><tr><th>日期</th><th>时间</th><th>代码 / 名称</th><th>操作</th><th>数量</th><th>价格</th><th>成交金额</th></tr></thead><tbody>{% for row in preview %}<tr><td>{{ row.trade_date }}</td><td>{{ row.trade_time }}</td><td><b>{{ row.stock_code }}</b><small>{{ row.stock_name }}</small></td><td><span class="action {{ row.action }}">{{ '买入' if row.action == 'BUY' else '卖出' }}</span></td><td>{{ row.quantity|money }}</td><td>{{ row.deal_price|money }}</td><td>{{ row.deal_amount|money }}</td></tr>{% endfor %}</tbody></table></div>
+        <div class="confirm-import"><div><b>第 3 步：确认写入数据库</b><small>确认后将导入 {{ importable_rows }} 条新记录，并重新计算 FIFO、持仓和盈亏分析。</small></div><form id="confirm-import-form" method="post" action="{{ url_for('confirm_import', job_id=job_id) }}"><button id="confirm-import-button" class="button" type="submit">确认导入 {{ importable_rows }} 条记录</button></form></div>
+      </section>
+      {% endif %}
+      <script>
+      (function() {
+        const form = document.getElementById('preview-form');
+        const input = document.getElementById('statement-file');
+        const button = document.getElementById('preview-button');
+        const title = document.getElementById('file-title');
+        const detail = document.getElementById('file-detail');
+        const status = document.getElementById('parse-status');
+        const dropzone = document.getElementById('statement-dropzone');
+
+        input.addEventListener('change', function() {
+          const file = input.files[0];
+          button.disabled = !file;
+          dropzone.classList.toggle('has-file', Boolean(file));
+          if (!file) {
+            title.textContent = '点击选择文件';
+            detail.textContent = '支持 .xlsx、.xls、.csv、.txt，文件仅在本机处理';
+            status.textContent = '选择文件后即可解析';
+            return;
+          }
+          title.textContent = file.name;
+          detail.textContent = (file.size / 1024).toFixed(file.size < 10240 ? 1 : 0) + ' KB · 点击可重新选择';
+          status.textContent = '文件已选择，请点击“解析并预览”';
+        });
+
+        form.addEventListener('submit', function() {
+          if (!input.files.length) return;
+          button.disabled = true;
+          button.textContent = '正在解析...';
+          status.textContent = '正在读取并解析文件，请稍候';
+          form.classList.add('is-loading');
+        });
+
+        const confirmForm = document.getElementById('confirm-import-form');
+        if (confirmForm) {
+          const confirmButton = document.getElementById('confirm-import-button');
+          confirmForm.addEventListener('submit', function() {
+            confirmButton.disabled = true;
+            confirmButton.textContent = '正在导入并计算...';
+          });
+          const preview = document.getElementById('import-preview');
+          requestAnimationFrame(function() {
+            preview.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            preview.focus({ preventScroll: true });
+          });
+        }
+      }());
+      </script>
+
+      {% elif page == 'hot_sectors' %}
+      <section class="intro">
+        <div><span class="eyebrow">HOT SECTORS</span><p>今日涨幅居前的行业、概念板块与个股人气榜，交易时段每 31 秒自动刷新，非交易时段暂停。</p></div>
+        <div class="intro-actions">
+          <div class="portfolio-price-status"><b id="hot-sectors-updated">正在获取行情...</b><small id="hot-sectors-status">数据来源：新浪财经 · 腾讯行情</small></div>
+          <button class="button secondary" type="button" id="hot-sectors-refresh">刷新</button>
+        </div>
+      </section>
+      <section class="hot-sectors-grid">
+        <section class="panel hot-sectors-panel" data-module="industry">
+          <div class="panel-title">行业板块 <span class="pill">涨幅前 20</span></div>
+          <div class="table-wrap"><table><thead><tr><th>#</th><th>板块</th><th>平均价格</th><th>涨跌额</th><th>涨幅</th><th>公司家数</th><th>成交额</th><th>领涨股票</th></tr></thead><tbody><tr><td colspan="8" class="empty">正在加载...</td></tr></tbody></table></div>
+        </section>
+        <section class="panel hot-sectors-panel" data-module="concept">
+          <div class="panel-title">概念板块 <span class="pill">涨幅前 20</span></div>
+          <div class="table-wrap"><table><thead><tr><th>#</th><th>板块</th><th>平均价格</th><th>涨跌额</th><th>涨幅</th><th>公司家数</th><th>成交额</th><th>领涨股票</th></tr></thead><tbody><tr><td colspan="8" class="empty">正在加载...</td></tr></tbody></table></div>
+        </section>
+        <section class="panel hot-sectors-panel" data-module="hot_rank">
+          <div class="panel-title">个股人气榜 <span class="pill">人气前 20</span></div>
+          <div class="table-wrap"><table><thead><tr><th>#</th><th>代码</th><th>股票名称</th><th>最新价</th><th>涨跌额</th><th>涨幅</th></tr></thead><tbody><tr><td colspan="6" class="empty">正在加载...</td></tr></tbody></table></div>
+        </section>
+      </section>
+      <script>
+      (function() {
+        var panels = document.querySelectorAll('.hot-sectors-panel');
+        if (!panels.length) return;
+        var updatedEl = document.getElementById('hot-sectors-updated');
+        var statusEl = document.getElementById('hot-sectors-status');
+        var refreshBtn = document.getElementById('hot-sectors-refresh');
+        var keys = ['industry', 'concept', 'hot_rank'];
+
+        function esc(value) {
+          return String(value == null ? '' : value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+        function money(value) { return Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+        function percent(value) { return value == null ? '--' : (Number(value) > 0 ? '+' : '') + Number(value).toFixed(2) + '%'; }
+        function colorClass(value) { return value == null ? '' : (Number(value) >= 0 ? 'gain' : 'loss'); }
+        function sign(value) { return value > 0 ? '+' : ''; }
+        function yi(value) { return value == null ? '--' : (value / 100000000).toFixed(1) + ' 亿'; }
+        function num(value) { return value == null ? '--' : money(value); }
+
+        function boardRow(record, index) {
+          var lead = record['领涨股票'];
+          var leadRate = record['领涨股票-涨跌幅'];
+          return '<tr>' +
+            '<td>' + index + '</td>' +
+            '<td><b>' + esc(record['板块名称']) + '</b><small>' + esc(record['板块代码']) + '</small></td>' +
+            '<td>' + num(record['最新价']) + '</td>' +
+            '<td class="' + colorClass(record['涨跌额']) + '">' + (record['涨跌额'] == null ? '--' : sign(record['涨跌额']) + money(record['涨跌额'])) + '</td>' +
+            '<td class="' + colorClass(record['涨跌幅']) + '">' + percent(record['涨跌幅']) + '</td>' +
+            '<td>' + (record['公司家数'] == null ? '--' : record['公司家数'] + ' 家') + '</td>' +
+            '<td>' + yi(record['成交额']) + '</td>' +
+            '<td>' + (lead == null ? '--' : esc(lead) + (leadRate == null ? '' : ' <small class="' + colorClass(leadRate) + '">' + sign(leadRate) + Number(leadRate).toFixed(2) + '%</small>')) + '</td>' +
+            '</tr>';
+        }
+        function rankRow(record, index) {
+          return '<tr>' +
+            '<td>' + index + '</td>' +
+            '<td>' + esc(record['代码']) + '</td>' +
+            '<td><b>' + esc(record['股票名称']) + '</b></td>' +
+            '<td>' + num(record['最新价']) + '</td>' +
+            '<td class="' + colorClass(record['涨跌额']) + '">' + (record['涨跌额'] == null ? '--' : sign(record['涨跌额']) + money(record['涨跌额'])) + '</td>' +
+            '<td class="' + colorClass(record['涨跌幅']) + '">' + percent(record['涨跌幅']) + '</td>' +
+            '</tr>';
+        }
+
+        function renderModule(key, moduleData) {
+          var panel = document.querySelector('.hot-sectors-panel[data-module="' + key + '"]');
+          if (!panel) return;
+          var tbody = panel.querySelector('tbody');
+          if (!moduleData || !moduleData.records || !moduleData.records.length) {
+            var colspan = key === 'hot_rank' ? 6 : 8;
+            tbody.innerHTML = '<tr><td colspan="' + colspan + '" class="empty">' + (moduleData && moduleData.error ? esc(moduleData.error) : '暂无数据') + '</td></tr>';
+            return;
+          }
+          var render = key === 'hot_rank' ? rankRow : boardRow;
+          tbody.innerHTML = moduleData.records.map(function(record, i) { return render(record, i + 1); }).join('');
+        }
+
+        function render(payload) {
+          var modules = payload.modules || {};
+          keys.forEach(function(key) { renderModule(key, modules[key]); });
+          if (payload.updated_at) {
+            var moment = new Date(payload.updated_at * 1000);
+            updatedEl.textContent = '更新于 ' + moment.toTimeString().slice(0, 8);
+          }
+          var errors = keys.filter(function(key) {
+            var moduleData = modules[key];
+            return moduleData && moduleData.error && !moduleData.records.length;
+          }).length;
+          var statusText = errors ? '部分数据获取失败，可点击刷新重试' : '数据来源：新浪财经 · 腾讯行情';
+          if (!isTradingSession()) statusText += ' · 非交易时段暂停自动刷新';
+          statusEl.textContent = statusText;
+        }
+
+        function isTradingSession() {
+          var d = new Date();
+          if (d.getDay() === 0 || d.getDay() === 6) return false;
+          var minutes = d.getHours() * 60 + d.getMinutes();
+          return (minutes >= 555 && minutes <= 690) || (minutes >= 780 && minutes <= 900);
+        }
+
+
+        function refresh() {
+          fetch('{{ url_for("hot_sectors_api") }}', { cache: 'no-store' })
+            .then(function(response) { if (!response.ok) throw new Error(); return response.json(); })
+            .then(render)
+            .catch(function() {
+              updatedEl.textContent = '获取失败';
+              statusEl.textContent = '行情获取失败，请检查网络后重试';
+            });
+        }
+
+        refreshBtn.addEventListener('click', function() {
+          refreshBtn.disabled = true;
+          refreshBtn.textContent = '刷新中...';
+          fetch('{{ url_for("hot_sectors_api") }}?force=1', { cache: 'no-store' })
+            .then(function(response) { if (!response.ok) throw new Error(); return response.json(); })
+            .then(function(payload) {
+              render(payload);
+              refreshBtn.textContent = '刷新';
+              refreshBtn.disabled = false;
+            })
+            .catch(function() {
+              statusEl.textContent = '刷新失败，请稍后重试';
+              refreshBtn.textContent = '刷新';
+              refreshBtn.disabled = false;
+            });
+        });
+
+        refresh();
+        var lastFetchAt = Date.now();
+        (function schedule() {
+          var now = Date.now();
+          if (isTradingSession() && now - lastFetchAt >= 31000) {
+            refresh();
+            lastFetchAt = now;
+          }
+          window.setTimeout(schedule, 10000);
+        }());
+      }());
+      </script>
+      {% endif %}
+    </main>
+  </div>
+</body>
+</html>
