@@ -47,6 +47,13 @@ class StockNotesTest(unittest.TestCase):
                 "UPDATE alert_types SET params_json = ?, enabled = 1 WHERE code = ?",
                 (json.dumps(self.module.INTRADAY_REBOUND_DEFAULT_PARAMS), self.module.INTRADAY_REBOUND_CODE),
             )
+            db.execute(
+                "UPDATE alert_types SET params_json = ?, enabled = 1 WHERE code = ?",
+                (
+                    json.dumps(self.module.CONSOLIDATION_STABILIZATION_DEFAULT_PARAMS),
+                    self.module.CONSOLIDATION_STABILIZATION_CODE,
+                ),
+            )
             db.execute("DELETE FROM account_snapshots")
             db.execute("DELETE FROM watchlist_stocks")
             db.execute("DELETE FROM trade_excursion_metrics")
@@ -993,6 +1000,37 @@ class StockNotesTest(unittest.TestCase):
             finally:
                 backup.close()
 
+    def test_daily_volume_schema_migration_normalizes_lots_once(self):
+        with self.module.db_connect() as db:
+            rows = (
+                ("900001", "tencent-realtime", 1234),
+                ("900002", "akshare-eastmoney", 2345),
+                ("900003", "akshare-tencent", 345600),
+                ("900004", "akshare-sina", 456700),
+            )
+            for stock_code, source, volume in rows:
+                db.execute(
+                    """INSERT INTO daily_prices
+                    (stock_code, trade_date, open, high, low, close, volume, source, fetched_at)
+                    VALUES (?, '2026-08-24', 10, 11, 9, 10, ?, ?, '2026-08-24T15:00:00')""",
+                    (stock_code, volume, source),
+                )
+            db.execute("PRAGMA user_version = 14")
+
+        self.module.init_db()
+        self.module.init_db()
+
+        with self.module.db_connect() as db:
+            volumes = dict(db.execute(
+                "SELECT stock_code, volume FROM daily_prices WHERE stock_code LIKE '90000%'"
+            ).fetchall())
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(version, self.module.SCHEMA_VERSION)
+        self.assertEqual(volumes, {
+            "900001": 123400, "900002": 234500,
+            "900003": 345600, "900004": 456700,
+        })
+
     def test_split_menus(self):
         root = self.client.get("/")
         self.assertEqual(root.status_code, 302)
@@ -1380,6 +1418,7 @@ class StockNotesTest(unittest.TestCase):
         with self.module.db_connect() as db:
             price = db.execute("SELECT * FROM daily_prices WHERE stock_code = '002156'").fetchone()
         self.assertEqual(price["close"], 11.5)
+        self.assertEqual(price["volume"], 100000.0)
         self.assertEqual(price["source"], "tencent-realtime")
 
     def _intraday_rebound_sample(self):
@@ -1655,7 +1694,7 @@ class StockNotesTest(unittest.TestCase):
         self.assertAlmostEqual(result["signal_low_above_prior_ratio"], 12.34 / 11.92 - 1)
 
     def test_three_day_dip_realtime_alerts_deduplicate_candidate_and_confirmation(self):
-        now = "2026-08-14T14:30:00"
+        now = "2026-08-20T14:30:00"
         with self.module.db_connect() as db:
             user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
             db.execute(
@@ -1672,7 +1711,9 @@ class StockNotesTest(unittest.TestCase):
                     (row["trade_date"], row["open"], row["high"], row["low"], row["close"], row["volume"], now),
                 )
 
-        candidate = {"600482": dict(self._exhaustion_sample()[-1], fetched_at=now, amount=1)}
+        candidate_quote = dict(self._exhaustion_sample()[-1], fetched_at=now, amount=1)
+        candidate_quote["volume"] /= 100
+        candidate = {"600482": candidate_quote}
         with patch.object(self.module, "fetch_realtime_prices", return_value=candidate):
             self.module.sync_realtime_codes(["600482"])
             self.module.sync_realtime_codes(["600482"])
@@ -1682,7 +1723,7 @@ class StockNotesTest(unittest.TestCase):
         self.assertEqual(stages, ["CANDIDATE"])
         self.assertEqual(event_stages, ["CANDIDATE"])
 
-        confirmed = {"600482": dict(candidate["600482"], fetched_at="2026-08-14T15:00:00")}
+        confirmed = {"600482": dict(candidate["600482"], fetched_at="2026-08-20T15:00:00")}
         with patch.object(self.module, "fetch_realtime_prices", return_value=confirmed):
             self.module.sync_realtime_codes(["600482"])
             self.module.sync_realtime_codes(["600482"])
@@ -1691,6 +1732,88 @@ class StockNotesTest(unittest.TestCase):
             event_stages = [row["stage"] for row in db.execute("SELECT stage FROM alert_signal_events ORDER BY id")]
         self.assertEqual(stages, ["CANDIDATE", "CONFIRMED"])
         self.assertEqual(event_stages, ["CANDIDATE", "CONFIRMED"])
+
+    def _consolidation_stabilization_sample(self):
+        return [
+            {"trade_date": "2026-06-01", "open": 24.46, "high": 24.98, "low": 23.90, "close": 24.34, "volume": 24089000},
+            {"trade_date": "2026-06-02", "open": 24.28, "high": 24.38, "low": 23.50, "close": 23.84, "volume": 22939900},
+            {"trade_date": "2026-06-03", "open": 23.73, "high": 23.73, "low": 23.14, "close": 23.29, "volume": 30451400},
+            {"trade_date": "2026-06-04", "open": 23.16, "high": 23.28, "low": 22.61, "close": 22.78, "volume": 24355900},
+            {"trade_date": "2026-06-05", "open": 23.22, "high": 23.60, "low": 22.80, "close": 22.87, "volume": 27941800},
+            {"trade_date": "2026-06-08", "open": 22.51, "high": 22.89, "low": 21.60, "close": 21.91, "volume": 24121600},
+            {"trade_date": "2026-06-09", "open": 21.92, "high": 22.05, "low": 21.38, "close": 22.00, "volume": 20537300},
+            {"trade_date": "2026-06-10", "open": 21.79, "high": 22.35, "low": 21.76, "close": 22.08, "volume": 20901200},
+            {"trade_date": "2026-06-11", "open": 21.80, "high": 21.92, "low": 21.25, "close": 21.52, "volume": 29624800},
+            {"trade_date": "2026-06-12", "open": 21.69, "high": 22.18, "low": 20.81, "close": 22.18, "volume": 70001500},
+            {"trade_date": "2026-06-15", "open": 21.91, "high": 22.28, "low": 21.70, "close": 22.27, "volume": 42825200},
+            {"trade_date": "2026-06-16", "open": 21.98, "high": 22.04, "low": 21.61, "close": 21.79, "volume": 25921000},
+            {"trade_date": "2026-06-17", "open": 21.73, "high": 22.17, "low": 21.60, "close": 21.97, "volume": 24893000},
+            {"trade_date": "2026-06-18", "open": 21.82, "high": 22.74, "low": 21.66, "close": 22.51, "volume": 41863700},
+        ]
+
+    def test_consolidation_stabilization_kanglong_sample_confirms_on_june_18(self):
+        prices = self._consolidation_stabilization_sample()
+        result = self.module.evaluate_consolidation_stabilization(prices)
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["pattern_type"], "DOWN_STABILIZATION")
+        self.assertEqual(result["signal"]["trade_date"], "2026-06-18")
+        self.assertAlmostEqual(result["range_high"], 22.28)
+        self.assertAlmostEqual(result["range_ratio"], 22.28 / 21.60 - 1)
+        self.assertGreater(result["breakout_volume_ratio"], 1.2)
+
+        realtime_volume = [dict(row) for row in prices]
+        realtime_volume[-1]["source"] = "tencent-realtime"
+        self.assertTrue(self.module.evaluate_consolidation_stabilization(realtime_volume)["matched"])
+        self.assertAlmostEqual(
+            self.module.evaluate_consolidation_stabilization(realtime_volume)["breakout_volume_ratio"],
+            result["breakout_volume_ratio"],
+        )
+
+        self.assertFalse(self.module.evaluate_consolidation_stabilization(prices[:-1])["matched"])
+        no_volume = [dict(row) for row in prices]
+        no_volume[-1]["volume"] = 30000000
+        self.assertFalse(self.module.evaluate_consolidation_stabilization(no_volume)["matched"])
+        no_breakout = [dict(row) for row in prices]
+        no_breakout[-1]["close"] = 22.20
+        self.assertFalse(self.module.evaluate_consolidation_stabilization(no_breakout)["matched"])
+
+    def test_consolidation_stabilization_realtime_is_confirmed_user_scoped_and_deduplicated(self):
+        prices = self._consolidation_stabilization_sample()
+        now = "2026-06-18T15:01:00"
+        with self.module.db_connect() as db:
+            first_user = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            second_user = db.execute(
+                "INSERT INTO users (name, created_at) VALUES ('second', ?) RETURNING id",
+                (now,),
+            ).fetchone()["id"]
+            for user_id in (first_user, second_user):
+                db.execute(
+                    """INSERT INTO watchlist_stocks
+                    (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                    VALUES (?, '300759', '康龙化成', 3, '', ?, ?)""",
+                    (user_id, now, now),
+                )
+            for row in prices:
+                db.execute(
+                    """INSERT INTO daily_prices
+                    (stock_code, trade_date, open, high, low, close, volume, source, fetched_at)
+                    VALUES ('300759', ?, ?, ?, ?, ?, ?, 'test', ?)""",
+                    (row["trade_date"], row["open"], row["high"], row["low"], row["close"], row["volume"], now),
+                )
+            quote = {"300759": dict(prices[-1], fetched_at=now, quote_time=now)}
+            self.assertEqual(self.module.evaluate_consolidation_stabilization_alerts(db, quote), 2)
+            self.assertEqual(self.module.evaluate_consolidation_stabilization_alerts(db, quote), 0)
+            notifications = db.execute(
+                "SELECT stage, content FROM notifications ORDER BY user_id"
+            ).fetchall()
+            events = db.execute(
+                "SELECT stage, rule_version, metrics_json FROM alert_signal_events ORDER BY user_id"
+            ).fetchall()
+        self.assertEqual([row["stage"] for row in notifications], ["CONFIRMED", "CONFIRMED"])
+        self.assertTrue(all("下跌企稳" in row["content"] for row in notifications))
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(row["rule_version"] == self.module.CONSOLIDATION_STABILIZATION_RULE_VERSION for row in events))
+        self.assertTrue(all(json.loads(row["metrics_json"])["pattern_type"] == "DOWN_STABILIZATION" for row in events))
 
     def test_notification_api_is_user_scoped(self):
         now = "2026-08-14T15:00:00"
@@ -1886,6 +2009,53 @@ class StockNotesTest(unittest.TestCase):
         self.assertEqual(params["lookback_minutes"], 90)
         self.assertEqual(params["min_drop_ratio"], 0.025)
         self.assertEqual(params["confirmation_min_volume_multiple"], 2.0)
+
+    def test_consolidation_stabilization_admin_and_kanglong_backtest(self):
+        now = "2026-06-18T15:01:00"
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            db.execute(
+                """INSERT INTO watchlist_stocks
+                (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                VALUES (?, '300759', '康龙化成', 3, '', ?, ?)""",
+                (user_id, now, now),
+            )
+            for row in self._consolidation_stabilization_sample():
+                db.execute(
+                    """INSERT INTO daily_prices
+                    (stock_code, trade_date, open, high, low, close, volume, source, fetched_at)
+                    VALUES ('300759', ?, ?, ?, ?, ?, ?, 'test', ?)""",
+                    (row["trade_date"], row["open"], row["high"], row["low"], row["close"], row["volume"], now),
+                )
+
+        page = self.client.get(
+            "/admin/alert-types/consolidation-stabilization?run_test=1&stock_code=300759&start_date=2026-06-18&end_date=2026-06-18"
+        ).get_data(as_text=True)
+        self.assertIn("横盘整理企稳", page)
+        self.assertIn("康龙化成", page)
+        self.assertIn("下跌企稳", page)
+        self.assertIn("1.34 倍", page)
+
+        response = self.client.post(
+            "/admin/alert-types/consolidation-stabilization",
+            data={
+                "enabled": "on", "consolidation_days": "4", "max_range_percent": "5",
+                "trend_lookback_days": "12", "trend_threshold_percent": "6",
+                "min_breakout_volume_ratio": "1.3",
+            },
+            follow_redirects=True,
+        )
+        self.assertIn("已保存横盘整理企稳提醒参数", response.get_data(as_text=True))
+        with self.module.db_connect() as db:
+            row = db.execute(
+                "SELECT params_json FROM alert_types WHERE code = ?",
+                (self.module.CONSOLIDATION_STABILIZATION_CODE,),
+            ).fetchone()
+        params = json.loads(row["params_json"])
+        self.assertEqual(params["consolidation_days"], 4)
+        self.assertEqual(params["trend_lookback_days"], 12)
+        self.assertAlmostEqual(params["max_range_ratio"], 0.05)
+        self.assertAlmostEqual(params["min_breakout_volume_ratio"], 1.3)
 
     def test_three_day_dip_backtest_finds_hits_without_writing_notifications(self):
         now = "2026-08-15T10:00:00"
@@ -2133,12 +2303,12 @@ class StockNotesTest(unittest.TestCase):
             self.assertEqual(self.module.evaluate_watchlist_limit_up_alerts(db, quote), 0)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 0)
 
-    def test_kline_volume_keeps_realtime_lots(self):
+    def test_kline_volume_converts_standardized_realtime_shares_to_lots(self):
         with self.module.db_connect() as db:
             db.execute(
                 """INSERT INTO daily_prices
                 (stock_code, trade_date, open, high, low, close, volume, source, fetched_at)
-                VALUES ('000657', '2026-08-24', 69, 70, 64, 66.76, 896396, 'tencent-realtime', '2026-08-24T15:03:06')"""
+                VALUES ('000657', '2026-08-24', 69, 70, 64, 66.76, 89639600, 'tencent-realtime', '2026-08-24T15:03:06')"""
             )
             row = db.execute("SELECT volume, source FROM daily_prices WHERE stock_code = '000657'").fetchone()
         self.assertEqual(self.module.kline_volume_lots(row), 896396)
@@ -2152,6 +2322,65 @@ class StockNotesTest(unittest.TestCase):
             )
             row = db.execute("SELECT volume, source FROM daily_prices WHERE stock_code = '000657'").fetchone()
         self.assertEqual(self.module.kline_volume_lots(row), 8963.96)
+
+    def test_kline_api_declares_lot_volume_unit(self):
+        now = "2026-08-24T15:03:06"
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            db.execute(
+                """INSERT INTO watchlist_stocks
+                (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                VALUES (?, '000657', '中钨高新', 2, '', ?, ?)""",
+                (user_id, now, now),
+            )
+            db.execute(
+                """INSERT INTO daily_prices
+                (stock_code, trade_date, open, high, low, close, volume, source, fetched_at)
+                VALUES ('000657', '2026-08-24', 69, 70, 64, 66.76, 89639600,
+                'tencent-realtime', ?)""",
+                (now,),
+            )
+        payload = self.client.get("/analysis/watchlist/kline/000657").get_json()
+        self.assertEqual(payload["volume_unit"], "lot")
+        self.assertEqual(payload["data"][0]["volume"], 896396)
+
+    def test_eastmoney_history_volume_is_normalized_from_lots_to_shares(self):
+        frame = pd.DataFrame([{
+            "日期": "2026-08-24", "开盘": 69, "最高": 70, "最低": 64, "收盘": 66.76,
+            "成交量": 896396, "成交额": 600000000,
+        }])
+        with self.module.db_connect() as db:
+            self.module.save_daily_prices(
+                db, "000657", frame, "akshare-eastmoney", "2026-08-24", "2026-08-24",
+            )
+            row = db.execute("SELECT volume, source FROM daily_prices WHERE stock_code = '000657'").fetchone()
+        self.assertEqual(row["volume"], 89639600)
+        self.assertEqual(self.module.kline_volume_lots(row), 896396)
+
+    def test_three_day_dip_volume_ratio_uses_standardized_daily_shares(self):
+        prices = self._exhaustion_sample()
+        for row in prices:
+            row["source"] = "akshare-tencent"
+        result = self.module.evaluate_three_day_dip(prices, enforce_volume=True)
+        self.assertAlmostEqual(result["volume_ratio"], 29231900 / 31212500)
+
+        quote = {"000657": {
+            "trade_date": "2026-08-24", "open": 69, "high": 70, "low": 64, "close": 66.76,
+            "volume": 896396, "amount": 600000000, "fetched_at": "2026-08-24T15:03:06",
+        }}
+        with self.module.db_connect() as db:
+            self.module.save_realtime_prices(db, quote)
+            row = db.execute("SELECT volume, source FROM daily_prices WHERE stock_code = '000657'").fetchone()
+        self.assertEqual(row["volume"], 89639600)
+
+    def test_closing_quote_uses_market_quote_time(self):
+        delayed = {
+            "trade_date": "2026-08-24", "quote_time": "2026-08-24T14:59:30",
+            "fetched_at": "2026-08-24T15:03:06",
+        }
+        self.assertFalse(self.module.is_closing_quote(delayed))
+        self.assertTrue(self.module.is_closing_quote(dict(delayed, quote_time="2026-08-24T15:00:00")))
+        self.assertFalse(self.module.is_closing_quote(dict(delayed, quote_time="2026-08-23T15:00:00")))
 
     def test_fetch_market_indexes_parses_index_quotes(self):
         fields = [""] * 88

@@ -1,6 +1,6 @@
 # StockNotes 提醒系统规范
 
-本文件是三日低吸、日内反弹及其后续回测功能的单一规则文档。
+本文件是三日低吸、横盘整理企稳、日内反弹及其后续回测功能的单一规则文档。
 
 修改任何提醒逻辑、参数、通知、样本、回测或相关数据库结构前，必须先阅读本文件。修改完成后必须同步更新本文件，并运行完整测试。
 
@@ -33,6 +33,10 @@
 
 主要字段：`stock_code`、`trade_date`、`open`、`high`、`low`、`close`、`volume`、`amount`、`source`、`fetched_at`。
 
+`daily_prices.volume` 的数据库单位固定为“股”，不随 `source` 改变。K 线 JSON 对外输出“手”，并携带 `volume_unit: "lot"`。
+
+数据库版本 `15` 将旧 `tencent-realtime`、`akshare-eastmoney` 日线成交量从“手”迁移为“股”；版本 `17` 使用标准化日线修复仍可追溯的三日低吸样本 candle 和事件量比。缺少对应日线的旧样本不猜测、不伪造单位或量比。
+
 用途：
 
 - 三日低吸识别。
@@ -45,6 +49,8 @@
 表：`intraday_quotes`
 
 主要字段：`stock_code`、`trade_date`、`quote_minute`、`price`、`previous_close`、`volume`、`amount`、`fetched_at`。
+
+`intraday_quotes.volume` 是腾讯行情截至该分钟的当日累计成交量，单位固定为“手”，不是该分钟独立成交量。日内反弹只在同一交易会话内对相邻累计值做差分。
 
 要求：
 
@@ -135,6 +141,64 @@ baseline.close > baseline.open
 ```text
 user_id:alert_type:stock_code:trade_date:stage
 ```
+
+## 4A. 横盘整理企稳
+
+状态：独立提醒类型、收盘确认、历史测试、真实通知事件和日线后续收益为**已实现**。
+
+策略代码：`CONSOLIDATION_STABILIZATION`
+
+规则版本：`consolidation-stabilization-v1`
+
+核心函数：
+
+- `consolidation_stabilization_params()`。
+- `evaluate_consolidation_stabilization()`。
+- `evaluate_consolidation_stabilization_alerts()`。
+
+### 4A.1 计算窗口
+
+默认使用横盘前 `10` 个交易日、横盘期 `3` 个交易日和确认日，共 `14` 根日 K。确认日只能使用当日收盘后完整的开高低收和成交量，不产生盘中候选。
+
+### 4A.2 横盘与确认
+
+横盘期区间定义为：
+
+```text
+range_high = max(consolidation.high)
+range_low = min(consolidation.low)
+range_ratio = range_high / range_low - 1
+```
+
+默认要求：
+
+- 横盘区间振幅不超过 `4%`。
+- 确认日收盘价严格高于横盘期最高价。
+- 确认日成交量至少为横盘期平均成交量的 `1.2` 倍。
+
+`daily_prices.volume` 统一保存“股”。腾讯实时和东方财富历史接口返回“手”，写入时乘以 `100`；腾讯历史和新浪历史接口返回“股”，直接写入。K 线 API 输出时统一除以 `100` 转成“手”。`intraday_quotes.volume` 单独保存腾讯当日累计“手”，只用于同源分钟差分和量比。
+
+探底回收不是硬条件，普通窄幅横盘也可识别。趋势分类只生成标签，不阻止提醒。
+
+### 4A.3 趋势标签
+
+以横盘前趋势窗口首尾收盘涨跌分类，默认阈值为 `5%`：
+
+- `DOWN_STABILIZATION`：前置涨跌不高于 `-5%`，显示“下跌企稳”。
+- `UP_CONTINUATION`：前置涨跌不低于 `+5%`，显示“上涨中继”。
+- `NEUTRAL_BREAKOUT`：其余情况，显示“中性横盘突破”。
+
+康龙化成 `300759` 的基准样本为 `2026-06-15` 至 `2026-06-17` 横盘，`2026-06-18` 收盘放量突破，分类为 `DOWN_STABILIZATION`。
+
+### 4A.4 通知与收益
+
+只生成 `CONFIRMED` 通知。同一用户、股票和交易日最多一条：
+
+```text
+user_id:CONSOLIDATION_STABILIZATION:stock_code:trade_date:CONFIRMED
+```
+
+成功生成通知后写入 `alert_signal_events`，保存实际触发价、规则版本、完整参数快照，以及整理区上下沿、区间振幅、突破量比和前置趋势涨跌。复用 `alert_signal_event_outcomes` 计算 T+1、T+3、T+5、T+10 收盘收益、最高收益和最大回撤。
 
 ## 5. 日内反弹
 
@@ -272,6 +336,19 @@ user_id:alert_type:stock_code:trade_date:session:trough_minute:stage
 ```
 
 代码默认值、管理页面和 `stocknotes.db` 中 `alert_types.params_json` 必须保持一致。修改参数后必须核对数据库中的实际生效值。
+
+横盘整理企稳默认基线：
+
+```json
+{
+  "consolidation_days": 3,
+  "max_range_ratio": 0.04,
+  "trend_lookback_days": 10,
+  "trend_threshold_ratio": 0.05,
+  "min_breakout_volume_ratio": 1.2,
+  "enabled": true
+}
+```
 
 ## 7. 提醒样本与回测
 
@@ -491,7 +568,9 @@ THREE_DAY_DIP_RULE_VERSION
 INTRADAY_REBOUND_RULE_VERSION
 ```
 
-状态：两类提醒均已将独立规则版本写入统一事件表。
+状态：三类策略提醒均已将独立规则版本写入统一事件表。
+
+横盘整理企稳使用独立版本常量 `CONSOLIDATION_STABILIZATION_RULE_VERSION`，当前版本为 `consolidation-stabilization-v1`。
 
 规则版本必须写入：
 
@@ -506,7 +585,7 @@ INTRADAY_REBOUND_RULE_VERSION
 
 修改前必须回答：
 
-1. 修改的是三日低吸还是日内反弹？
+1. 修改的是三日低吸、横盘整理企稳还是日内反弹？
 2. 使用的是日线还是分钟线？
 3. 是否改变触发条件？
 4. 是否改变通知阶段？

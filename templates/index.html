@@ -25,13 +25,14 @@
           <a class="{{ 'active' if page == 'strategy' else '' }}" href="{{ url_for('analysis_strategy') }}">策略验证</a>
           <a class="{{ 'active' if page == 'discipline' else '' }}" href="{{ url_for('analysis_discipline') }}">情绪纪律</a>
         </details>
-        <details id="submenu-admin" class="nav-group" {% if page in ('statements', 'import', 'account', 'three_day_dip', 'three_day_dip_pool', 'intraday_rebound') %}open{% endif %}>
+        <details id="submenu-admin" class="nav-group" {% if page in ('statements', 'import', 'account', 'three_day_dip', 'three_day_dip_pool', 'consolidation_stabilization', 'intraday_rebound') %}open{% endif %}>
           <summary>⚙ <span>后台管理</span></summary>
           <a class="{{ 'active' if page in ('statements', 'import') else '' }}" href="{{ url_for('statements') }}">交割单</a>
           <a class="{{ 'active' if page == 'account' else '' }}" href="{{ url_for('account_management') }}">账户资金</a>
-          <details class="nav-subgroup" {% if page in ('three_day_dip', 'three_day_dip_pool', 'intraday_rebound') %}open{% endif %}>
+          <details class="nav-subgroup" {% if page in ('three_day_dip', 'three_day_dip_pool', 'consolidation_stabilization', 'intraday_rebound') %}open{% endif %}>
             <summary>提醒类型</summary>
             <a class="{{ 'active' if page in ('three_day_dip', 'three_day_dip_pool') else '' }}" href="{{ url_for('three_day_dip_management') }}">三日低吸</a>
+            <a class="{{ 'active' if page == 'consolidation_stabilization' else '' }}" href="{{ url_for('consolidation_stabilization_management') }}">横盘整理企稳</a>
             <a class="{{ 'active' if page == 'intraday_rebound' else '' }}" href="{{ url_for('intraday_rebound_management') }}">日内反弹</a>
           </details>
         </details>
@@ -41,7 +42,7 @@
     <main class="main{{ ' summary-page' if page == 'summary' else '' }}">
       {% set return_to = request.full_path if request.query_string else request.path %}
       <header class="top">
-        <div><small>STOCKNOTES / LOCAL</small><h1>{{ {'stocks': '个股分析', 'trade_detail': '交易复盘详情', 'portfolio': '持仓分析', 'watchlist': '重点观察', 'hot_sectors': '热门板块', 'notifications': '通知', 'summary': '汇总', 'reviews': '交易复盘', 'recent': '近期表现', 'timing': '时机把握', 'strategy': '策略验证', 'discipline': '情绪纪律', 'statements': '交割单', 'import': '导入交割单', 'account': '账户资金', 'three_day_dip': '三日低吸', 'three_day_dip_pool': '三日低吸池', 'intraday_rebound': '日内反弹'}.get(page, '后台管理') }}</h1></div>
+        <div><small>STOCKNOTES / LOCAL</small><h1>{{ {'stocks': '个股分析', 'trade_detail': '交易复盘详情', 'portfolio': '持仓分析', 'watchlist': '重点观察', 'hot_sectors': '热门板块', 'notifications': '通知', 'summary': '汇总', 'reviews': '交易复盘', 'recent': '近期表现', 'timing': '时机把握', 'strategy': '策略验证', 'discipline': '情绪纪律', 'statements': '交割单', 'import': '导入交割单', 'account': '账户资金', 'three_day_dip': '三日低吸', 'three_day_dip_pool': '三日低吸池', 'consolidation_stabilization': '横盘整理企稳', 'intraday_rebound': '日内反弹'}.get(page, '后台管理') }}</h1></div>
         <div class="workspace-tools">
           <div class="local-badge">● SQLite 本地数据库</div>
           <a class="database-backup" href="{{ url_for('export_database') }}" title="下载包含本机全部用户及所有业务数据的完整 SQLite 数据库">备份</a>
@@ -1010,6 +1011,7 @@
       <nav class="notification-filters" aria-label="通知类型筛选">
         <a class="{{ 'active' if not nd.alert_type_code else '' }}" href="{{ url_for('notifications') }}">全部</a>
         <a class="{{ 'active' if nd.alert_type_code == 'THREE_DAY_DIP' else '' }}" href="{{ url_for('notifications', type='THREE_DAY_DIP') }}">三日低吸</a>
+        <a class="{{ 'active' if nd.alert_type_code == 'CONSOLIDATION_STABILIZATION' else '' }}" href="{{ url_for('notifications', type='CONSOLIDATION_STABILIZATION') }}">横盘企稳</a>
         <a class="{{ 'active' if nd.alert_type_code == 'INTRADAY_REBOUND' else '' }}" href="{{ url_for('notifications', type='INTRADAY_REBOUND') }}">日内反弹</a>
         <a class="{{ 'active' if nd.alert_type_code == 'WATCHLIST_LIMIT_UP' else '' }}" href="{{ url_for('notifications', type='WATCHLIST_LIMIT_UP') }}">日常提醒</a>
       </nav>
@@ -1986,6 +1988,54 @@
         {% if intraday_notifications %}<div class="table-wrap"><table class="sample-table"><thead><tr><th>时间</th><th>证券</th><th>信号内容</th></tr></thead><tbody>{% for row in intraday_notifications %}<tr><td>{{ row.quote_time[:16]|replace('T', ' ') }}</td><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ row.content }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="empty">还没有日内反弹候选。</div>{% endif %}
       </section>
 
+      {% elif page == 'consolidation_stabilization' %}
+      <section class="intro">
+        <div><span class="eyebrow">ALERTS / CONSOLIDATION</span><p>识别窄幅横盘后的收盘放量突破，并按前置趋势标记下跌企稳、上涨中继或中性横盘突破。</p></div>
+        <a class="button secondary" href="{{ url_for('analysis_watchlist') }}">查看重点观察</a>
+      </section>
+      <section class="panel alert-settings">
+        <div class="panel-title">横盘整理企稳 <span class="pill">收盘确认</span></div>
+        <p class="hint">仅在收盘价突破整理区最高价，且成交量达到整理期均量要求时发送确认提醒。</p>
+        <form method="post" action="{{ url_for('save_consolidation_stabilization_alert_type') }}">
+          <label class="alert-toggle"><input type="checkbox" name="enabled" {{ 'checked' if alert_type.enabled else '' }}><span><b>启用横盘整理企稳</b><small>应用于所有用户各自的重点观察股票</small></span></label>
+          <div class="alert-field-grid">
+            <label><span>横盘交易日</span><input name="consolidation_days" type="number" min="2" max="10" value="{{ alert_params.consolidation_days }}" required></label>
+            <label><span>横盘区间振幅最多</span><div class="input-suffix"><input name="max_range_percent" type="number" min="0.1" max="30" step="0.1" value="{{ '%.1f'|format(alert_params.max_range_ratio * 100) }}" required><i>%</i></div></label>
+            <label><span>前置趋势观察日</span><input name="trend_lookback_days" type="number" min="2" max="60" value="{{ alert_params.trend_lookback_days }}" required></label>
+            <label><span>趋势分类阈值</span><div class="input-suffix"><input name="trend_threshold_percent" type="number" min="0" max="50" step="0.1" value="{{ '%.1f'|format(alert_params.trend_threshold_ratio * 100) }}" required><i>%</i></div></label>
+            <label><span>突破成交量至少</span><input name="min_breakout_volume_ratio" type="number" min="1" max="10" step="0.1" value="{{ '%.1f'|format(alert_params.min_breakout_volume_ratio) }}" required><small>相对横盘期平均成交量</small></label>
+          </div>
+          <button class="button" type="submit">保存提醒参数</button>
+        </form>
+      </section>
+      {% set ae = alert_effectiveness %}
+      <section class="panel alert-backtest-panel">
+        <div class="alert-backtest-head"><div><span class="eyebrow">REAL OUTCOMES</span><div class="panel-title">横盘整理企稳提醒效果</div><p class="hint">只统计真实收盘确认事件，以实际触发价计算后续收益。</p></div><div class="pill">{{ ae.summary.total }} 个事件</div></div>
+        <div class="backtest-summary">
+          {% for key, label in [('day_1_close_return','T+1'),('day_3_close_return','T+3'),('day_5_close_return','T+5'),('day_10_close_return','T+10')] %}{% set p = ae.performance[key] %}<div class="{{ 'hit' if p.average is not none and p.average > 0 else '' }}"><span>{{ label }}</span><b>{{ p.average|percent if p.average is not none else '--' }}</b><small>{{ p.samples }} 个完整样本{% if p.win_rate is not none %} · 胜率 {{ p.win_rate|percent }}{% endif %}</small></div>{% endfor %}
+        </div>
+        {% if ae.rows %}<div class="table-wrap"><table class="sample-table"><thead><tr><th>信号日</th><th>证券</th><th>信号价</th><th>T+1</th><th>T+3</th><th>T+5</th></tr></thead><tbody>{% for row in ae.rows %}<tr><td>{{ row.signal_date }}</td><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ row.signal_price|money }}</td><td>{{ row.day_1_close_return|percent if row.day_1_close_return is not none else '--' }}</td><td>{{ row.day_3_close_return|percent if row.day_3_close_return is not none else '--' }}</td><td>{{ row.day_5_close_return|percent if row.day_5_close_return is not none else '--' }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="empty">暂无真实横盘整理企稳事件，后续收盘确认会自动进入统计。</div>{% endif %}
+      </section>
+      <section class="panel alert-backtest-panel">
+        <div class="alert-backtest-head"><div><span class="eyebrow">HISTORICAL TEST</span><div class="panel-title">重点观察历史命中测试</div><p class="hint">测试只读取已有日线，不生成通知。趋势分类只影响标签，不阻止提醒。</p></div>{% if alert_watchlist %}<a class="button secondary" href="{{ url_for('analysis_watchlist') }}">同步历史行情</a>{% endif %}</div>
+        {% if alert_watchlist %}
+        <form class="alert-backtest-form" method="get" action="{{ url_for('consolidation_stabilization_management') }}">
+          <input type="hidden" name="run_test" value="1">
+          <label><span>重点观察股票</span><select name="stock_code" required><option value="">请选择股票</option>{% for stock in alert_watchlist %}<option value="{{ stock.stock_code }}" {{ 'selected' if stock.stock_code == selected_stock_code else '' }}>{{ stock.stock_name }} · {{ stock.stock_code }}</option>{% endfor %}</select></label>
+          <label><span>开始日期</span><input name="start_date" type="date" value="{{ test_start_date }}" required></label>
+          <label><span>截止日期</span><input name="end_date" type="date" value="{{ test_end_date }}" required></label>
+          <button class="button" type="submit">测试是否命中</button>
+        </form>
+        {% else %}<div class="empty">当前用户还没有重点观察股票，请先添加股票并同步历史行情。</div>{% endif %}
+        {% if backtest_error %}<div class="backtest-message error">{{ backtest_error }}</div>{% endif %}
+        {% if backtest %}
+        <div class="backtest-summary"><div><span>测试股票</span><b>{{ backtest.stock_name }}</b><small>{{ backtest.stock_code }}</small></div><div><span>参与扫描</span><b>{{ backtest.scanned_days }}</b><small>个交易日</small></div><div class="{{ 'hit' if backtest.hits else '' }}"><span>命中次数</span><b>{{ backtest.hits|length }}</b><small>次</small></div></div>
+        {% if backtest.insufficient %}<div class="backtest-message warning"><b>历史行情不足，无法完成测试。</b><span>数据库行情范围：{{ backtest.first_price_date or '无' }} 至 {{ backtest.last_price_date or '无' }}。</span></div>
+        {% elif not backtest.hits %}<div class="backtest-message neutral"><b>所选日期范围内没有命中“横盘整理企稳”。</b><span>已扫描 {{ backtest.scanned_days }} 个交易日。</span></div>
+        {% else %}<div class="backtest-hit-list">{% for hit in backtest.hits %}<details class="backtest-hit" open><summary><div><span class="backtest-hit-date">{{ hit.signal_date }}</span><b>{{ {'DOWN_STABILIZATION':'下跌企稳','UP_CONTINUATION':'上涨中继','NEUTRAL_BREAKOUT':'中性横盘突破'}[hit.pattern_type] }}</b></div><div><span>放量 <b>{{ '%.2f'|format(hit.breakout_volume_ratio) }} 倍</b></span></div></summary><div class="backtest-checks"><span class="pass">✓ 整理振幅 {{ '%.2f'|format(hit.range_ratio * 100) }}%</span><span class="pass">✓ 收盘突破 {{ hit.range_high|money }}</span><span class="pass">✓ 前置趋势 {{ hit.trend_change_ratio|percent }}</span></div><div class="table-wrap"><table class="backtest-candles"><thead><tr><th>日期</th><th>开盘</th><th>最高</th><th>最低</th><th>收盘</th><th>成交量（手）</th></tr></thead><tbody>{% for candle in hit.candles %}<tr><td>{{ candle.trade_date }}</td><td>{{ candle.open|money }}</td><td>{{ candle.high|money }}</td><td>{{ candle.low|money }}</td><td>{{ candle.close|money }}</td><td>{{ '%.0f'|format((candle.volume or 0) / 100) }}</td></tr>{% endfor %}</tbody></table></div></details>{% endfor %}</div>{% endif %}
+        {% endif %}
+      </section>
+
       {% elif page == 'three_day_dip' %}
       <nav class="alert-page-tabs" aria-label="三日低吸功能"><a class="active" href="{{ url_for('three_day_dip_management') }}">规则参数</a><a href="{{ url_for('three_day_dip_pool') }}">样本池</a></nav>
       <section class="intro">
@@ -1997,7 +2047,12 @@
           <p class="hint">盘中候选暂不使用成交量硬条件；收盘确认会完整判断缩量。</p>
           <form method="post" action="{{ url_for('save_three_day_dip_alert_type') }}">
             <label class="alert-toggle"><input type="checkbox" name="enabled" {{ 'checked' if alert_type.enabled else '' }}><span><b>启用三日低吸</b><small>应用于所有用户各自的重点观察股票</small></span></label>
-          <div class="alert-field-grid">
+            <div class="alert-check-grid">
+              <label><input type="checkbox" name="require_bullish_baseline" {{ 'checked' if alert_params.require_bullish_baseline else '' }}> 基准日必须收红</label>
+              <label><input type="checkbox" name="require_bearish_candles" {{ 'checked' if alert_params.require_bearish_candles else '' }}> 前置交易日必须收阴</label>
+              <label><input type="checkbox" name="require_declining_closes" {{ 'checked' if alert_params.require_declining_closes else '' }}> 收盘价必须逐日走低</label>
+            </div>
+            <div class="alert-field-grid alert-field-grid-four">
               <label><span>前置下跌天数</span><input name="decline_days" type="number" min="1" max="5" value="{{ alert_params.decline_days }}" required></label>
               <label><span>共同累计跌幅至少</span><div class="input-suffix"><input name="min_decline_percent" type="number" min="0" max="100" step="0.1" value="{{ '%.1f'|format(alert_params.min_decline_ratio * 100) }}" required><i>%</i></div></label>
               <label><span>信号日最低价高于前低最多</span><div class="input-suffix"><input name="max_signal_low_above_prior_percent" type="number" min="0" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.max_signal_low_above_prior_ratio * 100) }}" required><i>%</i></div></label>
@@ -2026,9 +2081,6 @@
               </div></fieldset>
             </div>
             <div class="alert-check-grid">
-              <label><input type="checkbox" name="require_bullish_baseline" {{ 'checked' if alert_params.require_bullish_baseline else '' }}> 基准日必须收红</label>
-              <label><input type="checkbox" name="require_bearish_candles" {{ 'checked' if alert_params.require_bearish_candles else '' }}> 前置交易日必须收阴</label>
-              <label><input type="checkbox" name="require_declining_closes" {{ 'checked' if alert_params.require_declining_closes else '' }}> 收盘价必须逐日走低</label>
               <label><input type="checkbox" name="intraday_candidate_enabled" {{ 'checked' if alert_params.intraday_candidate_enabled else '' }}> 发送盘中候选提醒</label>
               <label><input type="checkbox" name="close_confirmation_enabled" {{ 'checked' if alert_params.close_confirmation_enabled else '' }}> 发送收盘确认提醒</label>
             </div>

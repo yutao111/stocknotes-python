@@ -30,7 +30,7 @@ DB_PATH = Path(os.environ.get("STOCKNOTES_DB", BASE_DIR / "stocknotes.db"))
 ALLOWED_EXTENSIONS = {"xlsx", "xls", "csv", "txt"}
 IGNORED_ACTIONS = {"申购配号", "股息入账", "股息红利税补", "指定交易"}
 STATEMENTS_PER_PAGE = 20
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 17
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 DEFAULT_USER_NAME = "yutaoGS"
 MAX_USER_NAME_LENGTH = 50
@@ -94,6 +94,16 @@ THREE_DAY_DIP_DEFAULT_PARAMS = {
     "close_confirmation_enabled": True,
 }
 THREE_DAY_DIP_RULE_VERSION = "three-day-dip-v7"
+CONSOLIDATION_STABILIZATION_CODE = "CONSOLIDATION_STABILIZATION"
+CONSOLIDATION_STABILIZATION_DEFAULT_PARAMS = {
+    "consolidation_days": 3,
+    "max_range_ratio": 0.04,
+    "trend_lookback_days": 10,
+    "trend_threshold_ratio": 0.05,
+    "min_breakout_volume_ratio": 1.2,
+    "enabled": True,
+}
+CONSOLIDATION_STABILIZATION_RULE_VERSION = "consolidation-stabilization-v1"
 INTRADAY_REBOUND_CODE = "INTRADAY_REBOUND"
 INTRADAY_REBOUND_DEFAULT_PARAMS = {
     "lookback_minutes": 120,
@@ -109,7 +119,10 @@ INTRADAY_REBOUND_DEFAULT_PARAMS = {
 }
 INTRADAY_REBOUND_RULE_VERSION = "intraday-rebound-v2"
 WATCHLIST_LIMIT_UP_CODE = "WATCHLIST_LIMIT_UP"
-NOTIFICATION_FILTER_CODES = {THREE_DAY_DIP_CODE, INTRADAY_REBOUND_CODE, WATCHLIST_LIMIT_UP_CODE}
+NOTIFICATION_FILTER_CODES = {
+    THREE_DAY_DIP_CODE, CONSOLIDATION_STABILIZATION_CODE,
+    INTRADAY_REBOUND_CODE, WATCHLIST_LIMIT_UP_CODE,
+}
 REVIEW_MAIN_PROBLEMS = (
     "STOCK_SELECTION", "ENTRY_TIMING", "EXIT_TIMING", "POSITION_SIZE",
     "STOP_LOSS", "EARLY_PROFIT_TAKING", "CHASE", "BOTTOM_FISHING",
@@ -192,6 +205,7 @@ def init_db() -> None:
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
     try:
+        previous_schema_version = int(db.execute("PRAGMA user_version").fetchone()[0])
         db.execute("PRAGMA foreign_keys = OFF")
         db.execute("BEGIN IMMEDIATE")
         db.execute(
@@ -659,6 +673,18 @@ def init_db() -> None:
         db.execute(
             """INSERT INTO alert_types
             (code, name, signal_side, description, params_json, sample_json, enabled, created_at, updated_at)
+            VALUES (?, '横盘整理企稳', 'BUY', '窄幅横盘后，收盘放量突破整理区上沿。', ?, '{}', 1, ?, ?)
+            ON CONFLICT(code) DO NOTHING""",
+            (
+                CONSOLIDATION_STABILIZATION_CODE,
+                json.dumps(CONSOLIDATION_STABILIZATION_DEFAULT_PARAMS, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        db.execute(
+            """INSERT INTO alert_types
+            (code, name, signal_side, description, params_json, sample_json, enabled, created_at, updated_at)
             VALUES (?, '重点观察涨停提醒', 'NEUTRAL', '重点观察股票当日首次达到行情源涨停价时提醒。', '{}', '{}', 1, ?, ?)
             ON CONFLICT(code) DO NOTHING""",
             (WATCHLIST_LIMIT_UP_CODE, now, now),
@@ -682,6 +708,13 @@ def init_db() -> None:
         daily_price_columns = {column["name"] for column in db.execute("PRAGMA table_info(daily_prices)")}
         if "amount" not in daily_price_columns:
             db.execute("ALTER TABLE daily_prices ADD COLUMN amount REAL")
+        if previous_schema_version < 15:
+            db.execute(
+                """UPDATE daily_prices SET volume = volume * 100
+                WHERE volume IS NOT NULL AND source IN ('tencent-realtime', 'akshare-eastmoney')"""
+            )
+        if previous_schema_version < 17:
+            repair_stored_alert_volumes(db)
         if needs_migration:
             for table in business_tables:
                 if table not in legacy_columns:
@@ -1540,6 +1573,130 @@ def three_day_dip_params(raw: dict | None = None) -> dict:
     return params
 
 
+def consolidation_stabilization_params(raw: dict | None = None) -> dict:
+    params = dict(CONSOLIDATION_STABILIZATION_DEFAULT_PARAMS)
+    if raw:
+        params.update(raw)
+    params["consolidation_days"] = max(2, min(10, int(params["consolidation_days"])))
+    params["trend_lookback_days"] = max(2, min(60, int(params["trend_lookback_days"])))
+    for key in ("max_range_ratio", "trend_threshold_ratio", "min_breakout_volume_ratio"):
+        params[key] = max(0.0, min(10.0, float(params[key])))
+    params["enabled"] = bool(params["enabled"])
+    return params
+
+
+def daily_volume_shares(candle: dict) -> float:
+    return float(candle.get("volume") or 0)
+
+
+def repair_stored_alert_volumes(db: sqlite3.Connection) -> None:
+    samples = db.execute(
+        "SELECT id, stock_code, candles_json, metrics_json FROM alert_signal_samples"
+    ).fetchall()
+    for sample in samples:
+        try:
+            candles = json.loads(sample["candles_json"])
+            metrics = json.loads(sample["metrics_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        repaired = []
+        complete = True
+        for candle in candles:
+            candle = dict(candle)
+            price = db.execute(
+                "SELECT volume, source FROM daily_prices WHERE stock_code = ? AND trade_date = ?",
+                (sample["stock_code"], candle.get("trade_date")),
+            ).fetchone()
+            if price is None:
+                complete = False
+            else:
+                candle["volume"] = price["volume"]
+                candle["source"] = price["source"]
+            repaired.append(candle)
+        if complete and len(repaired) >= 2:
+            previous_volume = daily_volume_shares(repaired[-2])
+            signal_volume = daily_volume_shares(repaired[-1])
+            metrics["volume_ratio"] = signal_volume / previous_volume if previous_volume and signal_volume else None
+        db.execute(
+            "UPDATE alert_signal_samples SET candles_json = ?, metrics_json = ? WHERE id = ?",
+            (json.dumps(repaired, ensure_ascii=False), json.dumps(metrics, ensure_ascii=False), sample["id"]),
+        )
+
+    events = db.execute(
+        """SELECT event.id, event.stock_code, event.signal_date, event.metrics_json
+        FROM alert_signal_events AS event JOIN alert_types AS alert ON alert.id = event.alert_type_id
+        WHERE alert.code = ?""",
+        (THREE_DAY_DIP_CODE,),
+    ).fetchall()
+    for event in events:
+        prices = db.execute(
+            """SELECT volume FROM daily_prices WHERE stock_code = ? AND trade_date <= ?
+            AND volume IS NOT NULL ORDER BY trade_date DESC LIMIT 2""",
+            (event["stock_code"], event["signal_date"]),
+        ).fetchall()
+        if len(prices) < 2:
+            continue
+        try:
+            metrics = json.loads(event["metrics_json"])
+        except (TypeError, json.JSONDecodeError):
+            metrics = {}
+        previous_volume = float(prices[1]["volume"] or 0)
+        signal_volume = float(prices[0]["volume"] or 0)
+        metrics["volume_ratio"] = signal_volume / previous_volume if previous_volume and signal_volume else None
+        db.execute(
+            "UPDATE alert_signal_events SET metrics_json = ? WHERE id = ?",
+            (json.dumps(metrics, ensure_ascii=False), event["id"]),
+        )
+
+
+def evaluate_consolidation_stabilization(prices: list[dict], params: dict | None = None) -> dict:
+    params = consolidation_stabilization_params(params)
+    required = params["trend_lookback_days"] + params["consolidation_days"] + 1
+    if len(prices) < required:
+        return {"matched": False, "reason": f"至少需要 {required} 个交易日行情"}
+    candles = [dict(row) for row in prices[-required:]]
+    trend = candles[:params["trend_lookback_days"]]
+    consolidation = candles[params["trend_lookback_days"]:-1]
+    signal = candles[-1]
+    range_high = max(float(item["high"]) for item in consolidation)
+    range_low = min(float(item["low"]) for item in consolidation)
+    range_ratio = range_high / range_low - 1 if range_low else 0.0
+    average_volume = sum(daily_volume_shares(item) for item in consolidation) / len(consolidation)
+    signal_volume = daily_volume_shares(signal)
+    breakout_volume_ratio = signal_volume / average_volume if average_volume and signal_volume else None
+    trend_start_close = float(trend[0]["close"])
+    trend_end_close = float(trend[-1]["close"])
+    trend_change_ratio = trend_end_close / trend_start_close - 1 if trend_start_close else 0.0
+    if trend_change_ratio <= -params["trend_threshold_ratio"]:
+        pattern_type = "DOWN_STABILIZATION"
+    elif trend_change_ratio >= params["trend_threshold_ratio"]:
+        pattern_type = "UP_CONTINUATION"
+    else:
+        pattern_type = "NEUTRAL_BREAKOUT"
+    range_ok = range_ratio <= params["max_range_ratio"]
+    breakout_ok = float(signal["close"]) > range_high
+    volume_ok = (
+        breakout_volume_ratio is not None
+        and breakout_volume_ratio >= params["min_breakout_volume_ratio"]
+    )
+    return {
+        "matched": range_ok and breakout_ok and volume_ok,
+        "pattern_type": pattern_type,
+        "range_ok": range_ok,
+        "breakout_ok": breakout_ok,
+        "volume_ok": volume_ok,
+        "range_high": range_high,
+        "range_low": range_low,
+        "range_ratio": range_ratio,
+        "average_volume": average_volume,
+        "breakout_volume_ratio": breakout_volume_ratio,
+        "trend_change_ratio": trend_change_ratio,
+        "trend": trend,
+        "consolidation": consolidation,
+        "signal": signal,
+    }
+
+
 def evaluate_three_day_dip(
     prices: list[dict], params: dict | None = None, enforce_volume: bool = False,
 ) -> dict:
@@ -1580,8 +1737,8 @@ def evaluate_three_day_dip(
     lower_shadow_amount = max(0.0, min(float(signal["open"]), float(signal["close"])) - float(signal["low"]))
     lower_shadow_body_ratio = lower_shadow_amount / body_amount if body_amount else None
     signal_change_ratio = float(signal["close"]) / previous_close - 1 if previous_close else 0.0
-    previous_volume = float(decline_candles[-1].get("volume") or 0)
-    signal_volume = float(signal.get("volume") or 0)
+    previous_volume = daily_volume_shares(decline_candles[-1])
+    signal_volume = daily_volume_shares(signal)
     volume_ratio = signal_volume / previous_volume if previous_volume and signal_volume else None
     common_ok = (
         baseline_bullish_ok and bearish_ok and declining_ok and low_position_ok
@@ -1780,6 +1937,14 @@ def alert_type_data(db: sqlite3.Connection) -> tuple[sqlite3.Row, dict]:
     return alert_type, params
 
 
+def consolidation_stabilization_alert_type_data(db: sqlite3.Connection) -> tuple[sqlite3.Row, dict]:
+    alert_type = db.execute(
+        "SELECT * FROM alert_types WHERE code = ?", (CONSOLIDATION_STABILIZATION_CODE,)
+    ).fetchone()
+    params = consolidation_stabilization_params(json.loads(alert_type["params_json"]))
+    return alert_type, params
+
+
 def intraday_rebound_alert_type_data(db: sqlite3.Connection) -> tuple[sqlite3.Row, dict]:
     alert_type = db.execute("SELECT * FROM alert_types WHERE code = ?", (INTRADAY_REBOUND_CODE,)).fetchone()
     params = intraday_rebound_params(json.loads(alert_type["params_json"]))
@@ -1790,7 +1955,7 @@ def backtest_three_day_dip(
     db: sqlite3.Connection, stock: sqlite3.Row, start_date: str, end_date: str, params: dict,
 ) -> dict:
     prices = [dict(row) for row in db.execute(
-        """SELECT trade_date, open, high, low, close, volume FROM daily_prices
+        """SELECT trade_date, open, high, low, close, volume, source FROM daily_prices
         WHERE stock_code = ? AND trade_date <= ? AND open IS NOT NULL AND high IS NOT NULL
         AND low IS NOT NULL AND close IS NOT NULL ORDER BY trade_date""",
         (stock["stock_code"], end_date),
@@ -1830,6 +1995,45 @@ def backtest_three_day_dip(
         "available_days": len(dates_in_range),
         "hits": hits,
         "insufficient": not signal_indexes,
+        "first_price_date": prices[0]["trade_date"] if prices else None,
+        "last_price_date": prices[-1]["trade_date"] if prices else None,
+    }
+
+
+def backtest_consolidation_stabilization(
+    db: sqlite3.Connection, stock: sqlite3.Row, start_date: str, end_date: str, params: dict,
+) -> dict:
+    prices = [dict(row) for row in db.execute(
+        """SELECT trade_date, open, high, low, close, volume, source FROM daily_prices
+        WHERE stock_code = ? AND trade_date <= ? AND open IS NOT NULL AND high IS NOT NULL
+        AND low IS NOT NULL AND close IS NOT NULL ORDER BY trade_date""",
+        (stock["stock_code"], end_date),
+    ).fetchall()]
+    required = params["trend_lookback_days"] + params["consolidation_days"] + 1
+    signal_indexes = [
+        index for index, price in enumerate(prices)
+        if start_date <= price["trade_date"] <= end_date and index + 1 >= required
+    ]
+    hits = []
+    for index in signal_indexes:
+        candles = prices[index - required + 1:index + 1]
+        result = evaluate_consolidation_stabilization(candles, params)
+        if result["matched"]:
+            hits.append({
+                "signal_date": result["signal"]["trade_date"],
+                "pattern_type": result["pattern_type"],
+                "range_high": result["range_high"],
+                "range_low": result["range_low"],
+                "range_ratio": result["range_ratio"],
+                "breakout_volume_ratio": result["breakout_volume_ratio"],
+                "trend_change_ratio": result["trend_change_ratio"],
+                "candles": candles,
+            })
+    dates_in_range = [price["trade_date"] for price in prices if start_date <= price["trade_date"] <= end_date]
+    return {
+        "stock_code": stock["stock_code"], "stock_name": stock["stock_name"],
+        "start_date": start_date, "end_date": end_date, "scanned_days": len(signal_indexes),
+        "available_days": len(dates_in_range), "hits": hits, "insufficient": not signal_indexes,
         "first_price_date": prices[0]["trade_date"] if prices else None,
         "last_price_date": prices[-1]["trade_date"] if prices else None,
     }
@@ -2078,17 +2282,20 @@ def backfill_alert_signal_events(db: sqlite3.Connection) -> int:
     rows = db.execute(
         """SELECT notification.*, alert.code AS alert_code, alert.params_json
         FROM notifications AS notification JOIN alert_types AS alert ON alert.id = notification.alert_type_id
-        WHERE alert.code IN (?, ?) ORDER BY notification.id""",
-        (THREE_DAY_DIP_CODE, INTRADAY_REBOUND_CODE),
+        WHERE alert.code IN (?, ?, ?) ORDER BY notification.id""",
+        (THREE_DAY_DIP_CODE, INTRADAY_REBOUND_CODE, CONSOLIDATION_STABILIZATION_CODE),
     ).fetchall()
     inserted = 0
     for row in rows:
         try:
             details = json.loads(row["details_json"] or "{}")
             signal_time = datetime.fromisoformat(row["quote_time"]).isoformat(timespec="seconds")
-            if row["alert_code"] == THREE_DAY_DIP_CODE:
+            if row["alert_code"] in (THREE_DAY_DIP_CODE, CONSOLIDATION_STABILIZATION_CODE):
                 signal_price = float(details["price"])
-                rule_version = THREE_DAY_DIP_RULE_VERSION
+                rule_version = (
+                    THREE_DAY_DIP_RULE_VERSION if row["alert_code"] == THREE_DAY_DIP_CODE
+                    else CONSOLIDATION_STABILIZATION_RULE_VERSION
+                )
             else:
                 minute = datetime.fromisoformat(signal_time).isoformat(timespec="minutes")
                 quote = db.execute(
@@ -2577,7 +2784,7 @@ def save_realtime_prices(db: sqlite3.Connection, quotes: dict[str, dict]) -> int
             close = excluded.close, volume = excluded.volume, amount = excluded.amount,
             source = excluded.source, fetched_at = excluded.fetched_at""",
             (stock_code, quote["trade_date"], quote["open"], quote["high"], quote["low"],
-             quote["close"], quote["volume"], quote["amount"], quote["fetched_at"]),
+             quote["close"], float(quote["volume"]) * 100, quote["amount"], quote["fetched_at"]),
         )
     return len(quotes)
 
@@ -2614,10 +2821,10 @@ def save_intraday_quotes(db: sqlite3.Connection, quotes: dict[str, dict]) -> int
 
 def is_closing_quote(quote: dict) -> bool:
     try:
-        moment = datetime.fromisoformat(quote["fetched_at"])
+        moment = datetime.fromisoformat(quote.get("quote_time", quote["fetched_at"]))
     except (KeyError, TypeError, ValueError):
         return False
-    return moment.hour >= 15
+    return moment.date().isoformat() == quote.get("trade_date") and moment.hour >= 15
 
 
 def create_alert_notification(
@@ -2653,6 +2860,47 @@ def create_alert_notification(
         (
             watch["user_id"], alert_type_id, watch["stock_code"], watch["stock_name"], stage,
             title, content, json.dumps(details, ensure_ascii=False), quote["fetched_at"], created_at, dedupe_key,
+        ),
+    )
+    return cursor.rowcount > 0
+
+
+def create_consolidation_stabilization_notification(
+    db: sqlite3.Connection, alert_type_id: int, watch: sqlite3.Row, quote: dict, result: dict,
+) -> bool:
+    labels = {
+        "DOWN_STABILIZATION": "下跌企稳",
+        "UP_CONTINUATION": "上涨中继",
+        "NEUTRAL_BREAKOUT": "中性横盘突破",
+    }
+    pattern_label = labels[result["pattern_type"]]
+    created_at = datetime.now().isoformat(timespec="seconds")
+    title = f"{watch['stock_name']}触发横盘整理企稳·收盘确认"
+    content = (
+        f"{pattern_label}：整理区间 {result['range_low']:.2f}-{result['range_high']:.2f}，"
+        f"收盘 {float(quote['close']):.2f} 突破上沿，成交量为整理期均量的 "
+        f"{result['breakout_volume_ratio']:.2f} 倍。"
+    )
+    details = {
+        "price": float(quote["close"]), "pattern_type": result["pattern_type"],
+        "range_low": result["range_low"], "range_high": result["range_high"],
+        "range_ratio": result["range_ratio"],
+        "breakout_volume_ratio": result["breakout_volume_ratio"],
+        "trend_change_ratio": result["trend_change_ratio"],
+    }
+    dedupe_key = (
+        f"{watch['user_id']}:{CONSOLIDATION_STABILIZATION_CODE}:"
+        f"{watch['stock_code']}:{quote['trade_date']}:CONFIRMED"
+    )
+    cursor = db.execute(
+        """INSERT OR IGNORE INTO notifications
+        (user_id, alert_type_id, stock_code, stock_name, stage, title, content,
+         details_json, quote_time, created_at, dedupe_key)
+        VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, ?, ?)""",
+        (
+            watch["user_id"], alert_type_id, watch["stock_code"], watch["stock_name"],
+            title, content, json.dumps(details, ensure_ascii=False),
+            quote.get("quote_time", quote["fetched_at"]), created_at, dedupe_key,
         ),
     )
     return cursor.rowcount > 0
@@ -2783,7 +3031,7 @@ def evaluate_realtime_alerts(db: sqlite3.Connection, quotes: dict[str, dict]) ->
     for watch in watches:
         quote = quotes[watch["stock_code"]]
         prices = [dict(row) for row in reversed(db.execute(
-            """SELECT trade_date, open, high, low, close, volume FROM daily_prices
+            """SELECT trade_date, open, high, low, close, volume, source FROM daily_prices
             WHERE stock_code = ? AND trade_date <= ? AND open IS NOT NULL AND high IS NOT NULL
             AND low IS NOT NULL AND close IS NOT NULL ORDER BY trade_date DESC LIMIT ?""",
             (watch["stock_code"], quote["trade_date"], params["decline_days"] + 2),
@@ -2835,6 +3083,75 @@ def evaluate_realtime_alerts(db: sqlite3.Connection, quotes: dict[str, dict]) ->
             (
                 watch["user_id"], alert_type["id"], watch["stock_code"], quote["trade_date"],
                 candidate_at, confirmation_at, quote["fetched_at"], int(result["matched"]),
+            ),
+        )
+    return created
+
+
+def evaluate_consolidation_stabilization_alerts(db: sqlite3.Connection, quotes: dict[str, dict]) -> int:
+    if not quotes:
+        return 0
+    alert_type = db.execute(
+        "SELECT * FROM alert_types WHERE code = ? AND enabled = 1",
+        (CONSOLIDATION_STABILIZATION_CODE,),
+    ).fetchone()
+    if alert_type is None:
+        return 0
+    params = consolidation_stabilization_params(json.loads(alert_type["params_json"]))
+    if not params["enabled"]:
+        return 0
+    placeholders = ",".join("?" for _ in quotes)
+    watches = db.execute(
+        f"""SELECT user_id, stock_code, stock_name FROM watchlist_stocks
+        WHERE stock_code IN ({placeholders}) ORDER BY user_id, stock_code""",
+        tuple(quotes),
+    ).fetchall()
+    required = params["trend_lookback_days"] + params["consolidation_days"] + 1
+    results = {}
+    created = 0
+    for watch in watches:
+        quote = quotes[watch["stock_code"]]
+        if watch["stock_code"] not in results:
+            prices = [dict(row) for row in reversed(db.execute(
+                """SELECT trade_date, open, high, low, close, volume, source FROM daily_prices
+                WHERE stock_code = ? AND trade_date <= ? AND open IS NOT NULL AND high IS NOT NULL
+                AND low IS NOT NULL AND close IS NOT NULL ORDER BY trade_date DESC LIMIT ?""",
+                (watch["stock_code"], quote["trade_date"], required),
+            ).fetchall())]
+            results[watch["stock_code"]] = evaluate_consolidation_stabilization(prices, params)
+        result = results[watch["stock_code"]]
+        state = db.execute(
+            """SELECT confirmation_triggered_at FROM alert_rule_states
+            WHERE user_id = ? AND alert_type_id = ? AND stock_code = ? AND trade_date = ?""",
+            (watch["user_id"], alert_type["id"], watch["stock_code"], quote["trade_date"]),
+        ).fetchone()
+        confirmation_at = state["confirmation_triggered_at"] if state else None
+        closing = is_closing_quote(quote)
+        if result.get("matched") and closing and not confirmation_at:
+            if create_consolidation_stabilization_notification(db, alert_type["id"], watch, quote, result):
+                created += 1
+                upsert_alert_signal_event(
+                    db, watch["user_id"], alert_type["id"], watch["stock_code"], watch["stock_name"],
+                    "CONFIRMED", quote.get("quote_time", quote["fetched_at"]), float(quote["close"]),
+                    CONSOLIDATION_STABILIZATION_RULE_VERSION, params, {
+                        key: result.get(key) for key in (
+                            "pattern_type", "range_high", "range_low", "range_ratio",
+                            "breakout_volume_ratio", "trend_change_ratio",
+                        )
+                    },
+                )
+            confirmation_at = quote.get("quote_time", quote["fetched_at"])
+        db.execute(
+            """INSERT INTO alert_rule_states
+            (user_id, alert_type_id, stock_code, trade_date, candidate_triggered_at,
+             confirmation_triggered_at, last_evaluated_at, last_matched)
+            VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
+            ON CONFLICT(user_id, alert_type_id, stock_code, trade_date) DO UPDATE SET
+            confirmation_triggered_at = excluded.confirmation_triggered_at,
+            last_evaluated_at = excluded.last_evaluated_at, last_matched = excluded.last_matched""",
+            (
+                watch["user_id"], alert_type["id"], watch["stock_code"], quote["trade_date"],
+                confirmation_at, quote.get("quote_time", quote["fetched_at"]), int(bool(result.get("matched"))),
             ),
         )
     return created
@@ -3159,6 +3476,9 @@ def save_daily_prices(db: sqlite3.Connection, stock_code: str, frame, source: st
             except (TypeError, ValueError):
                 return None
         seen_dates.add(trade_date)
+        volume = num(row.get("成交量", row.get("volume")))
+        if volume is not None and source == "akshare-eastmoney":
+            volume *= 100
         db.execute(
             """INSERT INTO daily_prices
             (stock_code, trade_date, open, high, low, close, volume, amount, source, fetched_at)
@@ -3169,7 +3489,7 @@ def save_daily_prices(db: sqlite3.Connection, stock_code: str, frame, source: st
             source = excluded.source, fetched_at = excluded.fetched_at""",
             (stock_code, trade_date, num(row.get("开盘", row.get("open"))),
              num(row.get("最高", row.get("high"))), num(row.get("最低", row.get("low"))),
-             num(row.get("收盘", row.get("close"))), num(row.get("成交量", row.get("volume"))),
+             num(row.get("收盘", row.get("close"))), volume,
              num(row.get("成交额", row.get("amount"))),
              source, fetched_at),
         )
@@ -3198,6 +3518,7 @@ def sync_realtime_codes(stock_codes: list[str]) -> tuple[int, list[str]]:
             synced = save_realtime_prices(db, quotes)
             save_intraday_quotes(db, quotes)
             evaluate_realtime_alerts(db, quotes)
+            evaluate_consolidation_stabilization_alerts(db, quotes)
             evaluate_intraday_rebound_alerts(db, quotes)
             evaluate_watchlist_limit_up_alerts(db, quotes)
             refresh_alert_signal_event_outcomes(db, list(quotes))
@@ -4323,7 +4644,8 @@ def stocks_kline(stock_code: str):
         bs_points = kline_bs_points(db, current_user_id(), stock_code)
     return jsonify({
         "stock_code": stock_code, "stock_name": stock["stock_name"], "data": chart,
-        "bs_points": bs_points, "sync_attempted": sync_attempted, "sync_error": sync_error,
+        "bs_points": bs_points, "volume_unit": "lot",
+        "sync_attempted": sync_attempted, "sync_error": sync_error,
     })
 
 
@@ -4607,8 +4929,7 @@ def kline_bs_points(db: sqlite3.Connection, user_id: int, stock_code: str) -> li
 
 
 def kline_volume_lots(row: sqlite3.Row) -> float:
-    volume = float(row["volume"] or 0)
-    return volume if row["source"] == "tencent-realtime" else volume / 100
+    return float(row["volume"] or 0) / 100
 
 
 @app.post("/analysis/watchlist/sync-prices")
@@ -4660,7 +4981,10 @@ def watchlist_kline(stock_code: str):
                 (stock_code,),
             ).fetchall()
         ]
-    return jsonify({"stock_code": stock_code, "stock_name": item["stock_name"], "data": data, "bs_points": bs_points})
+    return jsonify({
+        "stock_code": stock_code, "stock_name": item["stock_name"], "data": data,
+        "bs_points": bs_points, "volume_unit": "lot",
+    })
 
 
 @app.get("/analysis/portfolio")
@@ -4779,7 +5103,8 @@ def portfolio_kline(stock_code: str):
         bs_points = kline_bs_points(db, current_user_id(), stock_code)
     return jsonify({
         "stock_code": stock_code, "stock_name": position["stock_name"],
-        "avg_cost": float(position["avg_cost"] or 0), "data": chart, "bs_points": bs_points,
+        "avg_cost": float(position["avg_cost"] or 0), "data": chart,
+        "bs_points": bs_points, "volume_unit": "lot",
     })
 
 
@@ -5062,6 +5387,71 @@ def save_three_day_dip_alert_type():
     return redirect(url_for("three_day_dip_management"))
 
 
+@app.get("/admin/alert-types/consolidation-stabilization")
+def consolidation_stabilization_management():
+    backtest = None
+    backtest_error = None
+    selected_stock_code = request.args.get("stock_code", "").strip()
+    start_date = request.args.get("start_date", "").strip()
+    end_date = request.args.get("end_date", "").strip()
+    with db_connect() as db:
+        alert_type, params = consolidation_stabilization_alert_type_data(db)
+        effectiveness = alert_effectiveness_data(db, current_user_id(), alert_type["id"])
+        watchlist = db.execute(
+            """SELECT stock_code, stock_name FROM watchlist_stocks WHERE user_id = ?
+            ORDER BY priority DESC, stock_name COLLATE NOCASE, stock_code""",
+            (current_user_id(),),
+        ).fetchall()
+        if request.args.get("run_test") == "1":
+            stock = db.execute(
+                """SELECT stock_code, stock_name FROM watchlist_stocks
+                WHERE user_id = ? AND stock_code = ?""",
+                (current_user_id(), selected_stock_code),
+            ).fetchone()
+            try:
+                start_date = normalize_date(start_date)
+                end_date = normalize_date(end_date)
+                if start_date > end_date:
+                    raise ValueError("开始日期不能晚于截止日期")
+                if stock is None:
+                    raise ValueError("请选择当前用户重点观察中的股票")
+                backtest = backtest_consolidation_stabilization(db, stock, start_date, end_date, params)
+            except (TypeError, ValueError) as error:
+                backtest_error = str(error) if str(error) else "测试条件无效，请检查股票和日期。"
+    return render_template(
+        "index.html", page="consolidation_stabilization", alert_type=alert_type, alert_params=params,
+        alert_watchlist=watchlist, selected_stock_code=selected_stock_code,
+        test_start_date=start_date, test_end_date=end_date, backtest=backtest,
+        backtest_error=backtest_error, alert_effectiveness=effectiveness,
+    )
+
+
+@app.post("/admin/alert-types/consolidation-stabilization")
+def save_consolidation_stabilization_alert_type():
+    try:
+        params = consolidation_stabilization_params({
+            "consolidation_days": int(request.form.get("consolidation_days", "3")),
+            "max_range_ratio": float(request.form.get("max_range_percent", "4")) / 100,
+            "trend_lookback_days": int(request.form.get("trend_lookback_days", "10")),
+            "trend_threshold_ratio": float(request.form.get("trend_threshold_percent", "5")) / 100,
+            "min_breakout_volume_ratio": float(request.form.get("min_breakout_volume_ratio", "1.2")),
+            "enabled": "enabled" in request.form,
+        })
+        now = datetime.now().isoformat(timespec="seconds")
+        with db_connect() as db:
+            db.execute(
+                "UPDATE alert_types SET params_json = ?, enabled = ?, updated_at = ? WHERE code = ?",
+                (
+                    json.dumps(params, ensure_ascii=False), int(params["enabled"]), now,
+                    CONSOLIDATION_STABILIZATION_CODE,
+                ),
+            )
+        flash("已保存横盘整理企稳提醒参数。", "success")
+    except (TypeError, ValueError):
+        flash("提醒参数格式无效，请检查数值。", "error")
+    return redirect(url_for("consolidation_stabilization_management"))
+
+
 @app.get("/admin/alert-types/intraday-rebound")
 def intraday_rebound_management():
     with db_connect() as db:
@@ -5141,7 +5531,7 @@ def add_three_day_dip_sample():
             raise ValueError("证券名称不能为空，备注不能超过 500 字")
         with db_connect() as db:
             prices = [dict(row) for row in reversed(db.execute(
-                """SELECT trade_date, open, high, low, close, volume FROM daily_prices
+                """SELECT trade_date, open, high, low, close, volume, source FROM daily_prices
                 WHERE stock_code = ? AND trade_date <= ? AND open IS NOT NULL AND high IS NOT NULL
                 AND low IS NOT NULL AND close IS NOT NULL ORDER BY trade_date DESC LIMIT 4""",
                 (stock_code, signal_date),
@@ -5151,7 +5541,7 @@ def add_three_day_dip_sample():
             with db_connect() as db:
                 sync_daily_prices(db, stock_code, start_date, signal_date)
                 prices = [dict(row) for row in reversed(db.execute(
-                    """SELECT trade_date, open, high, low, close, volume FROM daily_prices
+                    """SELECT trade_date, open, high, low, close, volume, source FROM daily_prices
                     WHERE stock_code = ? AND trade_date <= ? AND open IS NOT NULL AND high IS NOT NULL
                     AND low IS NOT NULL AND close IS NOT NULL ORDER BY trade_date DESC LIMIT 4""",
                     (stock_code, signal_date),
