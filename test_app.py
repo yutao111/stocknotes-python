@@ -32,9 +32,12 @@ class StockNotesTest(unittest.TestCase):
     def setUp(self):
         self.module.HOT_SECTORS_CACHE.update({"modules": {}, "updated_at": None})
         with self.module.db_connect() as db:
+            db.execute("DELETE FROM alert_signal_event_outcomes")
+            db.execute("DELETE FROM alert_signal_events")
             db.execute("DELETE FROM alert_signal_outcomes")
             db.execute("DELETE FROM alert_signal_samples")
             db.execute("DELETE FROM notifications")
+            db.execute("DELETE FROM intraday_rebound_states")
             db.execute("DELETE FROM alert_rule_states")
             db.execute(
                 "UPDATE alert_types SET params_json = ?, enabled = 1 WHERE code = ?",
@@ -55,6 +58,7 @@ class StockNotesTest(unittest.TestCase):
             db.execute("DELETE FROM trade_episodes")
             db.execute("DELETE FROM fifo_matches")
             db.execute("DELETE FROM positions")
+            db.execute("DELETE FROM current_positions")
             db.execute("DELETE FROM unmatched_sells")
             db.execute("DELETE FROM executions")
             db.execute("DELETE FROM import_jobs")
@@ -391,6 +395,20 @@ class StockNotesTest(unittest.TestCase):
         self.client.post(f"/admin/import/{job['id']}")
         with self.module.db_connect() as db:
             return db.execute("SELECT id FROM trade_episodes ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    def _add_current_position(self, stock_code="2156", stock_name="通富微电", quantity="100", avg_cost="10", first_buy_date="2026-08-01"):
+        response = self.client.post(
+            "/analysis/portfolio/position",
+            data={
+                "stock_code": stock_code,
+                "stock_name": stock_name,
+                "quantity": quantity,
+                "avg_cost": avg_cost,
+                "first_buy_date": first_buy_date,
+            },
+            follow_redirects=True,
+        )
+        return response
 
     def test_trade_review_form_renders_and_saves(self):
         episode_id = self._import_workbook_rows([
@@ -1035,6 +1053,7 @@ class StockNotesTest(unittest.TestCase):
         episode_id = self._import_workbook_rows([
             [20260801, "09:30:00", 2156, "通富微电", "证券买入", 100, "B1", 10],
         ])
+        self._add_current_position(quantity="100", avg_cost="10")
 
         page = self.client.get("/analysis/portfolio").get_data(as_text=True)
         self.assertIn("投入资金", page)
@@ -1052,8 +1071,6 @@ class StockNotesTest(unittest.TestCase):
 
         stock_page = self.client.get("/analysis/stocks?code=002156").get_data(as_text=True)
         self.assertIn("当前持仓", stock_page)
-        self.assertIn("查看成交与交易计划", stock_page)
-        self.assertIn(f'/analysis/trades/{episode_id}', stock_page)
 
         with self.module.db_connect() as db:
             db.execute(
@@ -1142,8 +1159,97 @@ class StockNotesTest(unittest.TestCase):
             [20260820, "09:30:00", 2156, "通富微电", "证券买入", 100, "B1", 10],
         ])
         page = self.client.get("/analysis/portfolio").get_data(as_text=True)
+        self.assertNotIn("持仓时间", page)
+        self.assertIn("当前没有持仓。在下方维护独立持仓后，系统会据此计算市值与浮动盈亏。", page)
+
+        self._add_current_position(quantity="100", avg_cost="10")
+        page = self.client.get("/analysis/portfolio").get_data(as_text=True)
         self.assertIn("当前持仓", page)
         self.assertNotIn("持仓时间", page)
+
+    def test_current_position_crud_and_validation(self):
+        response = self._add_current_position()
+        self.assertIn("已保存当前持仓", response.get_data(as_text=True))
+        with self.module.db_connect() as db:
+            row = db.execute("SELECT * FROM current_positions").fetchone()
+            self.assertEqual(row["stock_code"], "002156")
+            self.assertEqual(row["stock_name"], "通富微电")
+            self.assertAlmostEqual(row["quantity"], 100)
+            self.assertAlmostEqual(row["avg_cost"], 10)
+            self.assertEqual(row["first_buy_date"], "2026-08-01")
+
+        response = self._add_current_position(stock_code="002156", quantity="200", avg_cost="12", first_buy_date="2026-08-05")
+        self.assertIn("已保存当前持仓", response.get_data(as_text=True))
+        with self.module.db_connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM current_positions").fetchone()[0], 1)
+            row = db.execute("SELECT * FROM current_positions").fetchone()
+            self.assertAlmostEqual(row["quantity"], 200)
+            self.assertAlmostEqual(row["avg_cost"], 12)
+            self.assertEqual(row["first_buy_date"], "2026-08-05")
+
+        response = self.client.post(
+            "/analysis/portfolio/position/delete",
+            data={"stock_code": "002156"},
+            follow_redirects=True,
+        )
+        self.assertIn("已删除当前持仓", response.get_data(as_text=True))
+        with self.module.db_connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM current_positions").fetchone()[0], 0)
+
+        invalid_cases = [
+            {"stock_code": "", "stock_name": "通富微电", "quantity": "100", "avg_cost": "10", "first_buy_date": "2026-08-01"},
+            {"stock_code": "2156", "stock_name": "", "quantity": "100", "avg_cost": "10", "first_buy_date": "2026-08-01"},
+            {"stock_code": "2156", "stock_name": "通富微电", "quantity": "0", "avg_cost": "10", "first_buy_date": "2026-08-01"},
+            {"stock_code": "2156", "stock_name": "通富微电", "quantity": "100", "avg_cost": "-1", "first_buy_date": "2026-08-01"},
+            {"stock_code": "2156", "stock_name": "通富微电", "quantity": "100", "avg_cost": "10", "first_buy_date": "not-a-date"},
+        ]
+        for payload in invalid_cases:
+            response = self.client.post("/analysis/portfolio/position", data=payload, follow_redirects=True)
+            self.assertIn("保存持仓失败", response.get_data(as_text=True))
+            with self.module.db_connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM current_positions").fetchone()[0], 0)
+
+    def test_current_position_user_isolation(self):
+        self._add_current_position()
+        self.client.post("/users/create", data={"name": "portfolio-second", "next": "/analysis/portfolio"})
+        page = self.client.get("/analysis/portfolio").get_data(as_text=True)
+        self.assertIn("当前没有持仓", page)
+        with self.module.db_connect() as db:
+            first_user = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            second_user = db.execute("SELECT id FROM users WHERE name = 'portfolio-second'").fetchone()["id"]
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM current_positions WHERE user_id = ?", (first_user,)).fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM current_positions WHERE user_id = ?", (second_user,)).fetchone()[0], 0)
+        self.assertEqual(self.client.get("/analysis/portfolio/kline/002156").status_code, 404)
+
+    def test_statement_import_and_rebuild_do_not_touch_current_positions(self):
+        self._add_current_position(quantity="100", avg_cost="10")
+        episode_id = self._import_workbook_rows([
+            [20260801, "09:30:00", 2156, "通富微电", "证券买入", 100, "B1", 10],
+            [20260802, "10:00:00", 2156, "通富微电", "证券卖出", -100, "S1", 12],
+        ])
+        with self.module.db_connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM current_positions").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM fifo_matches").fetchone()[0], 1)
+
+        self.client.post("/admin/rebuild")
+        with self.module.db_connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM current_positions").fetchone()[0], 1)
+            row = db.execute("SELECT * FROM current_positions").fetchone()
+            self.assertAlmostEqual(row["quantity"], 100)
+            self.assertAlmostEqual(row["avg_cost"], 10)
+
+        page = self.client.get("/analysis/portfolio").get_data(as_text=True)
+        self.assertIn("1,000.00", page)
+
+    def test_watchlist_held_status_uses_current_positions(self):
+        self.client.post("/analysis/watchlist", data={"stock_code": "2156", "stock_name": "通富微电", "priority": "3", "note": ""})
+        page = self.client.get("/analysis/watchlist").get_data(as_text=True)
+        self.assertIn("仅观察", page)
+        self.assertNotIn("当前持仓", page)
+
+        self._add_current_position()
+        page = self.client.get("/analysis/watchlist").get_data(as_text=True)
+        self.assertIn("当前持仓", page)
 
     def test_watchlist_add_update_change_and_user_isolation(self):
         with patch.object(self.module, "sync_history_codes", return_value=(167, [])) as sync:
@@ -1286,7 +1392,7 @@ class StockNotesTest(unittest.TestCase):
             ("14:05", 0.713, 18000),
         ]
         return [
-            {"quote_minute": f"2026-08-24T{minute}", "price": price, "volume": volume}
+            {"quote_minute": f"2026-08-24T{minute}", "price": price, "volume": volume, "previous_close": 0.729}
             for minute, price, volume in prices
         ]
 
@@ -1295,8 +1401,9 @@ class StockNotesTest(unittest.TestCase):
         before_breakout = self.module.evaluate_intraday_rebound(samples[:-1])
         result = self.module.evaluate_intraday_rebound(samples)
 
-        self.assertFalse(before_breakout["matched"])
+        self.assertEqual(before_breakout["stage"], "CANDIDATE")
         self.assertTrue(result["matched"])
+        self.assertEqual(result["stage"], "CONFIRMED")
         self.assertEqual(result["trough_price"], 0.705)
         self.assertEqual(result["breakout_price"], 0.711)
         self.assertGreater(result["higher_low"], result["trough_price"])
@@ -1315,9 +1422,9 @@ class StockNotesTest(unittest.TestCase):
             for sample in self._intraday_rebound_sample():
                 db.execute(
                     """INSERT INTO intraday_quotes
-                    (stock_code, trade_date, quote_minute, price, volume, source, fetched_at)
-                    VALUES ('159516', '2026-08-24', ?, ?, ?, 'test', ?)""",
-                    (sample["quote_minute"], sample["price"], sample["volume"], sample["quote_minute"]),
+                    (stock_code, trade_date, quote_minute, price, previous_close, volume, source, fetched_at)
+                    VALUES ('159516', '2026-08-24', ?, ?, ?, ?, 'test', ?)""",
+                    (sample["quote_minute"], sample["price"], sample["previous_close"], sample["volume"], sample["quote_minute"]),
                 )
         quote = {
             "159516": {
@@ -1330,11 +1437,130 @@ class StockNotesTest(unittest.TestCase):
             self.module.evaluate_intraday_rebound_alerts(db, quote)
             self.module.evaluate_intraday_rebound_alerts(db, quote)
             notifications = db.execute(
-                "SELECT title, content FROM notifications WHERE stock_code = '159516'"
+                "SELECT stage, title, content FROM notifications WHERE stock_code = '159516' ORDER BY id"
             ).fetchall()
-        self.assertEqual(len(notifications), 1)
+            events = db.execute(
+                "SELECT stage, signal_price, rule_version FROM alert_signal_events ORDER BY id"
+            ).fetchall()
+        self.assertEqual(len(notifications), 2)
+        self.assertEqual([row["stage"] for row in notifications], ["CANDIDATE", "CONFIRMED"])
         self.assertIn("日内反弹", notifications[0]["title"])
-        self.assertIn("突破 0.711", notifications[0]["content"])
+        self.assertIn("固定突破位 0.711", notifications[1]["content"])
+        self.assertEqual([row["stage"] for row in events], ["CANDIDATE", "CONFIRMED"])
+        self.assertTrue(all(row["rule_version"] == self.module.INTRADAY_REBOUND_RULE_VERSION for row in events))
+
+    def test_alert_signal_event_outcomes_require_complete_windows(self):
+        now = "2026-08-24T10:00:00"
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            alert_type_id = db.execute(
+                "SELECT id FROM alert_types WHERE code = ?", (self.module.INTRADAY_REBOUND_CODE,)
+            ).fetchone()["id"]
+            for minute, price in (("10:00", 10.0), ("10:05", 10.5), ("10:10", 11.0), ("10:20", 9.5)):
+                db.execute(
+                    """INSERT INTO intraday_quotes
+                    (stock_code, trade_date, quote_minute, price, previous_close, volume, source, fetched_at)
+                    VALUES ('000001', '2026-08-24', ?, ?, 10.5, 100, 'test', ?)""",
+                    (f"2026-08-24T{minute}", price, f"2026-08-24T{minute}:00"),
+                )
+            event_id = self.module.upsert_alert_signal_event(
+                db, user_id, alert_type_id, "000001", "平安银行", "CANDIDATE", now, 10.0,
+                self.module.INTRADAY_REBOUND_RULE_VERSION, {}, {},
+            )
+            outcome = db.execute(
+                "SELECT * FROM alert_signal_event_outcomes WHERE event_id = ?", (event_id,)
+            ).fetchone()
+        self.assertAlmostEqual(outcome["minute_5_return"], 0.05)
+        self.assertAlmostEqual(outcome["minute_10_return"], 0.1)
+        self.assertAlmostEqual(outcome["minute_20_return"], -0.05)
+        self.assertIsNone(outcome["session_close_return"])
+
+    def test_alert_signal_event_daily_outcomes_wait_for_full_horizon(self):
+        now = "2026-08-20T15:00:00"
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            alert_type_id = db.execute(
+                "SELECT id FROM alert_types WHERE code = ?", (self.module.THREE_DAY_DIP_CODE,)
+            ).fetchone()["id"]
+            for trade_date, high, low, close in (
+                ("2026-08-21", 11.0, 9.5, 10.5), ("2026-08-24", 12.0, 10.0, 11.0),
+            ):
+                db.execute(
+                    """INSERT INTO daily_prices
+                    (stock_code, trade_date, high, low, close, source, fetched_at)
+                    VALUES ('000001', ?, ?, ?, ?, 'test', ?)""",
+                    (trade_date, high, low, close, now),
+                )
+            event_id = self.module.upsert_alert_signal_event(
+                db, user_id, alert_type_id, "000001", "平安银行", "CONFIRMED", now, 10.0,
+                self.module.THREE_DAY_DIP_RULE_VERSION, {}, {},
+            )
+            outcome = db.execute(
+                "SELECT * FROM alert_signal_event_outcomes WHERE event_id = ?", (event_id,)
+            ).fetchone()
+        self.assertAlmostEqual(outcome["day_1_close_return"], 0.05)
+        self.assertAlmostEqual(outcome["day_1_max_return"], 0.1)
+        self.assertIsNone(outcome["day_3_close_return"])
+        self.assertIsNone(outcome["day_3_max_return"])
+
+    def test_alert_signal_event_backfill_is_idempotent(self):
+        now = "2026-08-20T14:30:00"
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            alert_type_id = db.execute(
+                "SELECT id FROM alert_types WHERE code = ?", (self.module.THREE_DAY_DIP_CODE,)
+            ).fetchone()["id"]
+            db.execute(
+                """INSERT INTO notifications
+                (user_id, alert_type_id, stock_code, stock_name, stage, title, content,
+                 details_json, quote_time, created_at, dedupe_key)
+                VALUES (?, ?, '000001', '平安银行', 'CANDIDATE', '历史提醒', '历史内容',
+                ?, ?, ?, 'backfill-test')""",
+                (user_id, alert_type_id, json.dumps({"price": 10.5}), now, now),
+            )
+            self.assertEqual(self.module.backfill_alert_signal_events(db), 1)
+            self.assertEqual(self.module.backfill_alert_signal_events(db), 0)
+            event = db.execute("SELECT * FROM alert_signal_events").fetchone()
+        self.assertEqual(event["signal_price"], 10.5)
+        self.assertTrue(json.loads(event["params_json"])["backfilled"])
+
+    def test_intraday_rebound_does_not_cross_lunch_break(self):
+        morning = self._intraday_rebound_sample()
+        afternoon = [
+            {"quote_minute": f"2026-08-24T13:{minute:02d}", "price": 0.716 + minute * 0.001, "volume": 20000 + minute * 1000}
+            for minute in range(7)
+        ]
+        result = self.module.evaluate_intraday_rebound(morning + afternoon)
+        self.assertFalse(result["matched"])
+        self.assertIn(result["status"], ("等待分钟行情", "等待止跌确认", "未形成急跌结构"))
+
+    def test_intraday_rebound_159516_replay_is_early(self):
+        prices = [
+            ("09:33", 0.710, 1000), ("09:34", 0.705, 2000), ("09:35", 0.700, 3000),
+            ("09:36", 0.695, 4000), ("09:37", 0.690, 5000), ("09:38", 0.687, 6000),
+            ("09:39", 0.685, 7000), ("09:40", 0.690, 8000), ("09:41", 0.692, 9000),
+            ("09:42", 0.690, 10000), ("09:43", 0.693, 11000), ("09:44", 0.691, 12000),
+            ("09:45", 0.687, 13000), ("09:46", 0.683, 14000), ("09:47", 0.685, 14800),
+            ("09:48", 0.686, 15400), ("09:49", 0.686, 16100), ("09:50", 0.685, 17000),
+            ("09:51", 0.690, 18000),
+        ]
+        samples = [
+            {"quote_minute": f"2026-08-25T{minute}", "price": price, "volume": volume, "previous_close": 34.8}
+            for minute, price, volume in prices
+        ]
+        result = self.module.evaluate_intraday_rebound(samples)
+        self.assertIn(result["stage"], ("CANDIDATE", "CONFIRMED"))
+        self.assertEqual(result["trough_minute"], "2026-08-25T09:46")
+        self.assertEqual(result["trough_price"], 0.683)
+
+    def test_intraday_rebound_requires_waterline_drop(self):
+        samples = [
+            {"quote_minute": f"2026-08-25T13:{minute:02d}", "price": price, "volume": 1000 + minute * 100, "previous_close": 41.4}
+            for minute, price in enumerate((42.8, 42.5, 42.3, 42.27, 42.33, 42.45, 42.57, 42.6))
+        ]
+        result = self.module.evaluate_intraday_rebound(samples)
+        self.assertFalse(result["matched"])
+        self.assertEqual(result["status"], "未形成急跌结构")
 
     def _exhaustion_sample(self):
         return [
@@ -1357,6 +1583,31 @@ class StockNotesTest(unittest.TestCase):
         result = self.module.evaluate_three_day_dip(reversal, enforce_volume=True)
         self.assertTrue(result["matched"])
         self.assertEqual(result["pattern_type"], "STRONG_REVERSAL")
+
+    def test_three_day_dip_requires_bullish_baseline(self):
+        prices = self._exhaustion_sample()
+        result = self.module.evaluate_three_day_dip(prices, enforce_volume=True)
+        self.assertTrue(result["baseline_bullish_ok"])
+        self.assertTrue(result["matched"])
+
+        bearish = [dict(row) for row in prices]
+        bearish[0]["open"] = bearish[0]["close"] + 1
+        result = self.module.evaluate_three_day_dip(bearish, enforce_volume=True)
+        self.assertFalse(result["baseline_bullish_ok"])
+        self.assertFalse(result["common_ok"])
+        self.assertFalse(result["matched"])
+
+        doji = [dict(row) for row in prices]
+        doji[0]["open"] = doji[0]["close"]
+        result = self.module.evaluate_three_day_dip(doji, enforce_volume=True)
+        self.assertFalse(result["baseline_bullish_ok"])
+        self.assertFalse(result["matched"])
+
+        result = self.module.evaluate_three_day_dip(
+            bearish, {"require_bullish_baseline": False}, enforce_volume=True,
+        )
+        self.assertTrue(result["baseline_bullish_ok"])
+        self.assertTrue(result["matched"])
 
     def test_three_day_dip_shadow_stop_is_candidate_only(self):
         prices = [
@@ -1427,7 +1678,9 @@ class StockNotesTest(unittest.TestCase):
             self.module.sync_realtime_codes(["600482"])
         with self.module.db_connect() as db:
             stages = [row["stage"] for row in db.execute("SELECT stage FROM notifications ORDER BY id")]
+            event_stages = [row["stage"] for row in db.execute("SELECT stage FROM alert_signal_events ORDER BY id")]
         self.assertEqual(stages, ["CANDIDATE"])
+        self.assertEqual(event_stages, ["CANDIDATE"])
 
         confirmed = {"600482": dict(candidate["600482"], fetched_at="2026-08-14T15:00:00")}
         with patch.object(self.module, "fetch_realtime_prices", return_value=confirmed):
@@ -1435,7 +1688,9 @@ class StockNotesTest(unittest.TestCase):
             self.module.sync_realtime_codes(["600482"])
         with self.module.db_connect() as db:
             stages = [row["stage"] for row in db.execute("SELECT stage FROM notifications ORDER BY id")]
+            event_stages = [row["stage"] for row in db.execute("SELECT stage FROM alert_signal_events ORDER BY id")]
         self.assertEqual(stages, ["CANDIDATE", "CONFIRMED"])
+        self.assertEqual(event_stages, ["CANDIDATE", "CONFIRMED"])
 
     def test_notification_api_is_user_scoped(self):
         now = "2026-08-14T15:00:00"
@@ -1462,9 +1717,10 @@ class StockNotesTest(unittest.TestCase):
         self.assertEqual(self.client.post(f"/api/notifications/{notification_id}/read").status_code, 200)
         self.assertEqual(self.client.get("/api/notifications").get_json()["unread_count"], 0)
 
-    def _insert_notification(self, db, user_id, index, read=False):
+    def _insert_notification(self, db, user_id, index, read=False, alert_code=None):
         now = "2026-08-14T15:00:00"
-        alert_type_id = db.execute("SELECT id FROM alert_types WHERE code = ?", (self.module.THREE_DAY_DIP_CODE,)).fetchone()["id"]
+        alert_code = alert_code or self.module.THREE_DAY_DIP_CODE
+        alert_type_id = db.execute("SELECT id FROM alert_types WHERE code = ?", (alert_code,)).fetchone()["id"]
         return db.execute(
             """INSERT INTO notifications
             (user_id, alert_type_id, stock_code, stock_name, stage, title, content,
@@ -1473,7 +1729,7 @@ class StockNotesTest(unittest.TestCase):
             (
                 user_id, alert_type_id, "CANDIDATE" if index % 2 else "CONFIRMED",
                 f"通知标题 {index}", f"通知内容 {index}",
-                now, now, now if read else None, f"page-key-{user_id}-{index}",
+                now, now, now if read else None, f"page-key-{user_id}-{alert_code}-{index}",
             ),
         ).lastrowid
 
@@ -1520,6 +1776,67 @@ class StockNotesTest(unittest.TestCase):
         page = self.client.get("/analysis/notifications").get_data(as_text=True)
         self.assertIn("通知标题 1", page)
 
+    def test_notifications_page_filters_supported_strategy_types(self):
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            self._insert_notification(db, user_id, 1, alert_code=self.module.THREE_DAY_DIP_CODE)
+            self._insert_notification(db, user_id, 2, alert_code=self.module.INTRADAY_REBOUND_CODE)
+            self._insert_notification(db, user_id, 3, alert_code=self.module.WATCHLIST_LIMIT_UP_CODE)
+
+        all_page = self.client.get("/analysis/notifications").get_data(as_text=True)
+        self.assertIn("通知标题 1", all_page)
+        self.assertIn("通知标题 2", all_page)
+        self.assertIn("通知标题 3", all_page)
+        self.assertIn("涨停提醒", all_page)
+
+        dip_page = self.client.get(
+            f"/analysis/notifications?type={self.module.THREE_DAY_DIP_CODE}"
+        ).get_data(as_text=True)
+        dip_list = dip_page.split('<div class="notification-page-list">', 1)[1].split("</div>", 1)[0]
+        self.assertIn("通知标题 1", dip_list)
+        self.assertNotIn("通知标题 2", dip_list)
+        self.assertNotIn("通知标题 3", dip_list)
+        self.assertIn("当前 1 条", dip_page)
+
+        rebound_page = self.client.get(
+            f"/analysis/notifications?type={self.module.INTRADAY_REBOUND_CODE}"
+        ).get_data(as_text=True)
+        rebound_list = rebound_page.split('<div class="notification-page-list">', 1)[1].split("</div>", 1)[0]
+        self.assertNotIn("通知标题 1", rebound_list)
+        self.assertIn("通知标题 2", rebound_list)
+        self.assertNotIn("通知标题 3", rebound_list)
+
+        daily_page = self.client.get(
+            f"/analysis/notifications?type={self.module.WATCHLIST_LIMIT_UP_CODE}"
+        ).get_data(as_text=True)
+        daily_list = daily_page.split('<div class="notification-page-list">', 1)[1].split("</div>", 1)[0]
+        self.assertNotIn("通知标题 1", daily_list)
+        self.assertNotIn("通知标题 2", daily_list)
+        self.assertIn("通知标题 3", daily_list)
+        self.assertIn("日常提醒", daily_page)
+        self.assertIn("当前 1 条", daily_page)
+
+        unknown_page = self.client.get("/analysis/notifications?type=UNKNOWN").get_data(as_text=True)
+        self.assertIn("通知标题 1", unknown_page)
+        self.assertIn("通知标题 2", unknown_page)
+        self.assertIn("通知标题 3", unknown_page)
+
+    def test_notifications_filter_pagination_preserves_type(self):
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            for index in range(21):
+                self._insert_notification(
+                    db, user_id, index, alert_code=self.module.INTRADAY_REBOUND_CODE,
+                )
+            self._insert_notification(db, user_id, 30, alert_code=self.module.THREE_DAY_DIP_CODE)
+
+        page = self.client.get(
+            f"/analysis/notifications?type={self.module.INTRADAY_REBOUND_CODE}"
+        ).get_data(as_text=True)
+        self.assertIn("共 21 条", page)
+        self.assertIn("type=INTRADAY_REBOUND", page)
+        self.assertIn("page=2", page)
+
     def test_alert_type_admin_updates_parameters_without_builtin_sample(self):
         page = self.client.get("/admin/alert-types/three-day-dip").get_data(as_text=True)
         self.assertIn("衰竭止跌型", page)
@@ -1529,7 +1846,8 @@ class StockNotesTest(unittest.TestCase):
         response = self.client.post(
             "/admin/alert-types/three-day-dip",
             data={
-                "enabled": "on", "decline_days": "2", "require_bearish_candles": "on",
+                "enabled": "on", "decline_days": "2", "require_bullish_baseline": "on",
+                "require_bearish_candles": "on",
                 "require_declining_closes": "on", "require_signal_day_new_low": "on",
                 "min_decline_percent": "9", "max_volume_percent": "95",
                 "exhaustion_min_repair_percent": "2", "exhaustion_max_body_percent": "10",
@@ -1555,7 +1873,9 @@ class StockNotesTest(unittest.TestCase):
             "/admin/alert-types/intraday-rebound",
             data={
                 "enabled": "on", "lookback_minutes": "90", "min_drop_percent": "2.5",
-                "min_rebound_percent": "1.2", "min_trough_age_minutes": "6", "min_volume_multiple": "2",
+                "candidate_min_rebound_percent": "1.2", "min_trough_age_minutes": "6",
+                "candidate_min_volume_multiple": "1", "confirmation_min_volume_multiple": "2",
+                "first_bounce_min_percent": "0.5", "max_entry_rebound_percent": "2",
             },
             follow_redirects=True,
         )
@@ -1565,7 +1885,7 @@ class StockNotesTest(unittest.TestCase):
         params = json.loads(row["params_json"])
         self.assertEqual(params["lookback_minutes"], 90)
         self.assertEqual(params["min_drop_ratio"], 0.025)
-        self.assertEqual(params["min_volume_multiple"], 2.0)
+        self.assertEqual(params["confirmation_min_volume_multiple"], 2.0)
 
     def test_three_day_dip_backtest_finds_hits_without_writing_notifications(self):
         now = "2026-08-15T10:00:00"
@@ -1699,6 +2019,7 @@ class StockNotesTest(unittest.TestCase):
         fields[34] = "10.80"
         fields[35] = "11.50/1000/11500"
         fields[36] = "1000"
+        fields[47] = "12.10"
         payload = ('v_sz002156="' + "~".join(fields) + '";').encode("gbk")
 
         class Response:
@@ -1723,13 +2044,111 @@ class StockNotesTest(unittest.TestCase):
         self.assertEqual(quote["volume"], 1000.0)
         self.assertEqual(quote["amount"], 11500.0)
         self.assertEqual(quote["previous_close"], 11.0)
+        self.assertEqual(quote["stock_name"], "通富微电")
+        self.assertEqual(quote["limit_up"], 12.1)
 
-    def test_kline_volume_converts_realtime_shares_to_lots(self):
+    def test_fetch_realtime_prices_keeps_quote_when_limit_price_is_invalid(self):
+        fields = [""] * 88
+        fields[1], fields[2], fields[3], fields[4], fields[5] = "通富微电", "002156", "11.50", "11.00", "11.10"
+        fields[30], fields[33], fields[34] = "20260821150000", "12.00", "10.80"
+        fields[35], fields[36], fields[47] = "11.50/1000/11500", "1000", "--"
+        payload = ('v_sz002156="' + "~".join(fields) + '";').encode("gbk")
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self):
+                return payload
+
+        with patch.object(self.module, "urlopen", return_value=Response()):
+            quote = self.module.fetch_realtime_prices(["002156"])["002156"]
+        self.assertEqual(quote["close"], 11.5)
+        self.assertIsNone(quote["limit_up"])
+
+    def test_watchlist_limit_up_alert_is_daily_and_user_scoped(self):
+        now = "2026-08-21T10:15:00"
+        with self.module.db_connect() as db:
+            first_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            second_id = db.execute("INSERT INTO users (name, created_at) VALUES ('limit-second', ?)", (now,)).lastrowid
+            for user_id in (first_id, second_id):
+                db.execute(
+                    """INSERT INTO watchlist_stocks
+                    (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                    VALUES (?, '002156', '通富微电', 2, '', ?, ?)""",
+                    (user_id, now, now),
+                )
+
+        quote = {
+            "002156": {
+                "trade_date": "2026-08-21", "quote_time": now, "open": 11.2, "high": 12.1,
+                "low": 11.1, "close": 12.1, "previous_close": 11.0, "limit_up": 12.1,
+                "volume": 1000, "amount": 12100, "fetched_at": now,
+            },
+        }
+        with self.module.db_connect() as db:
+            self.assertEqual(self.module.evaluate_watchlist_limit_up_alerts(db, quote), 2)
+            self.assertEqual(self.module.evaluate_watchlist_limit_up_alerts(db, quote), 0)
+            notifications = db.execute(
+                """SELECT user_id, title, details_json FROM notifications
+                ORDER BY user_id"""
+            ).fetchall()
+        self.assertEqual([row["user_id"] for row in notifications], [first_id, second_id])
+        self.assertTrue(all(row["title"] == "通富微电达到涨停" for row in notifications))
+        self.assertEqual(json.loads(notifications[0]["details_json"])["limit_up"], 12.1)
+
+        next_day = {
+            "002156": dict(
+                quote["002156"], trade_date="2026-08-24", quote_time="2026-08-24T10:15:00",
+                fetched_at="2026-08-24T10:15:00",
+            ),
+        }
+        with self.module.db_connect() as db:
+            self.assertEqual(self.module.evaluate_watchlist_limit_up_alerts(db, next_day), 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 4)
+
+    def test_watchlist_limit_up_alert_requires_explicit_limit_price_and_watch(self):
+        now = "2026-08-21T10:15:00"
+        quote = {
+            "002156": {
+                "trade_date": "2026-08-21", "quote_time": now, "close": 12.1,
+                "previous_close": 11.0, "limit_up": None, "fetched_at": now,
+            },
+            "600000": {
+                "trade_date": "2026-08-21", "quote_time": now, "close": 11.0,
+                "previous_close": 10.0, "limit_up": 11.0, "fetched_at": now,
+            },
+        }
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            db.execute(
+                """INSERT INTO watchlist_stocks
+                (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                VALUES (?, '002156', '通富微电', 2, '', ?, ?)""",
+                (user_id, now, now),
+            )
+            self.assertEqual(self.module.evaluate_watchlist_limit_up_alerts(db, quote), 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 0)
+
+    def test_kline_volume_keeps_realtime_lots(self):
         with self.module.db_connect() as db:
             db.execute(
                 """INSERT INTO daily_prices
                 (stock_code, trade_date, open, high, low, close, volume, source, fetched_at)
                 VALUES ('000657', '2026-08-24', 69, 70, 64, 66.76, 896396, 'tencent-realtime', '2026-08-24T15:03:06')"""
+            )
+            row = db.execute("SELECT volume, source FROM daily_prices WHERE stock_code = '000657'").fetchone()
+        self.assertEqual(self.module.kline_volume_lots(row), 896396)
+
+    def test_kline_volume_converts_historical_shares_to_lots(self):
+        with self.module.db_connect() as db:
+            db.execute(
+                """INSERT INTO daily_prices
+                (stock_code, trade_date, open, high, low, close, volume, source, fetched_at)
+                VALUES ('000657', '2026-08-24', 69, 70, 64, 66.76, 896396, 'akshare-tencent', '2026-08-24T15:03:06')"""
             )
             row = db.execute("SELECT volume, source FROM daily_prices WHERE stock_code = '000657'").fetchone()
         self.assertEqual(self.module.kline_volume_lots(row), 8963.96)

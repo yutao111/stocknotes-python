@@ -30,7 +30,7 @@ DB_PATH = Path(os.environ.get("STOCKNOTES_DB", BASE_DIR / "stocknotes.db"))
 ALLOWED_EXTENSIONS = {"xlsx", "xls", "csv", "txt"}
 IGNORED_ACTIONS = {"申购配号", "股息入账", "股息红利税补", "指定交易"}
 STATEMENTS_PER_PAGE = 20
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 14
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 DEFAULT_USER_NAME = "yutaoGS"
 MAX_USER_NAME_LENGTH = 50
@@ -70,6 +70,7 @@ HOT_SECTORS_CACHE_TTL_SECONDS = 30
 THREE_DAY_DIP_CODE = "THREE_DAY_DIP"
 THREE_DAY_DIP_DEFAULT_PARAMS = {
     "decline_days": 2,
+    "require_bullish_baseline": True,
     "require_bearish_candles": True,
     "require_declining_closes": True,
     "max_signal_low_above_prior_ratio": 0.04,
@@ -92,16 +93,23 @@ THREE_DAY_DIP_DEFAULT_PARAMS = {
     "intraday_candidate_enabled": True,
     "close_confirmation_enabled": True,
 }
-THREE_DAY_DIP_RULE_VERSION = "three-day-dip-v6"
+THREE_DAY_DIP_RULE_VERSION = "three-day-dip-v7"
 INTRADAY_REBOUND_CODE = "INTRADAY_REBOUND"
 INTRADAY_REBOUND_DEFAULT_PARAMS = {
     "lookback_minutes": 120,
     "min_drop_ratio": 0.02,
-    "min_rebound_ratio": 0.008,
-    "min_trough_age_minutes": 5,
-    "min_volume_multiple": 1.5,
+    "min_waterline_drop_ratio": 0.02,
+    "candidate_min_rebound_ratio": 0.006,
+    "candidate_min_volume_multiple": 1.0,
+    "confirmation_min_volume_multiple": 1.2,
+    "min_trough_age_minutes": 3,
+    "first_bounce_min_ratio": 0.004,
+    "max_entry_rebound_ratio": 0.02,
     "enabled": True,
 }
+INTRADAY_REBOUND_RULE_VERSION = "intraday-rebound-v2"
+WATCHLIST_LIMIT_UP_CODE = "WATCHLIST_LIMIT_UP"
+NOTIFICATION_FILTER_CODES = {THREE_DAY_DIP_CODE, INTRADAY_REBOUND_CODE, WATCHLIST_LIMIT_UP_CODE}
 REVIEW_MAIN_PROBLEMS = (
     "STOCK_SELECTION", "ENTRY_TIMING", "EXIT_TIMING", "POSITION_SIZE",
     "STOP_LOSS", "EARLY_PROFIT_TAKING", "CHASE", "BOTTOM_FISHING",
@@ -300,6 +308,20 @@ def init_db() -> None:
                 unit_cost REAL NOT NULL,
                 total_cost REAL NOT NULL
             )""",
+            """CREATE TABLE IF NOT EXISTS current_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                stock_code TEXT NOT NULL,
+                stock_name TEXT NOT NULL,
+                quantity REAL NOT NULL CHECK(quantity > 0),
+                avg_cost REAL NOT NULL CHECK(avg_cost > 0),
+                first_buy_date TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, stock_code)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_current_positions_user
+            ON current_positions(user_id, stock_code)""",
             """CREATE TABLE IF NOT EXISTS unmatched_sells (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -483,6 +505,24 @@ def init_db() -> None:
             )""",
             """CREATE INDEX IF NOT EXISTS idx_alert_rule_states_lookup
             ON alert_rule_states(alert_type_id, stock_code, trade_date)""",
+            """CREATE TABLE IF NOT EXISTS intraday_rebound_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                alert_type_id INTEGER NOT NULL REFERENCES alert_types(id) ON DELETE CASCADE,
+                stock_code TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                session TEXT NOT NULL CHECK(session IN ('AM', 'PM')),
+                trough_minute TEXT,
+                trough_price REAL,
+                breakout_price REAL,
+                candidate_triggered_at TEXT,
+                confirmation_triggered_at TEXT,
+                last_evaluated_at TEXT NOT NULL,
+                last_status TEXT NOT NULL DEFAULT '',
+                UNIQUE(user_id, alert_type_id, stock_code, trade_date, session)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_intraday_rebound_states_lookup
+            ON intraday_rebound_states(alert_type_id, stock_code, trade_date, session)""",
             """CREATE TABLE IF NOT EXISTS notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -538,6 +578,48 @@ def init_db() -> None:
                 evaluated_through_date TEXT,
                 updated_at TEXT NOT NULL
             )""",
+            """CREATE TABLE IF NOT EXISTS alert_signal_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                alert_type_id INTEGER NOT NULL REFERENCES alert_types(id) ON DELETE CASCADE,
+                stock_code TEXT NOT NULL,
+                stock_name TEXT NOT NULL,
+                signal_date TEXT NOT NULL,
+                signal_time TEXT NOT NULL,
+                stage TEXT NOT NULL CHECK(stage IN ('CANDIDATE', 'CONFIRMED')),
+                signal_price REAL NOT NULL CHECK(signal_price > 0),
+                rule_version TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                metrics_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, alert_type_id, stock_code, signal_time, stage)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_alert_signal_events_user_date
+            ON alert_signal_events(user_id, alert_type_id, signal_date DESC, id DESC)""",
+            """CREATE TABLE IF NOT EXISTS alert_signal_event_outcomes (
+                event_id INTEGER PRIMARY KEY REFERENCES alert_signal_events(id) ON DELETE CASCADE,
+                minute_5_return REAL,
+                minute_10_return REAL,
+                minute_20_return REAL,
+                session_close_return REAL,
+                session_max_return REAL,
+                session_max_drawdown REAL,
+                day_1_close_return REAL,
+                day_3_close_return REAL,
+                day_5_close_return REAL,
+                day_10_close_return REAL,
+                day_1_max_return REAL,
+                day_3_max_return REAL,
+                day_5_max_return REAL,
+                day_10_max_return REAL,
+                day_1_max_drawdown REAL,
+                day_3_max_drawdown REAL,
+                day_5_max_drawdown REAL,
+                day_10_max_drawdown REAL,
+                evaluated_through_time TEXT,
+                evaluated_through_date TEXT,
+                updated_at TEXT NOT NULL
+            )""",
         )
         for statement in schema_statements:
             db.execute(statement)
@@ -573,6 +655,13 @@ def init_db() -> None:
                 now,
                 now,
             ),
+        )
+        db.execute(
+            """INSERT INTO alert_types
+            (code, name, signal_side, description, params_json, sample_json, enabled, created_at, updated_at)
+            VALUES (?, '重点观察涨停提醒', 'NEUTRAL', '重点观察股票当日首次达到行情源涨停价时提醒。', '{}', '{}', 1, ?, ?)
+            ON CONFLICT(code) DO NOTHING""",
+            (WATCHLIST_LIMIT_UP_CODE, now, now),
         )
         db.execute(
             """INSERT INTO alert_types
@@ -626,6 +715,7 @@ def init_db() -> None:
                 "UPDATE executions SET source = 'BROKER_TODAY', fingerprint = ? WHERE id = ?",
                 (new_fingerprint, row["id"]),
             )
+        backfill_alert_signal_events(db)
         foreign_key_errors = db.execute("PRAGMA foreign_key_check").fetchall()
         if foreign_key_errors:
             raise sqlite3.IntegrityError(f"数据库迁移外键检查失败：{foreign_key_errors}")
@@ -1079,6 +1169,56 @@ def rebuild_fifo(db: sqlite3.Connection, user_id: int | None = None) -> None:
     rebuild_trade_episodes(db, user_id)
 
 
+def upsert_current_position(
+    db: sqlite3.Connection,
+    user_id: int,
+    stock_code: str,
+    stock_name: str,
+    quantity: float,
+    avg_cost: float,
+    first_buy_date: str,
+) -> None:
+    stock_code = normalize_code(stock_code)
+    stock_name = str(stock_name or "").strip()
+    if not stock_name:
+        raise ValueError("证券名称为空")
+    if quantity <= 0:
+        raise ValueError("持仓数量必须大于 0")
+    if avg_cost <= 0:
+        raise ValueError("成本均价必须大于 0")
+    try:
+        first_buy_date = normalize_date(first_buy_date)
+    except (ValueError, TypeError):
+        raise ValueError("建仓日期格式不正确")
+    now = datetime.now().isoformat(timespec="seconds")
+    existing = db.execute(
+        "SELECT id FROM current_positions WHERE user_id = ? AND stock_code = ?",
+        (user_id, stock_code),
+    ).fetchone()
+    if existing is not None:
+        db.execute(
+            """UPDATE current_positions
+            SET stock_name = ?, quantity = ?, avg_cost = ?, first_buy_date = ?, updated_at = ?
+            WHERE id = ?""",
+            (stock_name, quantity, avg_cost, first_buy_date, now, existing["id"]),
+        )
+    else:
+        db.execute(
+            """INSERT INTO current_positions
+            (user_id, stock_code, stock_name, quantity, avg_cost, first_buy_date, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, stock_code, stock_name, quantity, avg_cost, first_buy_date, now, now),
+        )
+
+
+def delete_current_position(db: sqlite3.Connection, user_id: int, stock_code: str) -> bool:
+    cursor = db.execute(
+        "DELETE FROM current_positions WHERE user_id = ? AND stock_code = ?",
+        (user_id, normalize_code(stock_code)),
+    )
+    return cursor.rowcount > 0
+
+
 def analysis_data(db: sqlite3.Connection, user_id: int | None = None, stock_sort: str = "profit", performance_year: int | None = None) -> dict:
     user_id = user_id or current_user_id()
     stock_sort = stock_sort if stock_sort in STOCK_SORTS else "profit"
@@ -1243,13 +1383,9 @@ def performance_data(db: sqlite3.Connection, user_id: int, performance_year: int
 def portfolio_analysis_data(db: sqlite3.Connection, user_id: int) -> dict:
     today = date.today()
     position_rows = db.execute(
-        """SELECT p.stock_code, MAX(p.stock_name) stock_name, MIN(p.buy_date) first_buy_date,
-        SUM(p.quantity) quantity, SUM(p.total_cost) total_cost,
-        SUM(p.total_cost) / NULLIF(SUM(p.quantity), 0) avg_cost,
-        (SELECT ep.id FROM trade_episodes ep
-            WHERE ep.user_id = p.user_id AND ep.stock_code = p.stock_code AND ep.status = 'OPEN'
-            ORDER BY ep.opened_at DESC, ep.id DESC LIMIT 1) open_episode_id
-        FROM positions p WHERE p.user_id = ? GROUP BY p.stock_code ORDER BY total_cost DESC""",
+        """SELECT p.stock_code, p.stock_name, p.first_buy_date,
+        p.quantity quantity, p.quantity * p.avg_cost total_cost, p.avg_cost
+        FROM current_positions p WHERE p.user_id = ? ORDER BY total_cost DESC""",
         (user_id,),
     ).fetchall()
 
@@ -1283,16 +1419,6 @@ def portfolio_analysis_data(db: sqlite3.Connection, user_id: int) -> dict:
             item["market_value"] = None
             item["unrealized_profit"] = None
             item["unrealized_rate"] = None
-
-        review = None
-        if item["open_episode_id"] is not None:
-            review = db.execute(
-                """SELECT review_status, trade_reason, expected_target_price, stop_loss_price,
-                expected_holding_days FROM trade_reviews
-                WHERE user_id = ? AND trade_episode_id = ?""",
-                (user_id, item["open_episode_id"]),
-            ).fetchone()
-        item["review"] = dict(review) if review is not None else None
         positions.append(item)
 
     total_cost = sum(item["total_cost"] for item in positions)
@@ -1349,15 +1475,15 @@ def watchlist_data(db: sqlite3.Connection, user_id: int, query: str = "", priori
         item["change_amount"] = item["latest_price"] - item["previous_close"] if item["previous_close"] else None
         item["change_rate"] = item["change_amount"] / item["previous_close"] if item["previous_close"] else None
         item["is_held"] = db.execute(
-            "SELECT 1 FROM positions WHERE user_id = ? AND stock_code = ? LIMIT 1", (user_id, item["stock_code"])
+            "SELECT 1 FROM current_positions WHERE user_id = ? AND stock_code = ? LIMIT 1", (user_id, item["stock_code"])
         ).fetchone() is not None
         rebound = db.execute(
-            """SELECT last_matched FROM alert_rule_states
+            """SELECT confirmation_triggered_at FROM intraday_rebound_states
             WHERE user_id = ? AND alert_type_id = (SELECT id FROM alert_types WHERE code = ?)
-            AND stock_code = ? AND trade_date = ?""",
+            AND stock_code = ? AND trade_date = ? ORDER BY id DESC LIMIT 1""",
             (user_id, INTRADAY_REBOUND_CODE, item["stock_code"], item["price_date"]),
         ).fetchone()
-        item["intraday_rebound"] = bool(rebound["last_matched"]) if rebound else False
+        item["intraday_rebound"] = bool(rebound["confirmation_triggered_at"]) if rebound else False
         items.append(item)
     if query:
         lowered = query.lower()
@@ -1407,7 +1533,7 @@ def three_day_dip_params(raw: dict | None = None) -> dict:
     for key in ratio_keys:
         params[key] = max(-1.0, min(2.0, float(params[key])))
     for key in (
-        "require_bearish_candles", "require_declining_closes",
+        "require_bullish_baseline", "require_bearish_candles", "require_declining_closes",
         "intraday_candidate_enabled", "close_confirmation_enabled",
     ):
         params[key] = bool(params[key])
@@ -1422,8 +1548,12 @@ def evaluate_three_day_dip(
     if len(prices) < required:
         return {"matched": False, "reason": f"至少需要 {required} 个交易日行情"}
     candles = [dict(row) for row in prices[-required:]]
+    baseline = candles[0]
     decline_candles = candles[1:-1]
     signal = candles[-1]
+    baseline_bullish_ok = not params["require_bullish_baseline"] or (
+        float(baseline["close"]) > float(baseline["open"])
+    )
     bearish_ok = not params["require_bearish_candles"] or all(
         float(item["close"]) < float(item["open"]) for item in decline_candles
     )
@@ -1441,7 +1571,7 @@ def evaluate_three_day_dip(
     price_range = max(0.0, float(signal["high"]) - float(signal["low"]))
     recovery_amount = max(0.0, float(signal["close"]) - float(signal["low"]))
     recovery_range_ratio = recovery_amount / price_range if price_range else 0.0
-    baseline_close = float(candles[0]["close"])
+    baseline_close = float(baseline["close"])
     previous_close = float(decline_candles[-1]["close"])
     decline_ratio = max(0.0, 1 - previous_close / baseline_close) if baseline_close else 0.0
     repair_ratio = recovery_amount / previous_close if previous_close else 0.0
@@ -1453,7 +1583,10 @@ def evaluate_three_day_dip(
     previous_volume = float(decline_candles[-1].get("volume") or 0)
     signal_volume = float(signal.get("volume") or 0)
     volume_ratio = signal_volume / previous_volume if previous_volume and signal_volume else None
-    common_ok = bearish_ok and declining_ok and low_position_ok and decline_ratio >= params["min_decline_ratio"]
+    common_ok = (
+        baseline_bullish_ok and bearish_ok and declining_ok and low_position_ok
+        and decline_ratio >= params["min_decline_ratio"]
+    )
     exhaustion_volume_ok = not enforce_volume or (
         volume_ratio is not None and volume_ratio <= params["max_volume_ratio"]
     )
@@ -1487,6 +1620,7 @@ def evaluate_three_day_dip(
     return {
         "matched": pattern_type is not None,
         "pattern_type": pattern_type,
+        "baseline_bullish_ok": baseline_bullish_ok,
         "bearish_ok": bearish_ok,
         "declining_ok": declining_ok,
         "new_low_ok": new_low_ok,
@@ -1514,22 +1648,50 @@ def intraday_rebound_params(raw: dict | None = None) -> dict:
     params = dict(INTRADAY_REBOUND_DEFAULT_PARAMS)
     if raw:
         params.update(raw)
+        if "candidate_min_rebound_ratio" not in raw and "min_rebound_ratio" in raw:
+            params["candidate_min_rebound_ratio"] = raw["min_rebound_ratio"]
+        if "confirmation_min_volume_multiple" not in raw and "min_volume_multiple" in raw:
+            params["confirmation_min_volume_multiple"] = raw["min_volume_multiple"]
     params["lookback_minutes"] = max(20, min(240, int(params["lookback_minutes"])))
     params["min_trough_age_minutes"] = max(3, min(30, int(params["min_trough_age_minutes"])))
-    for key in ("min_drop_ratio", "min_rebound_ratio"):
+    for key in (
+        "min_drop_ratio", "min_waterline_drop_ratio", "candidate_min_rebound_ratio", "first_bounce_min_ratio",
+        "max_entry_rebound_ratio",
+    ):
         params[key] = max(0.001, min(0.2, float(params[key])))
-    params["min_volume_multiple"] = max(0.0, min(10.0, float(params["min_volume_multiple"])))
+    for key in ("candidate_min_volume_multiple", "confirmation_min_volume_multiple"):
+        params[key] = max(0.0, min(10.0, float(params[key])))
     params["enabled"] = bool(params["enabled"])
     return params
 
 
+def intraday_session(quote_minute: str) -> str | None:
+    clock = quote_minute[11:16]
+    if "09:30" <= clock <= "11:30":
+        return "AM"
+    if "13:00" <= clock <= "15:00":
+        return "PM"
+    return None
+
+
 def evaluate_intraday_rebound(samples: list[dict], params: dict | None = None) -> dict:
     params = intraday_rebound_params(params)
-    samples = [dict(sample) for sample in samples[-params["lookback_minutes"]:]]
+    samples = [dict(sample) for sample in samples]
+    if not samples:
+        return {"matched": False, "stage": None, "status": "等待分钟行情", "reason": "分钟行情不足"}
+    session = intraday_session(samples[-1]["quote_minute"])
+    samples = [sample for sample in samples if intraday_session(sample["quote_minute"]) == session]
+    samples = samples[-params["lookback_minutes"]:]
     if len(samples) < params["min_trough_age_minutes"] + 4:
-        return {"matched": False, "status": "等待分钟行情", "reason": "分钟行情不足"}
+        return {"matched": False, "stage": None, "status": "等待分钟行情", "reason": "分钟行情不足"}
     prices = [float(sample["price"]) for sample in samples]
     volumes = [float(sample.get("volume") or 0) for sample in samples]
+    previous_close = next(
+        (float(sample["previous_close"]) for sample in reversed(samples) if sample.get("previous_close")),
+        None,
+    )
+    if previous_close is None:
+        return {"matched": False, "stage": None, "status": "等待昨收数据", "reason": "缺少昨收基准"}
     latest_index = len(samples) - 1
     candidate_indexes = sorted(
         range(2, latest_index - params["min_trough_age_minutes"] + 1), key=lambda index: prices[index]
@@ -1541,31 +1703,58 @@ def evaluate_intraday_rebound(samples: list[dict], params: dict | None = None) -
         drop_ratio = 1 - trough_price / peak_price if peak_price else 0.0
         if drop_ratio < params["min_drop_ratio"]:
             continue
-        prior_prices = prices[trough_index + 1:latest_index]
-        if len(prior_prices) < 2:
+        waterline_drop_ratio = 1 - trough_price / previous_close if previous_close else 0.0
+        if waterline_drop_ratio < params["min_waterline_drop_ratio"]:
             continue
-        first_high = max(prior_prices)
-        first_high_index = trough_index + 1 + prior_prices.index(first_high)
-        pullback_prices = prices[first_high_index + 1:latest_index]
-        if not pullback_prices:
-            continue
-        higher_low = min(pullback_prices)
         recovery_ratio = prices[-1] / trough_price - 1 if trough_price else 0.0
-        breakout_price = max(prior_prices)
         volume_deltas = [max(0.0, volumes[index] - volumes[index - 1]) for index in range(1, len(volumes))]
         recent_volumes = [value for value in volume_deltas[max(0, len(volume_deltas) - 6):-1] if value > 0]
         baseline_volume = sorted(recent_volumes)[len(recent_volumes) // 2] if recent_volumes else 0.0
         latest_volume = volume_deltas[-1] if volume_deltas else 0.0
         volume_multiple = latest_volume / baseline_volume if baseline_volume else None
-        structure_ok = higher_low > trough_price and prices[-1] > breakout_price
-        volume_ok = volume_multiple is not None and volume_multiple >= params["min_volume_multiple"]
-        matched = (
-            structure_ok and recovery_ratio >= params["min_rebound_ratio"]
-            and (params["min_volume_multiple"] == 0 or volume_ok)
+        candidate_volume_ok = (
+            params["candidate_min_volume_multiple"] == 0
+            or volume_multiple is not None and volume_multiple >= params["candidate_min_volume_multiple"]
         )
+        entry_ok = recovery_ratio <= params["max_entry_rebound_ratio"]
+        candidate_ok = (
+            recovery_ratio >= params["candidate_min_rebound_ratio"] and candidate_volume_ok and entry_ok
+        )
+        first_high_index = None
+        for index in range(trough_index + 2, latest_index):
+            if (
+                prices[index] / trough_price - 1 >= params["first_bounce_min_ratio"]
+                and prices[index] >= prices[index - 1] and prices[index] > prices[index + 1]
+            ):
+                first_high_index = index
+                break
+        breakout_price = prices[first_high_index] if first_high_index is not None else None
+        pullback_prices = prices[first_high_index + 1:latest_index] if first_high_index is not None else []
+        higher_low = min(pullback_prices) if pullback_prices else None
+        structure_ok = (
+            breakout_price is not None and higher_low is not None and higher_low > trough_price
+            and prices[-1] > breakout_price
+        )
+        breakout_volume_multiples = []
+        if first_high_index is not None:
+            for index in range(first_high_index + 1, latest_index + 1):
+                baseline = [value for value in volume_deltas[max(0, index - 6):index - 1] if value > 0]
+                if baseline and index - 1 < len(volume_deltas):
+                    breakout_volume_multiples.append(
+                        volume_deltas[index - 1] / sorted(baseline)[len(baseline) // 2]
+                    )
+        breakout_volume_multiple = max(breakout_volume_multiples, default=volume_multiple or 0.0)
+        confirmation_volume_ok = (
+            params["confirmation_min_volume_multiple"] == 0
+            or breakout_volume_multiple >= params["confirmation_min_volume_multiple"]
+        )
+        confirmed = structure_ok and confirmation_volume_ok and entry_ok
+        stage = "CONFIRMED" if confirmed else "CANDIDATE" if candidate_ok else None
         return {
-            "matched": matched,
-            "status": "日内反弹候选" if matched else "等待放量突破",
+            "matched": stage is not None,
+            "stage": stage,
+            "status": "结构确认" if confirmed else "早期观察" if candidate_ok else "等待止跌确认",
+            "session": session,
             "peak_price": peak_price,
             "peak_minute": samples[peak_index]["quote_minute"],
             "trough_price": trough_price,
@@ -1573,12 +1762,16 @@ def evaluate_intraday_rebound(samples: list[dict], params: dict | None = None) -
             "higher_low": higher_low,
             "breakout_price": breakout_price,
             "drop_ratio": drop_ratio,
+            "waterline_drop_ratio": waterline_drop_ratio,
+            "previous_close": previous_close,
             "recovery_ratio": recovery_ratio,
             "volume_multiple": volume_multiple,
+            "breakout_volume_multiple": breakout_volume_multiple,
             "structure_ok": structure_ok,
-            "volume_ok": volume_ok,
+            "volume_ok": confirmation_volume_ok if confirmed else candidate_volume_ok,
+            "entry_ok": entry_ok,
         }
-    return {"matched": False, "status": "未形成急跌结构", "reason": "未找到满足条件的低点"}
+    return {"matched": False, "stage": None, "status": "未形成急跌结构", "reason": "未找到满足条件的低点"}
 
 
 def alert_type_data(db: sqlite3.Connection) -> tuple[sqlite3.Row, dict]:
@@ -1645,7 +1838,8 @@ def backtest_three_day_dip(
 def three_day_dip_metrics(result: dict) -> dict:
     return {
         key: result.get(key) for key in (
-            "pattern_type", "decline_ratio", "signal_low_above_prior_ratio", "recovery_range_ratio", "repair_ratio",
+            "pattern_type", "baseline_bullish_ok", "decline_ratio", "signal_low_above_prior_ratio",
+            "recovery_range_ratio", "repair_ratio",
             "body_range_ratio", "lower_shadow_body_ratio", "signal_change_ratio", "volume_ratio",
         )
     }
@@ -1771,36 +1965,258 @@ def alert_signal_pool_data(db: sqlite3.Connection, user_id: int) -> dict:
     }
 
 
+def update_alert_signal_event_outcome(db: sqlite3.Connection, event_id: int) -> None:
+    event = db.execute(
+        "SELECT * FROM alert_signal_events WHERE id = ?", (event_id,)
+    ).fetchone()
+    if event is None:
+        return
+    signal_price = float(event["signal_price"])
+    minute_values = {f"minute_{minute}_return": None for minute in (5, 10, 20)}
+    session_values = {
+        "session_close_return": None, "session_max_return": None, "session_max_drawdown": None,
+    }
+    signal_moment = datetime.fromisoformat(event["signal_time"])
+    session_end = "11:30" if signal_moment.hour < 12 else "15:00"
+    minute_rows = db.execute(
+        """SELECT quote_minute, price FROM intraday_quotes WHERE stock_code = ? AND trade_date = ?
+        AND quote_minute >= ? AND SUBSTR(quote_minute, 12, 5) <= ? ORDER BY quote_minute""",
+        (event["stock_code"], event["signal_date"], signal_moment.isoformat(timespec="minutes"), session_end),
+    ).fetchall()
+    for horizon in (5, 10, 20):
+        target = signal_moment + timedelta(minutes=horizon)
+        row = next(
+            (item for item in minute_rows if datetime.fromisoformat(item["quote_minute"]) >= target), None
+        )
+        if row is not None:
+            minute_values[f"minute_{horizon}_return"] = float(row["price"]) / signal_price - 1
+    session_complete = bool(minute_rows and minute_rows[-1]["quote_minute"][11:16] >= session_end)
+    if session_complete:
+        prices = [float(row["price"]) for row in minute_rows]
+        session_values = {
+            "session_close_return": prices[-1] / signal_price - 1,
+            "session_max_return": max(prices) / signal_price - 1,
+            "session_max_drawdown": min(prices) / signal_price - 1,
+        }
+
+    future = db.execute(
+        """SELECT trade_date, high, low, close FROM daily_prices WHERE stock_code = ? AND trade_date > ?
+        AND high IS NOT NULL AND low IS NOT NULL AND close IS NOT NULL ORDER BY trade_date LIMIT 10""",
+        (event["stock_code"], event["signal_date"]),
+    ).fetchall()
+    daily_values = {}
+    for horizon in (1, 3, 5, 10):
+        window = future[:horizon]
+        daily_values[f"day_{horizon}_close_return"] = (
+            float(window[-1]["close"]) / signal_price - 1 if len(window) >= horizon else None
+        )
+        daily_values[f"day_{horizon}_max_return"] = (
+            max(float(row["high"]) for row in window) / signal_price - 1 if len(window) >= horizon else None
+        )
+        daily_values[f"day_{horizon}_max_drawdown"] = (
+            min(float(row["low"]) for row in window) / signal_price - 1 if len(window) >= horizon else None
+        )
+    values = {**minute_values, **session_values, **daily_values}
+    columns = list(values)
+    now = datetime.now().isoformat(timespec="seconds")
+    db.execute(
+        f"""INSERT INTO alert_signal_event_outcomes
+        (event_id, {', '.join(columns)}, evaluated_through_time, evaluated_through_date, updated_at)
+        VALUES (?, {', '.join('?' for _ in columns)}, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+        {', '.join(f'{column} = excluded.{column}' for column in columns)},
+        evaluated_through_time = excluded.evaluated_through_time,
+        evaluated_through_date = excluded.evaluated_through_date, updated_at = excluded.updated_at""",
+        (
+            event_id, *(values[column] for column in columns),
+            minute_rows[-1]["quote_minute"] if minute_rows else None,
+            future[-1]["trade_date"] if future else None, now,
+        ),
+    )
+
+
+def upsert_alert_signal_event(
+    db: sqlite3.Connection, user_id: int, alert_type_id: int, stock_code: str, stock_name: str,
+    stage: str, signal_time: str, signal_price: float, rule_version: str, params: dict, metrics: dict,
+) -> int:
+    signal_time = datetime.fromisoformat(signal_time).isoformat(timespec="seconds")
+    now = datetime.now().isoformat(timespec="seconds")
+    cursor = db.execute(
+        """INSERT INTO alert_signal_events
+        (user_id, alert_type_id, stock_code, stock_name, signal_date, signal_time, stage,
+         signal_price, rule_version, params_json, metrics_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, alert_type_id, stock_code, signal_time, stage) DO UPDATE SET
+        stock_name = excluded.stock_name, signal_price = excluded.signal_price,
+        rule_version = excluded.rule_version, params_json = excluded.params_json,
+        metrics_json = excluded.metrics_json RETURNING id""",
+        (
+            user_id, alert_type_id, stock_code, stock_name, signal_time[:10], signal_time, stage,
+            float(signal_price), rule_version, json.dumps(params, ensure_ascii=False),
+            json.dumps(metrics, ensure_ascii=False), now,
+        ),
+    )
+    event_id = int(cursor.fetchone()["id"])
+    update_alert_signal_event_outcome(db, event_id)
+    return event_id
+
+
+def refresh_alert_signal_event_outcomes(db: sqlite3.Connection, stock_codes: list[str] | None = None) -> int:
+    if stock_codes:
+        placeholders = ",".join("?" for _ in stock_codes)
+        rows = db.execute(
+            f"SELECT id FROM alert_signal_events WHERE stock_code IN ({placeholders})", tuple(stock_codes)
+        ).fetchall()
+    else:
+        rows = db.execute("SELECT id FROM alert_signal_events").fetchall()
+    for row in rows:
+        update_alert_signal_event_outcome(db, int(row["id"]))
+    return len(rows)
+
+
+def backfill_alert_signal_events(db: sqlite3.Connection) -> int:
+    rows = db.execute(
+        """SELECT notification.*, alert.code AS alert_code, alert.params_json
+        FROM notifications AS notification JOIN alert_types AS alert ON alert.id = notification.alert_type_id
+        WHERE alert.code IN (?, ?) ORDER BY notification.id""",
+        (THREE_DAY_DIP_CODE, INTRADAY_REBOUND_CODE),
+    ).fetchall()
+    inserted = 0
+    for row in rows:
+        try:
+            details = json.loads(row["details_json"] or "{}")
+            signal_time = datetime.fromisoformat(row["quote_time"]).isoformat(timespec="seconds")
+            if row["alert_code"] == THREE_DAY_DIP_CODE:
+                signal_price = float(details["price"])
+                rule_version = THREE_DAY_DIP_RULE_VERSION
+            else:
+                minute = datetime.fromisoformat(signal_time).isoformat(timespec="minutes")
+                quote = db.execute(
+                    "SELECT price FROM intraday_quotes WHERE stock_code = ? AND quote_minute = ?",
+                    (row["stock_code"], minute),
+                ).fetchone()
+                signal_price = float(quote["price"]) if quote is not None else float(details.get("price") or 0)
+                rule_version = INTRADAY_REBOUND_RULE_VERSION
+            if signal_price <= 0:
+                continue
+            params = json.loads(row["params_json"] or "{}")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        params["backfilled"] = True
+        cursor = db.execute(
+            """INSERT OR IGNORE INTO alert_signal_events
+            (user_id, alert_type_id, stock_code, stock_name, signal_date, signal_time, stage,
+             signal_price, rule_version, params_json, metrics_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                row["user_id"], row["alert_type_id"], row["stock_code"], row["stock_name"],
+                signal_time[:10], signal_time, row["stage"], signal_price, rule_version,
+                json.dumps(params, ensure_ascii=False), json.dumps(details, ensure_ascii=False), row["created_at"],
+            ),
+        )
+        if cursor.rowcount:
+            inserted += 1
+        event = db.execute(
+            """SELECT id FROM alert_signal_events WHERE user_id = ? AND alert_type_id = ?
+            AND stock_code = ? AND signal_time = ? AND stage = ?""",
+            (row["user_id"], row["alert_type_id"], row["stock_code"], signal_time, row["stage"]),
+        ).fetchone()
+        update_alert_signal_event_outcome(db, int(event["id"]))
+    return inserted
+
+
+def alert_effectiveness_data(db: sqlite3.Connection, user_id: int, alert_type_id: int) -> dict:
+    rows = [dict(row) for row in db.execute(
+        """SELECT event.*, outcome.minute_5_return, outcome.minute_10_return,
+        outcome.minute_20_return, outcome.session_close_return, outcome.session_max_return,
+        outcome.session_max_drawdown, outcome.day_1_close_return, outcome.day_3_close_return,
+        outcome.day_5_close_return, outcome.day_10_close_return
+        FROM alert_signal_events AS event LEFT JOIN alert_signal_event_outcomes AS outcome
+        ON outcome.event_id = event.id WHERE event.user_id = ? AND event.alert_type_id = ?
+        ORDER BY event.signal_time DESC, event.id DESC""",
+        (user_id, alert_type_id),
+    ).fetchall()]
+    def performance(key: str, stage: str | None = None) -> dict:
+        values = [
+            float(row[key]) for row in rows
+            if row.get(key) is not None and (stage is None or row["stage"] == stage)
+        ]
+        return {
+            "samples": len(values), "average": sum(values) / len(values) if values else None,
+            "win_rate": sum(value > 0 for value in values) / len(values) if values else None,
+        }
+    return {
+        "rows": rows[:30],
+        "summary": {
+            "total": len(rows),
+            "candidate": sum(row["stage"] == "CANDIDATE" for row in rows),
+            "confirmed": sum(row["stage"] == "CONFIRMED" for row in rows),
+        },
+        "performance": {
+            key: performance(key) for key in (
+                "minute_5_return", "minute_10_return", "minute_20_return", "session_close_return",
+                "day_1_close_return", "day_3_close_return", "day_5_close_return", "day_10_close_return",
+            )
+        },
+        "stage_performance": {
+            stage: {
+                key: performance(key, stage) for key in (
+                    "minute_5_return", "minute_10_return", "minute_20_return", "session_close_return",
+                    "day_1_close_return", "day_3_close_return", "day_5_close_return", "day_10_close_return",
+                )
+            }
+            for stage in ("CANDIDATE", "CONFIRMED")
+        },
+    }
+
+
 def notification_rows(db: sqlite3.Connection, user_id: int, limit: int = 20) -> tuple[int, list[dict]]:
     unread = int(db.execute(
         "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL", (user_id,)
     ).fetchone()[0])
     rows = [dict(row) for row in db.execute(
-        """SELECT id, stock_code, stock_name, stage, title, content, quote_time, created_at, read_at
-        FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?""",
+        """SELECT notification.id, notification.stock_code, notification.stock_name, notification.stage,
+        notification.title, notification.content, notification.quote_time, notification.created_at,
+        notification.read_at, alert.code AS alert_type_code
+        FROM notifications AS notification
+        LEFT JOIN alert_types AS alert ON alert.id = notification.alert_type_id
+        WHERE notification.user_id = ? ORDER BY notification.created_at DESC, notification.id DESC LIMIT ?""",
         (user_id, limit),
     ).fetchall()]
     return unread, rows
 
 
-def notification_page_data(db: sqlite3.Connection, user_id: int, page: int, per_page: int = 20) -> dict:
+def notification_page_data(
+    db: sqlite3.Connection, user_id: int, page: int, per_page: int = 20, alert_type_code: str | None = None,
+) -> dict:
+    alert_type_code = alert_type_code if alert_type_code in NOTIFICATION_FILTER_CODES else None
+    filter_sql = " AND alert.code = ?" if alert_type_code else ""
+    params = (user_id, alert_type_code) if alert_type_code else (user_id,)
     unread = int(db.execute(
         "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL", (user_id,)
     ).fetchone()[0])
     total = int(db.execute(
-        "SELECT COUNT(*) FROM notifications WHERE user_id = ?", (user_id,)
+        f"""SELECT COUNT(*) FROM notifications AS notification
+        LEFT JOIN alert_types AS alert ON alert.id = notification.alert_type_id
+        WHERE notification.user_id = ?{filter_sql}""",
+        params,
     ).fetchone()[0])
     total_pages = max(1, math.ceil(total / per_page))
     page = min(max(1, page), total_pages)
     offset = (page - 1) * per_page
     rows = [dict(row) for row in db.execute(
-        """SELECT id, stock_code, stock_name, stage, title, content, quote_time, created_at, read_at
-        FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
-        (user_id, per_page, offset),
+        f"""SELECT notification.id, notification.stock_code, notification.stock_name, notification.stage,
+        notification.title, notification.content, notification.quote_time, notification.created_at,
+        notification.read_at, alert.code AS alert_type_code, alert.name AS alert_type_name
+        FROM notifications AS notification
+        LEFT JOIN alert_types AS alert ON alert.id = notification.alert_type_id
+        WHERE notification.user_id = ?{filter_sql}
+        ORDER BY notification.created_at DESC, notification.id DESC LIMIT ? OFFSET ?""",
+        (*params, per_page, offset),
     ).fetchall()]
     return {
         "unread": unread, "total": total, "per_page": per_page,
-        "page": page, "total_pages": total_pages, "rows": rows,
+        "page": page, "total_pages": total_pages, "rows": rows, "alert_type_code": alert_type_code,
     }
 
 
@@ -2055,7 +2471,12 @@ def fetch_realtime_prices(stock_codes: list[str]) -> dict[str, dict]:
             timestamp = fields[30]
             trade_date = f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}"
             quote_time = f"{trade_date}T{timestamp[8:10]}:{timestamp[10:12]}:{timestamp[12:14]}"
+            try:
+                limit_up = float(fields[47]) if len(fields) > 47 and fields[47].strip() else None
+            except ValueError:
+                limit_up = None
             quotes[requested_code] = {
+                "stock_name": fields[1].strip(),
                 "trade_date": trade_date,
                 "quote_time": quote_time,
                 "open": float(fields[5]),
@@ -2063,6 +2484,7 @@ def fetch_realtime_prices(stock_codes: list[str]) -> dict[str, dict]:
                 "low": float(fields[34]),
                 "close": float(fields[3]),
                 "previous_close": float(fields[4]),
+                "limit_up": limit_up,
                 "volume": float(fields[36]),
                 "amount": float(fields[35].split("/")[2]),
                 "fetched_at": datetime.now().isoformat(timespec="seconds"),
@@ -2237,37 +2659,109 @@ def create_alert_notification(
 
 
 def create_intraday_rebound_notification(
-    db: sqlite3.Connection, alert_type_id: int, watch: sqlite3.Row, quote: dict, result: dict,
+    db: sqlite3.Connection, alert_type_id: int, watch: sqlite3.Row, quote: dict, stage: str, result: dict,
 ) -> bool:
     created_at = datetime.now().isoformat(timespec="seconds")
-    content = (
-        f"低点 {result['trough_price']:.3f}（{result['trough_minute'][11:16]}），"
-        f"突破 {result['breakout_price']:.3f}，当前 {float(quote['close']):.3f}；"
-        f"低点反弹 {result['recovery_ratio'] * 100:.1f}%"
-    )
+    stage_label = "早期观察" if stage == "CANDIDATE" else "结构确认"
+    if stage == "CANDIDATE":
+        content = (
+            f"低点 {result['trough_price']:.3f}（{result['trough_minute'][11:16]}）后未创新低，"
+            f"当前 {float(quote['close']):.3f}，反弹 {result['recovery_ratio'] * 100:.1f}%；等待首次回踩突破。"
+        )
+    else:
+        content = (
+            f"低点 {result['trough_price']:.3f}（{result['trough_minute'][11:16]}），"
+            f"固定突破位 {result['breakout_price']:.3f}，当前 {float(quote['close']):.3f}；"
+            f"低点反弹 {result['recovery_ratio'] * 100:.1f}%"
+        )
     details = {
         "trough_price": result["trough_price"],
         "trough_minute": result["trough_minute"],
         "higher_low": result["higher_low"],
         "breakout_price": result["breakout_price"],
         "drop_ratio": result["drop_ratio"],
+        "waterline_drop_ratio": result["waterline_drop_ratio"],
+        "previous_close": result["previous_close"],
         "recovery_ratio": result["recovery_ratio"],
         "volume_multiple": result["volume_multiple"],
-        "invalidation_price": result["higher_low"],
+        "breakout_volume_multiple": result.get("breakout_volume_multiple"),
+        "invalidation_price": result["higher_low"] or result["trough_price"],
+        "session": result["session"],
+        "signal_stage": stage,
     }
-    dedupe_key = f"{watch['user_id']}:{INTRADAY_REBOUND_CODE}:{watch['stock_code']}:{quote['trade_date']}:CANDIDATE"
+    trough_key = result["trough_minute"].replace(":", "")
+    dedupe_key = (
+        f"{watch['user_id']}:{INTRADAY_REBOUND_CODE}:{watch['stock_code']}:"
+        f"{quote['trade_date']}:{result['session']}:{trough_key}:{stage}"
+    )
     cursor = db.execute(
         """INSERT OR IGNORE INTO notifications
         (user_id, alert_type_id, stock_code, stock_name, stage, title, content,
          details_json, quote_time, created_at, dedupe_key)
-        VALUES (?, ?, ?, ?, 'CANDIDATE', ?, ?, ?, ?, ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            watch["user_id"], alert_type_id, watch["stock_code"], watch["stock_name"],
-            f"{watch['stock_name']}触发日内反弹·候选", content,
+            watch["user_id"], alert_type_id, watch["stock_code"], watch["stock_name"], stage,
+            f"{watch['stock_name']}触发日内反弹·{stage_label}", content,
             json.dumps(details, ensure_ascii=False), quote.get("quote_time", quote["fetched_at"]), created_at, dedupe_key,
         ),
     )
     return cursor.rowcount > 0
+
+
+def create_watchlist_limit_up_notification(
+    db: sqlite3.Connection, alert_type_id: int, watch: sqlite3.Row, quote: dict,
+) -> bool:
+    try:
+        price = float(quote["close"])
+        limit_up = float(quote["limit_up"])
+        previous_close = float(quote.get("previous_close") or 0)
+    except (KeyError, TypeError, ValueError):
+        return False
+    if price <= 0 or limit_up <= 0 or price + 1e-6 < limit_up:
+        return False
+    created_at = datetime.now().isoformat(timespec="seconds")
+    change_ratio = price / previous_close - 1 if previous_close > 0 else None
+    content = f"当前价 {price:.2f} 元，今日涨停价 {limit_up:.2f} 元"
+    if change_ratio is not None:
+        content += f"，较前收上涨 {change_ratio * 100:.2f}%"
+    content += "。"
+    details = {
+        "price": price, "limit_up": limit_up, "previous_close": previous_close or None,
+        "change_ratio": change_ratio, "trade_date": quote["trade_date"],
+    }
+    dedupe_key = f"{watch['user_id']}:{WATCHLIST_LIMIT_UP_CODE}:{watch['stock_code']}:{quote['trade_date']}"
+    cursor = db.execute(
+        """INSERT OR IGNORE INTO notifications
+        (user_id, alert_type_id, stock_code, stock_name, stage, title, content,
+         details_json, quote_time, created_at, dedupe_key)
+        VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, ?, ?)""",
+        (
+            watch["user_id"], alert_type_id, watch["stock_code"], watch["stock_name"],
+            f"{watch['stock_name']}达到涨停", content, json.dumps(details, ensure_ascii=False),
+            quote.get("quote_time", quote["fetched_at"]), created_at, dedupe_key,
+        ),
+    )
+    return cursor.rowcount > 0
+
+
+def evaluate_watchlist_limit_up_alerts(db: sqlite3.Connection, quotes: dict[str, dict]) -> int:
+    if not quotes:
+        return 0
+    alert_type = db.execute(
+        "SELECT id FROM alert_types WHERE code = ? AND enabled = 1", (WATCHLIST_LIMIT_UP_CODE,)
+    ).fetchone()
+    if alert_type is None:
+        return 0
+    placeholders = ",".join("?" for _ in quotes)
+    watches = db.execute(
+        f"""SELECT user_id, stock_code, stock_name FROM watchlist_stocks
+        WHERE stock_code IN ({placeholders}) ORDER BY user_id, stock_code""",
+        tuple(quotes),
+    ).fetchall()
+    return sum(
+        create_watchlist_limit_up_notification(db, alert_type["id"], watch, quotes[watch["stock_code"]])
+        for watch in watches
+    )
 
 
 def evaluate_realtime_alerts(db: sqlite3.Connection, quotes: dict[str, dict]) -> int:
@@ -2306,6 +2800,11 @@ def evaluate_realtime_alerts(db: sqlite3.Connection, quotes: dict[str, dict]) ->
         if result["matched"] and params["intraday_candidate_enabled"] and not candidate_at:
             if create_alert_notification(db, alert_type["id"], watch, quote, "CANDIDATE", result):
                 created += 1
+                upsert_alert_signal_event(
+                    db, watch["user_id"], alert_type["id"], watch["stock_code"], watch["stock_name"],
+                    "CANDIDATE", quote.get("quote_time", quote["fetched_at"]), float(quote["close"]),
+                    THREE_DAY_DIP_RULE_VERSION, params, three_day_dip_metrics(result),
+                )
             candidate_at = quote["fetched_at"]
         if (
             result["matched"] and params["close_confirmation_enabled"]
@@ -2313,6 +2812,11 @@ def evaluate_realtime_alerts(db: sqlite3.Connection, quotes: dict[str, dict]) ->
         ):
             if create_alert_notification(db, alert_type["id"], watch, quote, "CONFIRMED", result):
                 created += 1
+                upsert_alert_signal_event(
+                    db, watch["user_id"], alert_type["id"], watch["stock_code"], watch["stock_name"],
+                    "CONFIRMED", quote.get("quote_time", quote["fetched_at"]), float(quote["close"]),
+                    THREE_DAY_DIP_RULE_VERSION, params, three_day_dip_metrics(result),
+                )
             confirmation_at = quote["fetched_at"]
         if result["matched"] and closing:
             upsert_alert_signal_sample(
@@ -2358,34 +2862,68 @@ def evaluate_intraday_rebound_alerts(db: sqlite3.Connection, quotes: dict[str, d
     for watch in watches:
         quote = quotes[watch["stock_code"]]
         if watch["stock_code"] not in results:
+            quote_session = intraday_session(quote.get("quote_time", quote["fetched_at"]))
+            if quote_session is None:
+                results[watch["stock_code"]] = {"matched": False, "stage": None, "status": "非连续交易时段"}
+                continue
             samples = [dict(row) for row in db.execute(
-                """SELECT quote_minute, price, volume FROM intraday_quotes
-                WHERE stock_code = ? AND trade_date = ? ORDER BY quote_minute DESC LIMIT ?""",
-                (watch["stock_code"], quote["trade_date"], params["lookback_minutes"]),
+                """SELECT quote_minute, price, volume, previous_close FROM intraday_quotes
+                WHERE stock_code = ? AND trade_date = ? AND SUBSTR(quote_minute, 12, 5) BETWEEN ? AND ?
+                ORDER BY quote_minute DESC LIMIT ?""",
+                (
+                    watch["stock_code"], quote["trade_date"],
+                    "09:30" if quote_session == "AM" else "13:00",
+                    "11:30" if quote_session == "AM" else "15:00",
+                    params["lookback_minutes"],
+                ),
             ).fetchall()][::-1]
             results[watch["stock_code"]] = evaluate_intraday_rebound(samples, params)
         result = results[watch["stock_code"]]
+        if not result.get("session") or not result.get("trough_minute"):
+            continue
         state = db.execute(
-            """SELECT * FROM alert_rule_states WHERE user_id = ? AND alert_type_id = ?
-            AND stock_code = ? AND trade_date = ?""",
-            (watch["user_id"], alert_type["id"], watch["stock_code"], quote["trade_date"]),
+            """SELECT * FROM intraday_rebound_states WHERE user_id = ? AND alert_type_id = ?
+            AND stock_code = ? AND trade_date = ? AND session = ?""",
+            (
+                watch["user_id"], alert_type["id"], watch["stock_code"], quote["trade_date"], result["session"],
+            ),
         ).fetchone()
-        candidate_at = state["candidate_triggered_at"] if state else None
-        if result["matched"] and not candidate_at:
-            if create_intraday_rebound_notification(db, alert_type["id"], watch, quote, result):
+        new_trough = state is None or state["trough_minute"] != result["trough_minute"]
+        candidate_at = None if new_trough else state["candidate_triggered_at"]
+        confirmation_at = None if new_trough else state["confirmation_triggered_at"]
+        if result["stage"] in ("CANDIDATE", "CONFIRMED") and not candidate_at:
+            if create_intraday_rebound_notification(db, alert_type["id"], watch, quote, "CANDIDATE", result):
                 created += 1
+                upsert_alert_signal_event(
+                    db, watch["user_id"], alert_type["id"], watch["stock_code"], watch["stock_name"],
+                    "CANDIDATE", quote.get("quote_time", quote["fetched_at"]), float(quote["close"]),
+                    INTRADAY_REBOUND_RULE_VERSION, params, result,
+                )
             candidate_at = quote.get("quote_time", quote["fetched_at"])
+        if result["stage"] == "CONFIRMED" and not confirmation_at:
+            if create_intraday_rebound_notification(db, alert_type["id"], watch, quote, "CONFIRMED", result):
+                created += 1
+                upsert_alert_signal_event(
+                    db, watch["user_id"], alert_type["id"], watch["stock_code"], watch["stock_name"],
+                    "CONFIRMED", quote.get("quote_time", quote["fetched_at"]), float(quote["close"]),
+                    INTRADAY_REBOUND_RULE_VERSION, params, result,
+                )
+            confirmation_at = quote.get("quote_time", quote["fetched_at"])
         db.execute(
-            """INSERT INTO alert_rule_states
-            (user_id, alert_type_id, stock_code, trade_date, candidate_triggered_at,
-             confirmation_triggered_at, last_evaluated_at, last_matched)
-            VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
-            ON CONFLICT(user_id, alert_type_id, stock_code, trade_date) DO UPDATE SET
+            """INSERT INTO intraday_rebound_states
+            (user_id, alert_type_id, stock_code, trade_date, session, trough_minute, trough_price,
+             breakout_price, candidate_triggered_at, confirmation_triggered_at, last_evaluated_at, last_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, alert_type_id, stock_code, trade_date, session) DO UPDATE SET
+            trough_minute = excluded.trough_minute, trough_price = excluded.trough_price,
+            breakout_price = excluded.breakout_price,
             candidate_triggered_at = excluded.candidate_triggered_at,
-            last_evaluated_at = excluded.last_evaluated_at, last_matched = excluded.last_matched""",
+            confirmation_triggered_at = excluded.confirmation_triggered_at,
+            last_evaluated_at = excluded.last_evaluated_at, last_status = excluded.last_status""",
             (
                 watch["user_id"], alert_type["id"], watch["stock_code"], quote["trade_date"],
-                candidate_at, quote.get("quote_time", quote["fetched_at"]), int(result["matched"]),
+                result["session"], result["trough_minute"], result["trough_price"], result["breakout_price"],
+                candidate_at, confirmation_at, quote.get("quote_time", quote["fetched_at"]), result["status"],
             ),
         )
     return created
@@ -2661,6 +3199,8 @@ def sync_realtime_codes(stock_codes: list[str]) -> tuple[int, list[str]]:
             save_intraday_quotes(db, quotes)
             evaluate_realtime_alerts(db, quotes)
             evaluate_intraday_rebound_alerts(db, quotes)
+            evaluate_watchlist_limit_up_alerts(db, quotes)
+            refresh_alert_signal_event_outcomes(db, list(quotes))
         return synced, [f"{stock_code}：未返回实时行情" for stock_code in missing_codes]
     finally:
         REALTIME_SYNC_LOCK.release()
@@ -2700,6 +3240,7 @@ def sync_history_codes(stock_codes: list[str], full: bool = False) -> tuple[int,
         for stock_code, frame, source, start_date, end_date in fetched:
             synced += save_daily_prices(db, stock_code, frame, source, start_date, end_date)
         refresh_alert_signal_outcomes(db, [item[0] for item in fetched])
+        refresh_alert_signal_event_outcomes(db, [item[0] for item in fetched])
     return synced, failed
 
 
@@ -2725,7 +3266,7 @@ def run_auto_realtime_sync(moment: datetime | None = None) -> bool:
             for row in db.execute(
                 """SELECT stock_code FROM watchlist_stocks
                 UNION
-                SELECT stock_code FROM positions
+                SELECT stock_code FROM current_positions
                 ORDER BY stock_code"""
             ).fetchall()
         ]
@@ -3591,13 +4132,9 @@ def analysis_stocks():
         data = analysis_data(db, user_id, stock_sort)
         stocks = data["by_stock"]
         position_rows = db.execute(
-            """SELECT p.stock_code, MAX(p.stock_name) stock_name, MIN(p.buy_date) first_buy_date,
-            SUM(p.quantity) quantity, SUM(p.total_cost) total_cost,
-            SUM(p.total_cost) / NULLIF(SUM(p.quantity), 0) avg_cost,
-            (SELECT ep.id FROM trade_episodes ep
-                WHERE ep.user_id = p.user_id AND ep.stock_code = p.stock_code AND ep.status = 'OPEN'
-                ORDER BY ep.opened_at DESC, ep.id DESC LIMIT 1) open_episode_id
-            FROM positions p WHERE p.user_id = ? GROUP BY p.stock_code""",
+            """SELECT p.stock_code, p.stock_name, p.first_buy_date,
+            p.quantity, p.quantity * p.avg_cost total_cost, p.avg_cost
+            FROM current_positions p WHERE p.user_id = ?""",
             (user_id,),
         ).fetchall()
         positions_by_code = {row["stock_code"]: dict(row) for row in position_rows}
@@ -4070,7 +4607,8 @@ def kline_bs_points(db: sqlite3.Connection, user_id: int, stock_code: str) -> li
 
 
 def kline_volume_lots(row: sqlite3.Row) -> float:
-    return float(row["volume"] or 0) / 100
+    volume = float(row["volume"] or 0)
+    return volume if row["source"] == "tencent-realtime" else volume / 100
 
 
 @app.post("/analysis/watchlist/sync-prices")
@@ -4132,6 +4670,43 @@ def analysis_portfolio():
     return render_template("index.html", page="portfolio", portfolio=portfolio, auto_sync=auto_sync_status())
 
 
+@app.post("/analysis/portfolio/position")
+def save_portfolio_position():
+    try:
+        stock_code = normalize_code(request.form.get("stock_code", ""))
+        stock_name = request.form.get("stock_name", "").strip()
+        quantity = to_number(request.form.get("quantity", ""))
+        avg_cost = to_number(request.form.get("avg_cost", ""))
+        first_buy_date = request.form.get("first_buy_date", "")
+    except (ValueError, TypeError) as error:
+        flash(f"保存持仓失败：{error}", "error")
+        return redirect(url_for("analysis_portfolio"))
+    try:
+        with db_connect() as db:
+            upsert_current_position(db, current_user_id(), stock_code, stock_name, quantity, avg_cost, first_buy_date)
+    except (ValueError, TypeError) as error:
+        flash(f"保存持仓失败：{error}", "error")
+        return redirect(url_for("analysis_portfolio"))
+    flash(f"已保存当前持仓：{stock_code} {stock_name}。", "success")
+    return redirect(url_for("analysis_portfolio"))
+
+
+@app.post("/analysis/portfolio/position/delete")
+def delete_portfolio_position():
+    try:
+        stock_code = normalize_code(request.form.get("stock_code", ""))
+    except ValueError as error:
+        flash(f"删除持仓失败：{error}", "error")
+        return redirect(url_for("analysis_portfolio"))
+    with db_connect() as db:
+        deleted = delete_current_position(db, current_user_id(), stock_code)
+    if deleted:
+        flash(f"已删除当前持仓：{stock_code}。", "success")
+    else:
+        flash(f"未找到持仓：{stock_code}。", "warning")
+    return redirect(url_for("analysis_portfolio"))
+
+
 @app.get("/analysis/portfolio/quotes")
 def portfolio_quotes():
     with db_connect() as db:
@@ -4182,9 +4757,9 @@ def portfolio_kline(stock_code: str):
         abort(404)
     with db_connect() as db:
         position = db.execute(
-            """SELECT p.stock_code, MAX(p.stock_name) stock_name, SUM(p.quantity) quantity,
-            SUM(p.total_cost) total_cost, SUM(p.total_cost) / NULLIF(SUM(p.quantity), 0) avg_cost
-            FROM positions p WHERE p.user_id = ? AND p.stock_code = ? GROUP BY p.stock_code""",
+            """SELECT p.stock_code, p.stock_name, p.quantity,
+            p.quantity * p.avg_cost total_cost, p.avg_cost
+            FROM current_positions p WHERE p.user_id = ? AND p.stock_code = ?""",
             (current_user_id(), stock_code),
         ).fetchone()
         if position is None:
@@ -4213,8 +4788,8 @@ def sync_portfolio_prices():
     user_id = current_user_id()
     with db_connect() as db:
         positions = db.execute(
-            """SELECT stock_code, MIN(buy_date) first_buy_date FROM positions
-            WHERE user_id = ? GROUP BY stock_code ORDER BY stock_code""",
+            """SELECT stock_code, first_buy_date FROM current_positions
+            WHERE user_id = ? ORDER BY stock_code""",
             (user_id,),
         ).fetchall()
         if not positions:
@@ -4243,7 +4818,7 @@ def sync_portfolio_realtime():
         stock_codes = [
             row["stock_code"]
             for row in db.execute(
-                "SELECT DISTINCT stock_code FROM positions WHERE user_id = ? ORDER BY stock_code",
+                "SELECT stock_code FROM current_positions WHERE user_id = ? ORDER BY stock_code",
                 (current_user_id(),),
             ).fetchall()
         ]
@@ -4263,7 +4838,7 @@ def sync_portfolio_history():
         stock_codes = [
             row["stock_code"]
             for row in db.execute(
-                "SELECT DISTINCT stock_code FROM positions WHERE user_id = ? ORDER BY stock_code",
+                "SELECT stock_code FROM current_positions WHERE user_id = ? ORDER BY stock_code",
                 (current_user_id(),),
             ).fetchall()
         ]
@@ -4416,6 +4991,7 @@ def three_day_dip_management():
     end_date = request.args.get("end_date", "").strip()
     with db_connect() as db:
         alert_type, params = alert_type_data(db)
+        effectiveness = alert_effectiveness_data(db, current_user_id(), alert_type["id"])
         watchlist = db.execute(
             """SELECT stock_code, stock_name FROM watchlist_stocks WHERE user_id = ?
             ORDER BY priority DESC, stock_name COLLATE NOCASE, stock_code""",
@@ -4441,7 +5017,7 @@ def three_day_dip_management():
         "index.html", page="three_day_dip", alert_type=alert_type, alert_params=params,
         alert_watchlist=watchlist,
         selected_stock_code=selected_stock_code, test_start_date=start_date, test_end_date=end_date,
-        backtest=backtest, backtest_error=backtest_error,
+        backtest=backtest, backtest_error=backtest_error, alert_effectiveness=effectiveness,
     )
 
 
@@ -4450,6 +5026,7 @@ def save_three_day_dip_alert_type():
     try:
         params = three_day_dip_params({
             "decline_days": int(request.form.get("decline_days", "2")),
+            "require_bullish_baseline": "require_bullish_baseline" in request.form,
             "require_bearish_candles": "require_bearish_candles" in request.form,
             "require_declining_closes": "require_declining_closes" in request.form,
             "max_signal_low_above_prior_ratio": float(request.form.get("max_signal_low_above_prior_percent", "4")) / 100,
@@ -4491,13 +5068,15 @@ def intraday_rebound_management():
         alert_type, params = intraday_rebound_alert_type_data(db)
         states = db.execute(
             """SELECT watch.stock_code, watch.stock_name, watch.priority, state.trade_date,
-            state.last_matched, state.last_evaluated_at, state.candidate_triggered_at,
+            state.last_status, state.last_evaluated_at, state.candidate_triggered_at,
+            state.confirmation_triggered_at, state.breakout_price,
             quote.price, quote.quote_minute
             FROM watchlist_stocks AS watch
-            LEFT JOIN alert_rule_states AS state ON state.user_id = watch.user_id
+            LEFT JOIN intraday_rebound_states AS state ON state.user_id = watch.user_id
             AND state.stock_code = watch.stock_code
             AND state.alert_type_id = ?
             AND state.trade_date = (SELECT MAX(trade_date) FROM intraday_quotes WHERE stock_code = watch.stock_code)
+            AND state.session = CASE WHEN TIME('now', 'localtime') < '12:00:00' THEN 'AM' ELSE 'PM' END
             LEFT JOIN intraday_quotes AS quote ON quote.stock_code = watch.stock_code
             AND quote.quote_minute = (
                 SELECT MAX(quote_minute) FROM intraday_quotes WHERE stock_code = watch.stock_code
@@ -4510,9 +5089,10 @@ def intraday_rebound_management():
             WHERE user_id = ? AND alert_type_id = ? ORDER BY created_at DESC LIMIT 20""",
             (current_user_id(), alert_type["id"]),
         ).fetchall()
+        effectiveness = alert_effectiveness_data(db, current_user_id(), alert_type["id"])
     return render_template(
         "index.html", page="intraday_rebound", alert_type=alert_type, alert_params=params,
-        intraday_states=states, intraday_notifications=notifications,
+        intraday_states=states, intraday_notifications=notifications, alert_effectiveness=effectiveness,
     )
 
 
@@ -4522,9 +5102,13 @@ def save_intraday_rebound_alert_type():
         params = intraday_rebound_params({
             "lookback_minutes": int(request.form.get("lookback_minutes", "120")),
             "min_drop_ratio": float(request.form.get("min_drop_percent", "2")) / 100,
-            "min_rebound_ratio": float(request.form.get("min_rebound_percent", "0.8")) / 100,
-            "min_trough_age_minutes": int(request.form.get("min_trough_age_minutes", "5")),
-            "min_volume_multiple": float(request.form.get("min_volume_multiple", "1.5")),
+            "min_waterline_drop_ratio": float(request.form.get("min_waterline_drop_percent", "2")) / 100,
+            "candidate_min_rebound_ratio": float(request.form.get("candidate_min_rebound_percent", "0.6")) / 100,
+            "candidate_min_volume_multiple": float(request.form.get("candidate_min_volume_multiple", "1")),
+            "confirmation_min_volume_multiple": float(request.form.get("confirmation_min_volume_multiple", "1.2")),
+            "min_trough_age_minutes": int(request.form.get("min_trough_age_minutes", "3")),
+            "first_bounce_min_ratio": float(request.form.get("first_bounce_min_percent", "0.4")) / 100,
+            "max_entry_rebound_ratio": float(request.form.get("max_entry_rebound_percent", "2")) / 100,
             "enabled": "enabled" in request.form,
         })
         now = datetime.now().isoformat(timespec="seconds")
@@ -4643,8 +5227,9 @@ def notifications():
         page = max(1, int(request.args.get("page", 1)))
     except (TypeError, ValueError):
         page = 1
+    alert_type_code = request.args.get("type", "").strip().upper()
     with db_connect() as db:
-        data = notification_page_data(db, current_user_id(), page)
+        data = notification_page_data(db, current_user_id(), page, alert_type_code=alert_type_code)
     return render_template("index.html", page="notifications", notification_data=data)
 
 

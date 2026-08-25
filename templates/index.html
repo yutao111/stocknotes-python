@@ -59,7 +59,7 @@
             <div class="notification-popup">
               <div class="notification-heading"><div><strong>提醒通知</strong><small id="notification-count-text">{{ unread_notifications }} 条未读</small></div><button id="notification-read-all" type="button" {{ 'disabled' if not unread_notifications else '' }}>全部已读</button></div>
               <div class="notification-list" id="notification-list">
-                {% for item in recent_notifications %}<button class="notification-item {{ 'unread' if not item.read_at else '' }}" type="button" data-id="{{ item.id }}"><span class="notification-stage {{ item.stage|lower }}">{{ '候选' if item.stage == 'CANDIDATE' else '确认' }}</span><span><b>{{ item.title }}</b><small>{{ item.content }}</small><time>{{ item.created_at[:16]|replace('T', ' ') }}</time></span></button>{% else %}<div class="notification-empty">还没有提醒通知。</div>{% endfor %}
+                {% for item in recent_notifications %}<button class="notification-item {{ 'unread' if not item.read_at else '' }}" type="button" data-id="{{ item.id }}"><span class="notification-stage {{ 'limit-up' if item.alert_type_code == 'WATCHLIST_LIMIT_UP' else item.stage|lower }}">{{ '涨停提醒' if item.alert_type_code == 'WATCHLIST_LIMIT_UP' else ('候选' if item.stage == 'CANDIDATE' else '确认') }}</span><span><b>{{ item.title }}</b><small>{{ item.content }}</small><time>{{ item.created_at[:16]|replace('T', ' ') }}</time></span></button>{% else %}<div class="notification-empty">还没有提醒通知。</div>{% endfor %}
               </div>
             </div>
           </details>
@@ -88,7 +88,7 @@
           </details>
         </div>
       </header>
-      <script>(function(){var center=document.getElementById('notification-center'),badge=document.getElementById('notification-badge'),count=document.getElementById('notification-count-text'),list=document.getElementById('notification-list'),readAll=document.getElementById('notification-read-all');function esc(value){var node=document.createElement('span');node.textContent=value||'';return node.innerHTML}function render(data){var unread=data.unread_count||0;badge.textContent=unread;badge.hidden=!unread;count.textContent=unread+' 条未读';readAll.disabled=!unread;if(!data.notifications.length){list.innerHTML='<div class="notification-empty">还没有提醒通知。</div>';return}list.innerHTML=data.notifications.map(function(item){return '<button class="notification-item '+(item.read_at?'':'unread')+'" type="button" data-id="'+item.id+'"><span class="notification-stage '+item.stage.toLowerCase()+'">'+(item.stage==='CANDIDATE'?'候选':'确认')+'</span><span><b>'+esc(item.title)+'</b><small>'+esc(item.content)+'</small><time>'+esc(item.created_at.slice(0,16).replace('T',' '))+'</time></span></button>'}).join('')}function refresh(){fetch('{{ url_for("notifications_api") }}').then(function(response){if(response.ok)return response.json();throw new Error()}).then(render).catch(function(){})}list.addEventListener('click',function(event){var item=event.target.closest('.notification-item');if(!item||!item.classList.contains('unread'))return;fetch('/api/notifications/'+item.dataset.id+'/read',{method:'POST'}).then(refresh)});readAll.addEventListener('click',function(){fetch('{{ url_for("read_all_notifications") }}',{method:'POST'}).then(refresh)});center.addEventListener('toggle',function(){if(center.open)refresh()});setInterval(refresh,20000)}());</script>
+      <script>(function(){var center=document.getElementById('notification-center'),badge=document.getElementById('notification-badge'),count=document.getElementById('notification-count-text'),list=document.getElementById('notification-list'),readAll=document.getElementById('notification-read-all');function esc(value){var node=document.createElement('span');node.textContent=value||'';return node.innerHTML}function render(data){var unread=data.unread_count||0;badge.textContent=unread;badge.hidden=!unread;count.textContent=unread+' 条未读';readAll.disabled=!unread;if(!data.notifications.length){list.innerHTML='<div class="notification-empty">还没有提醒通知。</div>';return}list.innerHTML=data.notifications.map(function(item){var limitUp=item.alert_type_code==='WATCHLIST_LIMIT_UP',stageClass=limitUp?'limit-up':item.stage.toLowerCase(),stageLabel=limitUp?'涨停提醒':(item.stage==='CANDIDATE'?'候选':'确认');return '<button class="notification-item '+(item.read_at?'':'unread')+'" type="button" data-id="'+item.id+'"><span class="notification-stage '+stageClass+'">'+stageLabel+'</span><span><b>'+esc(item.title)+'</b><small>'+esc(item.content)+'</small><time>'+esc(item.created_at.slice(0,16).replace('T',' '))+'</time></span></button>'}).join('')}function refresh(){fetch('{{ url_for("notifications_api") }}').then(function(response){if(response.ok)return response.json();throw new Error()}).then(render).catch(function(){})}list.addEventListener('click',function(event){var item=event.target.closest('.notification-item');if(!item||!item.classList.contains('unread'))return;fetch('/api/notifications/'+item.dataset.id+'/read',{method:'POST'}).then(refresh)});readAll.addEventListener('click',function(){fetch('{{ url_for("read_all_notifications") }}',{method:'POST'}).then(refresh)});center.addEventListener('toggle',function(){if(center.open)refresh()});setInterval(refresh,20000)}());</script>
       <script>
       window.renderUnifiedKline = function(element, payload, options) {
         options = options || {};
@@ -198,7 +198,7 @@
           {% if detail.position %}
           {% set cp = detail.position %}
           <section class="current-position-card" id="current-position">
-            <div class="current-position-head"><div><span class="eyebrow">OPEN POSITION</span><h3>当前持仓</h3></div>{% if cp.open_episode_id %}<a class="detail-link" href="{{ url_for('analysis_trade_detail', episode_id=cp.open_episode_id, sort=stock_sort, q=stock_query) }}">查看成交与交易计划 →</a>{% endif %}</div>
+            <div class="current-position-head"><div><span class="eyebrow">OPEN POSITION</span><h3>当前持仓</h3></div></div>
             <div class="current-position-grid">
               <div><span>持仓数量</span><b>{{ cp.quantity|money }} 股</b></div><div><span>含费持仓成本</span><b>{{ cp.total_cost|money }} 元</b></div><div><span>成本均价</span><b>{{ cp.avg_cost|money }}</b></div><div><span>持仓天数</span><b>{{ cp.holding_days }} 天</b></div>
               <div><span>最近收盘价</span>{% if cp.latest_price is not none %}<b>{{ cp.latest_price|money }}</b><small>{{ cp.price_date }}</small>{% else %}<b>暂无行情</b>{% endif %}</div><div><span>浮动盈亏</span>{% if cp.unrealized_profit is not none %}<b class="{{ 'gain' if cp.unrealized_profit >= 0 else 'loss' }}">{{ '+' if cp.unrealized_profit > 0 else '' }}{{ cp.unrealized_profit|money }}</b><small>{{ cp.unrealized_rate|percent }}</small>{% else %}<b>--</b>{% endif %}</div>
@@ -680,12 +680,65 @@
              <td>{% if row.unrealized_profit is not none %}<b class="{{ 'gain' if row.unrealized_profit >= 0 else 'loss' }}">{{ '+' if row.unrealized_profit > 0 else '' }}{{ row.unrealized_profit|money }}</b>{% else %}--{% endif %}</td>
             <td>{% if row.unrealized_rate is not none %}<b class="{{ 'gain' if row.unrealized_rate >= 0 else 'loss' }}">{{ row.unrealized_rate|percent }}</b>{% else %}--{% endif %}</td>
             <td><b>{{ row.holding_days }} 天</b><small>{{ row.first_buy_date }} 起</small></td>
-            <td><button class="detail-link kline-popup-trigger" type="button" data-kline-url="{{ url_for('portfolio_kline', stock_code=row.stock_code) }}">看K线 →</button></td>
+            <td class="position-actions"><button class="detail-link kline-popup-trigger" type="button" data-kline-url="{{ url_for('portfolio_kline', stock_code=row.stock_code) }}">看K线 →</button> <button class="detail-link portfolio-edit-trigger" type="button" data-code="{{ row.stock_code }}" data-name="{{ row.stock_name }}" data-quantity="{{ row.quantity }}" data-avg-cost="{{ row.avg_cost }}" data-date="{{ row.first_buy_date }}">编辑</button> <form class="inline-form" method="post" action="{{ url_for('delete_portfolio_position') }}" data-confirm="确认删除当前持仓 {{ row.stock_name }}（{{ row.stock_code }}）？"><input type="hidden" name="stock_code" value="{{ row.stock_code }}"><button class="danger-link" type="submit">删除</button></form></td>
           </tr>
           {% endfor %}
         </tbody></table></div>
-        {% else %}<div class="empty">{{ '当前筛选下没有持仓。' if ps.count else '当前没有持仓。导入交割单后，系统会通过 FIFO 自动计算。' }}</div>{% endif %}
+        {% else %}<div class="empty">{{ '当前筛选下没有持仓。' if ps.count else '当前没有持仓。在下方维护独立持仓后，系统会据此计算市值与浮动盈亏。' }}</div>{% endif %}
       </section>
+
+      <section class="panel" id="portfolio-manage">
+        <div class="portfolio-section-head"><div><span class="eyebrow">MANAGE POSITIONS</span><div class="panel-title">维护独立持仓</div></div><small>当前持仓独立于交割单：导入交割单或重新计算 FIFO 不会改动这里。保存后持仓分析、行情同步与观察状态会据此更新。</small></div>
+        <form method="post" action="{{ url_for('save_portfolio_position') }}" id="portfolio-position-form" class="portfolio-position-form">
+          <div class="portfolio-manage-grid">
+            <label><span>证券代码</span><input id="cp-code" type="text" name="stock_code" placeholder="例如 002156 或 2156" required autocomplete="off"></label>
+            <label><span>证券名称</span><input id="cp-name" type="text" name="stock_name" placeholder="例如 通富微电" required autocomplete="off"></label>
+            <label><span>持仓数量（股）</span><input id="cp-quantity" type="number" name="quantity" min="0.000001" step="any" required></label>
+            <label><span>成本均价（元）</span><input id="cp-avg-cost" type="number" name="avg_cost" min="0.000001" step="any" required></label>
+            <label><span>建仓日期</span><input id="cp-date" type="date" name="first_buy_date" required></label>
+          </div>
+          <div class="import-submit-row">
+            <button class="button" type="submit">保存持仓</button>
+            <button class="button secondary" type="button" id="cp-reset">清空表单</button>
+            <small id="cp-form-state" class="muted-value"></small>
+          </div>
+        </form>
+      </section>
+
+      <script>
+      (function() {
+        var form = document.getElementById('portfolio-position-form');
+        if (!form) return;
+        var code = document.getElementById('cp-code');
+        var name = document.getElementById('cp-name');
+        var quantity = document.getElementById('cp-quantity');
+        var avgCost = document.getElementById('cp-avg-cost');
+        var cpDate = document.getElementById('cp-date');
+        var state = document.getElementById('cp-form-state');
+        function resetForm() {
+          form.reset();
+          state.textContent = '';
+        }
+        document.getElementById('cp-reset').addEventListener('click', resetForm);
+        document.querySelectorAll('.portfolio-edit-trigger').forEach(function(button) {
+          button.addEventListener('click', function() {
+            code.value = button.dataset.code;
+            name.value = button.dataset.name;
+            quantity.value = button.dataset.quantity;
+            avgCost.value = button.dataset.avgCost;
+            cpDate.value = button.dataset.date;
+            state.textContent = '正在编辑 ' + button.dataset.name + '（' + button.dataset.code + '）';
+            document.getElementById('portfolio-manage').scrollIntoView({ behavior: 'smooth', block: 'start' });
+            code.focus();
+          });
+        });
+        document.querySelectorAll('form.inline-form[data-confirm]').forEach(function(form) {
+          form.addEventListener('submit', function(event) {
+            if (!window.confirm(form.dataset.confirm)) event.preventDefault();
+          });
+        });
+      }());
+      </script>
 
       <div class="review-modal-backdrop" id="portfolio-kline-backdrop" hidden>
         <div class="portfolio-kline-modal" role="dialog" aria-modal="true" aria-labelledby="portfolio-kline-title">
@@ -954,21 +1007,27 @@
         <div><span class="eyebrow">NOTIFICATIONS</span><p>查阅全部提醒通知。点击未读通知会自动标记为已读。</p></div>
         <a class="button secondary" href="{{ url_for('alert_types_management') }}">提醒设置 →</a>
       </section>
+      <nav class="notification-filters" aria-label="通知类型筛选">
+        <a class="{{ 'active' if not nd.alert_type_code else '' }}" href="{{ url_for('notifications') }}">全部</a>
+        <a class="{{ 'active' if nd.alert_type_code == 'THREE_DAY_DIP' else '' }}" href="{{ url_for('notifications', type='THREE_DAY_DIP') }}">三日低吸</a>
+        <a class="{{ 'active' if nd.alert_type_code == 'INTRADAY_REBOUND' else '' }}" href="{{ url_for('notifications', type='INTRADAY_REBOUND') }}">日内反弹</a>
+        <a class="{{ 'active' if nd.alert_type_code == 'WATCHLIST_LIMIT_UP' else '' }}" href="{{ url_for('notifications', type='WATCHLIST_LIMIT_UP') }}">日常提醒</a>
+      </nav>
       {% if nd.rows %}
       <section class="panel notification-page-panel">
-        <div class="panel-title">提醒通知 <span class="pill">共 {{ nd.total }} 条 · {{ nd.unread }} 条未读</span></div>
+        <div class="panel-title">提醒通知 <span class="pill">当前 {{ nd.total }} 条 · 全部 {{ nd.unread }} 条未读</span></div>
         <div class="notification-page-list">
           {% for item in nd.rows %}
           <button class="notification-page-item {{ 'unread' if not item.read_at else '' }}" type="button" data-id="{{ item.id }}">
-            <span class="notification-stage {{ item.stage|lower }}">{{ '候选' if item.stage == 'CANDIDATE' else '确认' }}</span>
+            <span class="notification-stage {{ 'limit-up' if item.alert_type_code == 'WATCHLIST_LIMIT_UP' else item.stage|lower }}">{{ '涨停提醒' if item.alert_type_code == 'WATCHLIST_LIMIT_UP' else (item.alert_type_name or ('候选' if item.stage == 'CANDIDATE' else '确认')) }}</span>
             <span class="notification-page-main"><b>{{ item.title }}</b><small>{{ item.content }}</small><span class="notification-page-meta"><span>{{ item.stock_name }} · {{ item.stock_code }}</span><time>{{ item.created_at[:16]|replace('T', ' ') }}</time></span></span>
           </button>
           {% endfor %}
         </div>
-        {% if nd.total_pages > 1 %}<div class="pagination">{% if nd.page > 1 %}<a class="page-link" href="{{ url_for('notifications', page=nd.page - 1) }}">‹ 上一页</a>{% else %}<span class="page-link disabled">‹ 上一页</span>{% endif %}<span class="page-info">第 {{ nd.page }} / {{ nd.total_pages }} 页 · 共 {{ nd.total }} 条</span>{% if nd.page < nd.total_pages %}<a class="page-link" href="{{ url_for('notifications', page=nd.page + 1) }}">下一页 ›</a>{% else %}<span class="page-link disabled">下一页 ›</span>{% endif %}</div>{% endif %}
+        {% if nd.total_pages > 1 %}<div class="pagination">{% if nd.page > 1 %}<a class="page-link" href="{{ url_for('notifications', page=nd.page - 1, type=nd.alert_type_code or None) }}">‹ 上一页</a>{% else %}<span class="page-link disabled">‹ 上一页</span>{% endif %}<span class="page-info">第 {{ nd.page }} / {{ nd.total_pages }} 页 · 共 {{ nd.total }} 条</span>{% if nd.page < nd.total_pages %}<a class="page-link" href="{{ url_for('notifications', page=nd.page + 1, type=nd.alert_type_code or None) }}">下一页 ›</a>{% else %}<span class="page-link disabled">下一页 ›</span>{% endif %}</div>{% endif %}
       </section>
       <script>(function(){var panel=document.querySelector('.notification-page-list');panel.addEventListener('click',function(event){var item=event.target.closest('.notification-page-item');if(!item||!item.classList.contains('unread'))return;fetch('/api/notifications/'+item.dataset.id+'/read',{method:'POST'}).then(function(response){if(response.ok)window.location.reload()})})}());</script>
-      {% else %}<section class="panel"><div class="empty">还没有提醒通知。开启“三日低吸”提醒后，盘中或收盘满足条件时会在这里生成通知。</div></section>{% endif %}
+      {% else %}<section class="panel"><div class="empty">当前筛选下还没有提醒通知。策略信号或重点观察股票达到涨停后，会在这里生成通知。</div></section>{% endif %}
 
       {% elif page == 'summary' %}
        {% set s = data.summary %}{% set es = data.execution_summary %}
@@ -1896,18 +1955,30 @@
           <label class="alert-toggle"><input type="checkbox" name="enabled" {{ 'checked' if alert_type.enabled and alert_params.enabled else '' }}><span><b>启用日内反弹</b><small>应用于所有用户各自的重点观察股票</small></span></label>
           <div class="alert-field-grid">
             <label><span>观察窗口</span><div class="input-suffix"><input name="lookback_minutes" type="number" min="20" max="240" value="{{ alert_params.lookback_minutes }}" required><i>分</i></div></label>
-            <label><span>急跌幅度至少</span><div class="input-suffix"><input name="min_drop_percent" type="number" min="0.1" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.min_drop_ratio * 100) }}" required><i>%</i></div></label>
-            <label><span>低点反弹至少</span><div class="input-suffix"><input name="min_rebound_percent" type="number" min="0.1" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.min_rebound_ratio * 100) }}" required><i>%</i></div></label>
+            <label><span>相对昨收水下至少</span><div class="input-suffix"><input name="min_waterline_drop_percent" type="number" min="0.1" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.min_waterline_drop_ratio * 100) }}" required><i>%</i></div></label>
+            <label><span>局部急跌幅度至少</span><div class="input-suffix"><input name="min_drop_percent" type="number" min="0.1" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.min_drop_ratio * 100) }}" required><i>%</i></div></label>
+            <label><span>早期观察反弹至少</span><div class="input-suffix"><input name="candidate_min_rebound_percent" type="number" min="0.1" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.candidate_min_rebound_ratio * 100) }}" required><i>%</i></div></label>
             <label><span>低点确认等待</span><div class="input-suffix"><input name="min_trough_age_minutes" type="number" min="3" max="30" value="{{ alert_params.min_trough_age_minutes }}" required><i>分</i></div></label>
-            <label><span>突破分钟量比至少</span><input name="min_volume_multiple" type="number" min="0" max="10" step="0.1" value="{{ '%.1f'|format(alert_params.min_volume_multiple) }}" required></label>
+            <label><span>早期观察量比至少</span><input name="candidate_min_volume_multiple" type="number" min="0" max="10" step="0.1" value="{{ '%.1f'|format(alert_params.candidate_min_volume_multiple) }}" required></label>
+            <label><span>结构确认量比至少</span><input name="confirmation_min_volume_multiple" type="number" min="0" max="10" step="0.1" value="{{ '%.1f'|format(alert_params.confirmation_min_volume_multiple) }}" required></label>
+            <label><span>首次反弹幅度至少</span><div class="input-suffix"><input name="first_bounce_min_percent" type="number" min="0.1" max="10" step="0.1" value="{{ '%.1f'|format(alert_params.first_bounce_min_ratio * 100) }}" required><i>%</i></div></label>
+            <label><span>通知时最多已反弹</span><div class="input-suffix"><input name="max_entry_rebound_percent" type="number" min="0.1" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.max_entry_rebound_ratio * 100) }}" required><i>%</i></div></label>
           </div>
           <button class="button" type="submit">保存提醒参数</button>
         </form>
       </section>
+      {% set ae = alert_effectiveness %}
+      <section class="panel alert-backtest-panel">
+        <div class="alert-backtest-head"><div><span class="eyebrow">REAL OUTCOMES</span><div class="panel-title">日内反弹提醒效果</div><p class="hint">只统计真实生成的提醒；早期观察与结构确认分别作为独立事件。</p></div><div class="pill">{{ ae.summary.total }} 个事件</div></div>
+        <div class="backtest-summary">
+          {% for key, label in [('minute_5_return','5分钟'),('minute_10_return','10分钟'),('minute_20_return','20分钟'),('session_close_return','会话收盘')] %}{% set p = ae.performance[key] %}<div class="{{ 'hit' if p.average is not none and p.average > 0 else '' }}"><span>{{ label }}</span><b>{{ p.average|percent if p.average is not none else '--' }}</b><small>{{ p.samples }} 个完整样本{% if p.win_rate is not none %} · 胜率 {{ p.win_rate|percent }}{% endif %}</small></div>{% endfor %}
+        </div>
+        {% if ae.rows %}<div class="table-wrap"><table class="sample-table"><thead><tr><th>信号时间</th><th>证券</th><th>阶段</th><th>信号价</th><th>5分钟</th><th>20分钟</th><th>会话收盘</th></tr></thead><tbody>{% for row in ae.rows %}<tr><td>{{ row.signal_time[:16]|replace('T',' ') }}</td><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ '早期观察' if row.stage == 'CANDIDATE' else '结构确认' }}</td><td>{{ row.signal_price|money }}</td><td>{{ row.minute_5_return|percent if row.minute_5_return is not none else '--' }}</td><td>{{ row.minute_20_return|percent if row.minute_20_return is not none else '--' }}</td><td>{{ row.session_close_return|percent if row.session_close_return is not none else '--' }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="empty">暂无真实日内反弹事件，后续通知会自动进入统计。</div>{% endif %}
+      </section>
       <section class="panel alert-backtest-panel">
         <div class="alert-backtest-head"><div><span class="eyebrow">LIVE WATCH</span><div class="panel-title">重点观察实时状态</div><p class="hint">触发后会在通知中心生成“日内反弹·候选”；当日只提示一次。</p></div></div>
         {% if intraday_states %}
-        <div class="table-wrap"><table class="sample-table"><thead><tr><th>证券</th><th>最新分钟价</th><th>分钟时间</th><th>检测状态</th><th>候选触发时间</th></tr></thead><tbody>{% for row in intraday_states %}<tr><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ row.price|money if row.price is not none else '--' }}</td><td>{{ row.quote_minute[11:16] if row.quote_minute else '--' }}</td><td>{% if row.last_matched %}<span class="pill gain">日内反弹候选</span>{% elif row.last_evaluated_at %}<span class="muted-value">观察中</span>{% else %}<span class="muted-value">等待分钟行情</span>{% endif %}</td><td>{{ row.candidate_triggered_at[11:16] if row.candidate_triggered_at else '--' }}</td></tr>{% endfor %}</tbody></table></div>
+        <div class="table-wrap"><table class="sample-table"><thead><tr><th>证券</th><th>最新分钟价</th><th>分钟时间</th><th>检测状态</th><th>固定突破位</th><th>早期观察</th><th>结构确认</th></tr></thead><tbody>{% for row in intraday_states %}<tr><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ row.price|money if row.price is not none else '--' }}</td><td>{{ row.quote_minute[11:16] if row.quote_minute else '--' }}</td><td>{% if row.last_status %}<span class="pill gain">{{ row.last_status }}</span>{% elif row.last_evaluated_at %}<span class="muted-value">观察中</span>{% else %}<span class="muted-value">等待分钟行情</span>{% endif %}</td><td>{{ row.breakout_price|money if row.breakout_price is not none else '--' }}</td><td>{{ row.candidate_triggered_at[11:16] if row.candidate_triggered_at else '--' }}</td><td>{{ row.confirmation_triggered_at[11:16] if row.confirmation_triggered_at else '--' }}</td></tr>{% endfor %}</tbody></table></div>
         {% else %}<div class="empty">当前用户还没有重点观察股票，请先添加要跟踪的 ETF 或股票。</div>{% endif %}
       </section>
       <section class="panel alert-backtest-panel">
@@ -1955,6 +2026,7 @@
               </div></fieldset>
             </div>
             <div class="alert-check-grid">
+              <label><input type="checkbox" name="require_bullish_baseline" {{ 'checked' if alert_params.require_bullish_baseline else '' }}> 基准日必须收红</label>
               <label><input type="checkbox" name="require_bearish_candles" {{ 'checked' if alert_params.require_bearish_candles else '' }}> 前置交易日必须收阴</label>
               <label><input type="checkbox" name="require_declining_closes" {{ 'checked' if alert_params.require_declining_closes else '' }}> 收盘价必须逐日走低</label>
               <label><input type="checkbox" name="intraday_candidate_enabled" {{ 'checked' if alert_params.intraday_candidate_enabled else '' }}> 发送盘中候选提醒</label>
@@ -1962,6 +2034,14 @@
             </div>
             <button class="button" type="submit">保存提醒参数</button>
           </form>
+      </section>
+      {% set ae = alert_effectiveness %}
+      <section class="panel alert-backtest-panel">
+        <div class="alert-backtest-head"><div><span class="eyebrow">REAL OUTCOMES</span><div class="panel-title">三日低吸提醒效果</div><p class="hint">真实自动通知独立统计，不与手工金标准混合。</p></div><div class="pill">{{ ae.summary.total }} 个事件</div></div>
+        <div class="backtest-summary">
+          {% for key, label in [('day_1_close_return','T+1'),('day_3_close_return','T+3'),('day_5_close_return','T+5'),('day_10_close_return','T+10')] %}{% set p = ae.performance[key] %}<div class="{{ 'hit' if p.average is not none and p.average > 0 else '' }}"><span>{{ label }}</span><b>{{ p.average|percent if p.average is not none else '--' }}</b><small>{{ p.samples }} 个完整样本{% if p.win_rate is not none %} · 胜率 {{ p.win_rate|percent }}{% endif %}</small></div>{% endfor %}
+        </div>
+        {% if ae.rows %}<div class="table-wrap"><table class="sample-table"><thead><tr><th>信号日</th><th>证券</th><th>阶段</th><th>信号价</th><th>T+1</th><th>T+3</th><th>T+5</th></tr></thead><tbody>{% for row in ae.rows %}<tr><td>{{ row.signal_date }}</td><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ '盘中候选' if row.stage == 'CANDIDATE' else '收盘确认' }}</td><td>{{ row.signal_price|money }}</td><td>{{ row.day_1_close_return|percent if row.day_1_close_return is not none else '--' }}</td><td>{{ row.day_3_close_return|percent if row.day_3_close_return is not none else '--' }}</td><td>{{ row.day_5_close_return|percent if row.day_5_close_return is not none else '--' }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="empty">暂无真实三日低吸通知事件，后续候选和确认会自动进入统计。</div>{% endif %}
       </section>
       <section class="panel alert-backtest-panel">
         <div class="alert-backtest-head"><div><span class="eyebrow">HISTORICAL TEST</span><div class="panel-title">重点观察历史命中测试</div><p class="hint">请输入三日形态的开始和截止日期，系统会自动读取开始日期之前的一个交易日作为前收基准。测试只读取已有行情，不生成通知。</p></div>{% if alert_watchlist %}<a class="button secondary" href="{{ url_for('analysis_watchlist') }}">同步历史行情</a>{% endif %}</div>
@@ -1992,7 +2072,7 @@
           {% for hit in backtest.hits %}
           <details class="backtest-hit" open>
             <summary><div><span class="backtest-hit-date">{{ hit.signal_date }}</span><b>{{ {'STRONG_REVERSAL':'强修复型','SHADOW_STOP':'下影止跌型','EXHAUSTION':'衰竭止跌型'}[hit.pattern_type] }}</b></div><div><span>低点修复 <b>{{ '%.1f'|format(hit.repair_ratio * 100) }}%</b></span></div></summary>
-            <div class="backtest-checks"><span class="pass">✓ 前置日收阴</span><span class="pass">✓ 收盘逐日走低</span><span class="pass">✓ 信号日处于前低附近</span><span class="pass">✓ 缩量修复达标</span></div>
+            <div class="backtest-checks"><span class="pass">✓ 基准日收红</span><span class="pass">✓ 前置日收阴</span><span class="pass">✓ 收盘逐日走低</span><span class="pass">✓ 信号日处于前低附近</span><span class="pass">✓ 缩量修复达标</span></div>
             <div class="table-wrap"><table class="backtest-candles"><thead><tr><th>日期</th><th>用途</th><th>开盘</th><th>最高</th><th>最低</th><th>收盘</th></tr></thead><tbody>{% for candle in hit.candles %}<tr><td>{{ candle.trade_date }}</td><td>{% if loop.first %}前收基准{% elif loop.last %}信号日{% else %}第 {{ loop.index - 1 }} 个下跌日{% endif %}</td><td>{{ candle.open|money }}</td><td>{{ candle.high|money }}</td><td>{{ candle.low|money }}</td><td>{{ candle.close|money }}</td></tr>{% endfor %}</tbody></table></div>
           </details>
           {% endfor %}
@@ -2125,7 +2205,7 @@
         {% if ignored %}<details class="errors ignored"><summary>查看 {{ ignored|length }} 条自动忽略的非买卖记录</summary>{% for item in ignored %}<div>{{ item }}</div>{% endfor %}</details>{% endif %}
         {% if errors %}<details class="errors"><summary>查看 {{ errors|length }} 条异常记录（异常行不会导入）</summary>{% for error in errors %}<div>{{ error }}</div>{% endfor %}</details>{% endif %}
         <div class="table-wrap"><table><thead><tr><th>日期</th><th>时间</th><th>代码 / 名称</th><th>操作</th><th>数量</th><th>价格</th><th>成交金额</th></tr></thead><tbody>{% for row in preview %}<tr><td>{{ row.trade_date }}</td><td>{{ row.trade_time }}</td><td><b>{{ row.stock_code }}</b><small>{{ row.stock_name }}</small></td><td><span class="action {{ row.action }}">{{ '买入' if row.action == 'BUY' else '卖出' }}</span></td><td>{{ row.quantity|money }}</td><td>{{ row.deal_price|money }}</td><td>{{ row.deal_amount|money }}</td></tr>{% endfor %}</tbody></table></div>
-        <div class="confirm-import"><div><b>第 3 步：确认写入数据库</b><small>确认后将导入 {{ importable_rows }} 条新记录，并重新计算 FIFO、持仓和盈亏分析。</small></div><form id="confirm-import-form" method="post" action="{{ url_for('confirm_import', job_id=job_id) }}"><button id="confirm-import-button" class="button" type="submit">确认导入 {{ importable_rows }} 条记录</button></form></div>
+        <div class="confirm-import"><div><b>第 3 步：确认写入数据库</b><small>确认后将导入 {{ importable_rows }} 条新记录，并重新计算 FIFO 匹配与盈亏分析。当前持仓为手工维护，不会受影响。</small></div><form id="confirm-import-form" method="post" action="{{ url_for('confirm_import', job_id=job_id) }}"><button id="confirm-import-button" class="button" type="submit">确认导入 {{ importable_rows }} 条记录</button></form></div>
       </section>
       {% endif %}
       <script>

@@ -38,7 +38,18 @@ python3 app.py
 5. On confirm: insert into `executions`, then call `rebuild_fifo()`
 6. `rebuild_fifo()` clears and recalculates all `fifo_matches`, `positions`, `unmatched_sells` from scratch
 
+## Two independent data domains
+
+Current holdings and statement history are fully decoupled:
+
+- **Statement history**: `import_jobs` → `executions` → `fifo_matches` / `positions` / `unmatched_sells` / `trade_episodes`. `positions` is the internal FIFO projection (disposable cache). Used for realized P&L, trade reviews, charts.
+- **Current holdings**: `current_positions` (one row per user+stock, manual only). Edited via `/analysis/portfolio/position` (+ `/delete`). Imports, manual executions, and `/admin/rebuild` NEVER touch it.
+
+`portfolio_analysis_data()`, stock-detail "当前持仓", watchlist `is_held`, `portfolio_kline`, price-sync routes, and `run_auto_realtime_sync()` all read `current_positions`; never `positions`.
+
 ## Important patterns
+
+- **Alert system contract**: Before changing 三日低吸、日内反弹、通知、提醒参数、信号样本或后续收益统计, read `ALERTS.md`; update it with behavior/schema changes and run the full test suite afterward
 
 - **Fingerprint deduplication**: `app.py:293-294` — SHA256 hash of `trade_date|trade_time|stock_code|action|quantity|deal_price|deal_id` prevents duplicate imports
 - **FIFO calculation**: `app.py:305-351` — processes all executions chronologically, maintains per-stock buy queues, matches sells against oldest buys
@@ -52,6 +63,7 @@ python3 app.py
 - Must import `app` module inside `setUpClass` after setting env var
 - Test data uses simplified statements with integer dates like `20260801` that get normalized to `2026-08-01`
 - Chart label placement tests verify collision avoidance logic works (`test_app.py:101-106`)
+- Portfolio/current-holding tests seed `current_positions` via the `/analysis/portfolio/position` route helper `_add_current_position()`; imports alone no longer create holdings
 
 ## Common gotchas
 

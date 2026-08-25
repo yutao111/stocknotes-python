@@ -2,9 +2,9 @@
 set -e
 cd "$(dirname "$0")"
 
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
+if [ ! -d ".venv" ]; then
+    python3 -m venv .venv
 fi
-source venv/bin/activate
-pip install -r requirements.txt
+source .venv/bin/activate
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 python3 app.py
