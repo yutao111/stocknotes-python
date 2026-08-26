@@ -35,7 +35,7 @@
 
 `daily_prices.volume` 的数据库单位固定为“股”，不随 `source` 改变。K 线 JSON 对外输出“手”，并携带 `volume_unit: "lot"`。
 
-数据库版本 `15` 将旧 `tencent-realtime`、`akshare-eastmoney` 日线成交量从“手”迁移为“股”；版本 `17` 使用标准化日线修复仍可追溯的三日低吸样本 candle 和事件量比。缺少对应日线的旧样本不猜测、不伪造单位或量比。
+数据库版本 `15` 将旧 `tencent-realtime`、`akshare-eastmoney` 日线成交量从“手”迁移为“股”；版本 `17` 使用标准化日线修复仍可追溯的三日低吸样本 candle 和事件量比；版本 `18` 对成交额反推确认仍为“手”的腾讯历史日线转为“股”；版本 `19` 回退此前被错误放大 100 倍、且成交额反推确认原本为“股”的腾讯实时日线。版本 `18` 和 `19` 均会再次修复可追溯样本和事件量比。缺少对应日线的旧样本不猜测、不伪造单位或量比。
 
 用途：
 
@@ -66,7 +66,9 @@
 
 ## 3. 交易时间与同步
 
-后台自动行情同步周期为 `30` 秒。
+后台自动行情同步周期为 `5` 秒。
+
+持仓和重点观察页面每 `5` 秒通过短 HTTP 请求读取后台同步完成后的用户隔离快照，顶部通知中心每 `20` 秒读取一次。请求只读取已经写入 SQLite 的行情和通知，不额外访问外部行情源；不用 SSE 长连接，避免多个页面长期占满浏览器对本地 HTTP/1.1 服务的并发连接。旧 `/api/realtime-stream` 地址返回 `204`，使仍打开的旧页面停止 EventSource 自动重连。
 
 自动同步时间：
 
@@ -144,7 +146,7 @@ user_id:alert_type:stock_code:trade_date:stage
 
 ## 4A. 横盘整理企稳
 
-状态：独立提醒类型、收盘确认、历史测试、真实通知事件和日线后续收益为**已实现**。
+状态：独立提醒类型、收盘确认、历史测试、研究样本池、真实通知事件和日线后续收益为**已实现**。
 
 策略代码：`CONSOLIDATION_STABILIZATION`
 
@@ -158,7 +160,7 @@ user_id:alert_type:stock_code:trade_date:stage
 
 ### 4A.1 计算窗口
 
-默认使用横盘前 `10` 个交易日、横盘期 `3` 个交易日和确认日，共 `14` 根日 K。确认日只能使用当日收盘后完整的开高低收和成交量，不产生盘中候选。
+默认使用横盘前 `10` 个交易日、横盘期 `3` 个交易日和确认日，共 `14` 根日 K。横盘前最后 `4` 日作为背景探底窗口，背景区间振幅不得超过 `10%`，且必须出现低于最后横盘区最低价的低点。确认日只能使用当日收盘后完整的开高低收和成交量，不产生盘中候选。
 
 ### 4A.2 横盘与确认
 
@@ -172,11 +174,13 @@ range_ratio = range_high / range_low - 1
 
 默认要求：
 
+- 背景窗口存在低于最后横盘区最低价的探底低点。
+- 背景窗口振幅不超过 `10%`。
 - 横盘区间振幅不超过 `4%`。
 - 确认日收盘价严格高于横盘期最高价。
 - 确认日成交量至少为横盘期平均成交量的 `1.2` 倍。
 
-`daily_prices.volume` 统一保存“股”。腾讯实时和东方财富历史接口返回“手”，写入时乘以 `100`；腾讯历史和新浪历史接口返回“股”，直接写入。K 线 API 输出时统一除以 `100` 转成“手”。`intraday_quotes.volume` 单独保存腾讯当日累计“手”，只用于同源分钟差分和量比。
+`daily_prices.volume` 统一保存“股”。东方财富历史接口返回“手”，写入时乘以 `100`。腾讯实时和腾讯历史接口对不同标的都可能返回“手”或“股”：仅当 `成交额 / 收盘价 / 成交量` 位于 `75–125` 时判定为“手”并乘以 `100`，其余保留原值，避免误改 ETF 等无法可靠由收盘价反推成交股数的记录。新浪历史接口直接写入。K 线 API 输出时统一除以 `100` 转成“手”。`intraday_quotes.volume` 单独保存腾讯当日累计原始单位，只用于同源分钟差分和量比。
 
 探底回收不是硬条件，普通窄幅横盘也可识别。趋势分类只生成标签，不阻止提醒。
 
@@ -316,6 +320,76 @@ user_id, alert_type_id, stock_code, trade_date, session
 user_id:alert_type:stock_code:trade_date:session:trough_minute:stage
 ```
 
+## 5A. 日常提醒配置
+
+状态：**已实现**。
+
+日常提醒设置是全局统一配置，保存于各自 `alert_types` 记录中，对所有本地用户生效；提醒通知仍只发给将该股票放入重点观察池的用户。后台管理的“提醒类型 → 日常提醒”可设置：
+
+- 涨幅提醒开关及阈值，默认 `4%`。
+- 跌幅提醒开关及阈值，默认 `4%`。
+- 涨停提醒开关。
+- 跌停提醒开关。
+
+四种提醒独立评估和去重。例如跌停同时达到跌幅阈值时，会分别生成跌停提醒和跌幅提醒。
+
+## 5B. 涨幅提醒
+
+状态：**已实现**。
+
+策略代码：`WATCHLIST_OPEN_GAIN`
+
+仅检查重点观察池中的股票。实时行情当前价相对昨收的当日涨幅达到或超过配置阈值时生成一条 `CONFIRMED` 通知，默认阈值为 `4%`：
+
+```text
+current_price / previous_close - 1 >= 0.04
+```
+
+昨收或当前价缺失、无效时不提醒。同一用户、股票和交易日最多提醒一次：
+
+```text
+user_id:WATCHLIST_OPEN_GAIN:stock_code:trade_date
+```
+
+通知保存昨收、当前价、当日涨幅和交易日。该提醒独立于日内反弹开关，并与重点观察涨停提醒共同归入通知页面的“日常提醒”。
+
+### 5C. 跌幅提醒
+
+状态：**已实现**。
+
+策略代码：`WATCHLIST_OPEN_LOSS`
+
+仅检查重点观察池中的股票。实时行情当前价相对昨收的当日跌幅达到或超过配置阈值时生成一条 `CONFIRMED` 通知，默认阈值为 `4%`：
+
+```text
+1 - current_price / previous_close >= 0.04
+```
+
+昨收或当前价缺失、无效时不提醒。同一用户、股票和交易日最多提醒一次：
+
+```text
+user_id:WATCHLIST_OPEN_LOSS:stock_code:trade_date
+```
+
+通知保存昨收、当前价、当日跌幅和交易日。该提醒独立于其他策略开关，并归入通知页面的“日常提醒”。
+
+### 5D. 涨停与跌停提醒
+
+策略代码：`WATCHLIST_LIMIT_UP`、`WATCHLIST_LIMIT_DOWN`
+
+仅检查重点观察池中的股票。实时行情源必须返回有效的涨停价或跌停价；当前价达到对应价格时，生成一条 `CONFIRMED` 通知。不会按照固定涨跌幅推算涨停或跌停。
+
+同一用户、股票和交易日每个类型最多提醒一次：
+
+```text
+user_id:WATCHLIST_LIMIT_UP:stock_code:trade_date
+user_id:WATCHLIST_LIMIT_DOWN:stock_code:trade_date
+```
+
+### 5E. 日常提醒页面范围
+
+“日常提醒”筛选只展示本地自然日当天创建的 `WATCHLIST_LIMIT_UP`、`WATCHLIST_LIMIT_DOWN`、`WATCHLIST_OPEN_GAIN` 和 `WATCHLIST_OPEN_LOSS` 通知，时间范围为当天 `00:00`（含）至次日 `00:00`（不含）。历史通知记录和其他提醒类型不删除，也不受该筛选影响。
+
 ## 6. 参数基线
 
 当前生产默认基线：
@@ -342,6 +416,8 @@ user_id:alert_type:stock_code:trade_date:session:trough_minute:stage
 ```json
 {
   "consolidation_days": 3,
+  "setup_lookback_days": 4,
+  "setup_max_range_ratio": 0.10,
   "max_range_ratio": 0.04,
   "trend_lookback_days": 10,
   "trend_threshold_ratio": 0.05,
@@ -362,6 +438,8 @@ user_id:alert_type:stock_code:trade_date:session:trough_minute:stage
 只有成功插入的真实通知才生成事件；重复轮询和未发送的匹配不进入胜率统计。实时行情同步刷新分钟收益，历史日线同步刷新 T+N 收益。
 
 数据库升级会幂等回填仍保留在 `notifications` 中的历史三日低吸和日内反弹通知。回填事件优先使用通知详情或对应分钟行情恢复触发价，并在参数快照中写入 `backfilled: true`；无法可靠恢复触发价的通知跳过，不伪造收益。
+
+三日低吸回填按同一用户、标的、交易日和阶段复用已有实时事件，不因实时行情时间与通知时间相差几秒而重复生成统计事件。
 
 ### 7.1 三日低吸样本
 
@@ -396,7 +474,21 @@ user_id:alert_type:stock_code:trade_date:session:trough_minute:stage
 
 数据不足时使用 `NULL`，不能把不完整窗口当作完整结果。必须保存计算截止日期。
 
-### 7.3 日内反弹样本
+### 7.3 横盘整理企稳样本
+
+状态：**已实现**，复用 `alert_signal_samples` 和 `alert_signal_outcomes`，但必须按 `alert_type_id` 与三日低吸样本隔离展示、扫描和审核。
+
+手工加入和历史扫描分别保存：
+
+- 用户、标的、信号日期和来源。
+- 趋势标签：`DOWN_STABILIZATION`、`UP_CONTINUATION` 或 `NEUTRAL_BREAKOUT`。
+- 完整趋势窗口、横盘期和确认日 K 线。
+- 整理区上下沿、区间振幅、突破量比和前置趋势涨跌。
+- 规则版本、审核状态和备注。
+
+手工样本默认直接确认；历史扫描样本默认待确认。两类样本都以确认日收盘价为基准，复用 T+1、T+3、T+5、T+10 收盘收益、最高收益和最大回撤计算。
+
+### 7.4 日内反弹样本
 
 状态：**已实现**，复用统一表 `alert_signal_events`，不再单独创建策略专属样本表。
 
@@ -413,7 +505,7 @@ user_id:alert_type:stock_code:trade_date:session:trough_minute:stage
 - 参数快照和规则版本。
 - 生成时间。
 
-### 7.4 日内反弹后续收益
+### 7.5 日内反弹后续收益
 
 状态：**已实现**，写入 `alert_signal_event_outcomes`。
 

@@ -30,7 +30,6 @@ class StockNotesTest(unittest.TestCase):
         cls.temp_dir.cleanup()
 
     def setUp(self):
-        self.module.HOT_SECTORS_CACHE.update({"modules": {}, "updated_at": None})
         with self.module.db_connect() as db:
             db.execute("DELETE FROM alert_signal_event_outcomes")
             db.execute("DELETE FROM alert_signal_events")
@@ -54,6 +53,16 @@ class StockNotesTest(unittest.TestCase):
                     self.module.CONSOLIDATION_STABILIZATION_CODE,
                 ),
             )
+            for code, params in (
+                (self.module.WATCHLIST_OPEN_GAIN_CODE, self.module.WATCHLIST_OPEN_GAIN_DEFAULT_PARAMS),
+                (self.module.WATCHLIST_OPEN_LOSS_CODE, self.module.WATCHLIST_OPEN_LOSS_DEFAULT_PARAMS),
+                (self.module.WATCHLIST_LIMIT_UP_CODE, {}),
+                (self.module.WATCHLIST_LIMIT_DOWN_CODE, {}),
+            ):
+                db.execute(
+                    "UPDATE alert_types SET params_json = ?, enabled = 1 WHERE code = ?",
+                    (json.dumps(params), code),
+                )
             db.execute("DELETE FROM account_snapshots")
             db.execute("DELETE FROM watchlist_stocks")
             db.execute("DELETE FROM trade_excursion_metrics")
@@ -1031,6 +1040,55 @@ class StockNotesTest(unittest.TestCase):
             "900003": 345600, "900004": 456700,
         })
 
+    def test_current_positions_schema_migration_allows_optional_fields(self):
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            db.execute("DROP TABLE current_positions")
+            db.execute(
+                """CREATE TABLE current_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    quantity REAL NOT NULL CHECK(quantity > 0),
+                    avg_cost REAL NOT NULL CHECK(avg_cost > 0),
+                    first_buy_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(user_id, stock_code)
+                )"""
+            )
+            db.execute(
+                """INSERT INTO current_positions
+                (user_id, stock_code, stock_name, quantity, avg_cost, first_buy_date, created_at, updated_at)
+                VALUES (?, '002156', '通富微电', 100, 10, '2026-08-01', '2026-08-01', '2026-08-01')""",
+                (user_id,),
+            )
+            db.execute("PRAGMA user_version = 19")
+
+        self.module.init_db()
+        self.module.init_db()
+
+        with self.module.db_connect() as db:
+            columns = {row["name"]: row for row in db.execute("PRAGMA table_info(current_positions)")}
+            row = db.execute("SELECT * FROM current_positions WHERE stock_code = '002156'").fetchone()
+            db.execute(
+                """INSERT INTO current_positions
+                (user_id, stock_code, stock_name, quantity, avg_cost, first_buy_date, created_at, updated_at)
+                VALUES (?, '000001', '平安银行', NULL, NULL, NULL, '2026-08-01', '2026-08-01')""",
+                (user_id,),
+            )
+            index_names = {item["name"] for item in db.execute("PRAGMA index_list(current_positions)")}
+            foreign_key_errors = db.execute("PRAGMA foreign_key_check").fetchall()
+        self.assertEqual(row["quantity"], 100)
+        self.assertEqual(row["avg_cost"], 10)
+        self.assertEqual(row["first_buy_date"], "2026-08-01")
+        self.assertFalse(columns["quantity"]["notnull"])
+        self.assertFalse(columns["avg_cost"]["notnull"])
+        self.assertFalse(columns["first_buy_date"]["notnull"])
+        self.assertIn("idx_current_positions_user", index_names)
+        self.assertEqual(foreign_key_errors, [])
+
     def test_split_menus(self):
         root = self.client.get("/")
         self.assertEqual(root.status_code, 302)
@@ -1205,6 +1263,32 @@ class StockNotesTest(unittest.TestCase):
         self.assertIn("当前持仓", page)
         self.assertNotIn("持仓时间", page)
 
+    def test_portfolio_realtime_sync_refreshes_indexes_in_background(self):
+        self._add_current_position()
+        with patch.object(self.module, "sync_realtime_codes", return_value=(1, [])) as sync, \
+             patch.object(self.module, "refresh_market_indexes_in_background") as refresh, \
+             patch.object(self.module, "sync_market_indexes") as blocking_sync:
+            response = self.client.post(
+                "/analysis/portfolio/sync-realtime",
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+
+        self.assertEqual(response.get_json(), {"message": "已同步 1 条实时行情。", "category": "success"})
+        sync.assert_called_once_with(["002156"])
+        refresh.assert_called_once_with()
+        blocking_sync.assert_not_called()
+
+    def test_realtime_pages_use_short_polling_without_event_source(self):
+        portfolio = self.client.get("/analysis/portfolio").get_data(as_text=True)
+        watchlist = self.client.get("/analysis/watchlist").get_data(as_text=True)
+
+        self.assertNotIn("new EventSource", portfolio)
+        self.assertNotIn("new EventSource", watchlist)
+        self.assertIn("/analysis/portfolio/quotes", portfolio)
+        self.assertIn("/analysis/watchlist/quotes", watchlist)
+        self.assertIn("window.setInterval(refresh, 5000)", portfolio)
+        self.assertIn("window.setInterval(refresh,5000)", watchlist)
+
     def test_current_position_crud_and_validation(self):
         response = self._add_current_position()
         self.assertIn("已保存当前持仓", response.get_data(as_text=True))
@@ -1246,6 +1330,60 @@ class StockNotesTest(unittest.TestCase):
             self.assertIn("保存持仓失败", response.get_data(as_text=True))
             with self.module.db_connect() as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM current_positions").fetchone()[0], 0)
+
+    def test_incomplete_current_position_is_saved_but_excluded_from_calculations(self):
+        response = self._add_current_position(quantity="", avg_cost="", first_buy_date="")
+        page = response.get_data(as_text=True)
+        self.assertIn("已保存当前持仓", page)
+        self.assertIn("1 只资料不完整，不参与汇总", page)
+        self.assertIn("暂无完整持仓", page)
+        self.assertIn('data-quantity=""', page)
+        self.assertIn('data-avg-cost=""', page)
+        self.assertIn('data-date=""', page)
+
+        with self.module.db_connect() as db:
+            row = db.execute("SELECT * FROM current_positions").fetchone()
+            self.assertIsNone(row["quantity"])
+            self.assertIsNone(row["avg_cost"])
+            self.assertIsNone(row["first_buy_date"])
+            db.execute(
+                """INSERT INTO daily_prices
+                (stock_code, trade_date, open, high, low, close, volume, source, fetched_at)
+                VALUES ('002156', '2026-08-21', 11, 12.5, 10.8, 12, 10000, 'test', '2026-08-21T15:01:00')"""
+            )
+
+        quotes = self.client.get("/analysis/portfolio/quotes").get_json()
+        self.assertEqual(quotes["summary"]["count"], 1)
+        self.assertEqual(quotes["summary"]["calculated_count"], 0)
+        self.assertEqual(quotes["summary"]["incomplete_count"], 1)
+        self.assertEqual(quotes["summary"]["total_cost"], 0)
+        self.assertIsNone(quotes["summary"]["total_market_value"])
+        self.assertIsNone(quotes["positions"][0]["unrealized_profit"])
+
+        stock_page = self.client.get("/analysis/stocks?code=002156").get_data(as_text=True)
+        self.assertIn("当前持仓", stock_page)
+        self.assertIn("通富微电 · 002156", stock_page)
+        kline = self.client.get("/analysis/portfolio/kline/002156").get_json()
+        self.assertIsNone(kline["avg_cost"])
+
+        self._add_current_position(quantity="100", avg_cost="10", first_buy_date="2026-08-01")
+        with self.module.db_connect() as db:
+            row = db.execute("SELECT quantity, avg_cost, first_buy_date FROM current_positions").fetchone()
+            self.assertEqual(tuple(row), (100, 10, "2026-08-01"))
+        self._add_current_position(quantity="", avg_cost="", first_buy_date="")
+        with self.module.db_connect() as db:
+            row = db.execute("SELECT quantity, avg_cost, first_buy_date FROM current_positions").fetchone()
+            self.assertEqual(tuple(row), (None, None, None))
+
+    def test_incomplete_current_position_sync_uses_default_history_window(self):
+        self._add_current_position(quantity="", avg_cost="", first_buy_date="")
+        expected_start = (date.today() - timedelta(days=100)).isoformat()
+        with patch.object(self.module, "sync_daily_prices", return_value=5) as sync:
+            response = self.client.post("/analysis/portfolio/sync-prices", follow_redirects=True)
+        self.assertIn("已为 1 只持仓同步 5 条日线行情", response.get_data(as_text=True))
+        sync.assert_called_once_with(
+            unittest.mock.ANY, "002156", expected_start, date.today().isoformat(),
+        )
 
     def test_current_position_user_isolation(self):
         self._add_current_position()
@@ -1418,7 +1556,7 @@ class StockNotesTest(unittest.TestCase):
         with self.module.db_connect() as db:
             price = db.execute("SELECT * FROM daily_prices WHERE stock_code = '002156'").fetchone()
         self.assertEqual(price["close"], 11.5)
-        self.assertEqual(price["volume"], 100000.0)
+        self.assertEqual(price["volume"], 1000.0)
         self.assertEqual(price["source"], "tencent-realtime")
 
     def _intraday_rebound_sample(self):
@@ -1562,6 +1700,32 @@ class StockNotesTest(unittest.TestCase):
             event = db.execute("SELECT * FROM alert_signal_events").fetchone()
         self.assertEqual(event["signal_price"], 10.5)
         self.assertTrue(json.loads(event["params_json"])["backfilled"])
+
+    def test_alert_signal_event_backfill_reuses_same_day_three_day_event(self):
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            alert_type_id = db.execute(
+                "SELECT id FROM alert_types WHERE code = ?", (self.module.THREE_DAY_DIP_CODE,)
+            ).fetchone()["id"]
+            self.module.upsert_alert_signal_event(
+                db, user_id, alert_type_id, "000001", "平安银行", "CANDIDATE", "2026-08-20T14:29:57",
+                10.5, self.module.THREE_DAY_DIP_RULE_VERSION, {}, {},
+            )
+            db.execute(
+                """INSERT INTO notifications
+                (user_id, alert_type_id, stock_code, stock_name, stage, title, content,
+                 details_json, quote_time, created_at, dedupe_key)
+                VALUES (?, ?, '000001', '平安银行', 'CANDIDATE', '历史提醒', '历史内容',
+                ?, '2026-08-20T14:30:00', '2026-08-20T14:30:00', 'backfill-same-day-test')""",
+                (user_id, alert_type_id, json.dumps({"price": 10.5})),
+            )
+            self.assertEqual(self.module.backfill_alert_signal_events(db), 0)
+            events = db.execute(
+                """SELECT * FROM alert_signal_events
+                WHERE stock_code = '000001' AND signal_date = '2026-08-20'"""
+            ).fetchall()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["signal_time"], "2026-08-20T14:29:57")
 
     def test_intraday_rebound_does_not_cross_lunch_break(self):
         morning = self._intraday_rebound_sample()
@@ -1756,6 +1920,8 @@ class StockNotesTest(unittest.TestCase):
         result = self.module.evaluate_consolidation_stabilization(prices)
         self.assertTrue(result["matched"])
         self.assertEqual(result["pattern_type"], "DOWN_STABILIZATION")
+        self.assertTrue(result["setup_ok"])
+        self.assertAlmostEqual(result["setup_range_ratio"], 22.35 / 20.81 - 1)
         self.assertEqual(result["signal"]["trade_date"], "2026-06-18")
         self.assertAlmostEqual(result["range_high"], 22.28)
         self.assertAlmostEqual(result["range_ratio"], 22.28 / 21.60 - 1)
@@ -1905,12 +2071,28 @@ class StockNotesTest(unittest.TestCase):
             self._insert_notification(db, user_id, 1, alert_code=self.module.THREE_DAY_DIP_CODE)
             self._insert_notification(db, user_id, 2, alert_code=self.module.INTRADAY_REBOUND_CODE)
             self._insert_notification(db, user_id, 3, alert_code=self.module.WATCHLIST_LIMIT_UP_CODE)
+            self._insert_notification(db, user_id, 4, alert_code=self.module.WATCHLIST_OPEN_GAIN_CODE)
+            self._insert_notification(db, user_id, 5, alert_code=self.module.WATCHLIST_OPEN_LOSS_CODE)
+            self._insert_notification(db, user_id, 6, alert_code=self.module.WATCHLIST_LIMIT_DOWN_CODE)
+            today = datetime.now().date().isoformat()
+            db.execute(
+                "UPDATE notifications SET created_at = ?, quote_time = ? "
+                "WHERE user_id = ? AND title IN (?, ?, ?, ?)",
+                (f"{today}T15:00:00", f"{today}T15:00:00", user_id,
+                 "通知标题 3", "通知标题 4", "通知标题 5", "通知标题 6"),
+            )
 
         all_page = self.client.get("/analysis/notifications").get_data(as_text=True)
         self.assertIn("通知标题 1", all_page)
         self.assertIn("通知标题 2", all_page)
         self.assertIn("通知标题 3", all_page)
+        self.assertIn("通知标题 4", all_page)
+        self.assertIn("通知标题 5", all_page)
+        self.assertIn("通知标题 6", all_page)
         self.assertIn("涨停提醒", all_page)
+        self.assertIn("涨幅提醒", all_page)
+        self.assertIn("跌幅提醒", all_page)
+        self.assertIn("跌停提醒", all_page)
 
         dip_page = self.client.get(
             f"/analysis/notifications?type={self.module.THREE_DAY_DIP_CODE}"
@@ -1919,6 +2101,9 @@ class StockNotesTest(unittest.TestCase):
         self.assertIn("通知标题 1", dip_list)
         self.assertNotIn("通知标题 2", dip_list)
         self.assertNotIn("通知标题 3", dip_list)
+        self.assertNotIn("通知标题 4", dip_list)
+        self.assertNotIn("通知标题 5", dip_list)
+        self.assertNotIn("通知标题 6", dip_list)
         self.assertIn("当前 1 条", dip_page)
 
         rebound_page = self.client.get(
@@ -1928,21 +2113,49 @@ class StockNotesTest(unittest.TestCase):
         self.assertNotIn("通知标题 1", rebound_list)
         self.assertIn("通知标题 2", rebound_list)
         self.assertNotIn("通知标题 3", rebound_list)
+        self.assertNotIn("通知标题 4", rebound_list)
+        self.assertNotIn("通知标题 5", rebound_list)
+        self.assertNotIn("通知标题 6", rebound_list)
 
         daily_page = self.client.get(
-            f"/analysis/notifications?type={self.module.WATCHLIST_LIMIT_UP_CODE}"
+            f"/analysis/notifications?type={self.module.DAILY_ALERTS_FILTER_CODE}"
         ).get_data(as_text=True)
         daily_list = daily_page.split('<div class="notification-page-list">', 1)[1].split("</div>", 1)[0]
         self.assertNotIn("通知标题 1", daily_list)
         self.assertNotIn("通知标题 2", daily_list)
         self.assertIn("通知标题 3", daily_list)
+        self.assertIn("通知标题 4", daily_list)
+        self.assertIn("通知标题 5", daily_list)
+        self.assertIn("通知标题 6", daily_list)
         self.assertIn("日常提醒", daily_page)
-        self.assertIn("当前 1 条", daily_page)
+        self.assertIn("当前 4 条", daily_page)
 
         unknown_page = self.client.get("/analysis/notifications?type=UNKNOWN").get_data(as_text=True)
         self.assertIn("通知标题 1", unknown_page)
         self.assertIn("通知标题 2", unknown_page)
         self.assertIn("通知标题 3", unknown_page)
+        self.assertIn("通知标题 4", unknown_page)
+        self.assertIn("通知标题 5", unknown_page)
+        self.assertIn("通知标题 6", unknown_page)
+
+    def test_daily_notifications_only_show_today(self):
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            self._insert_notification(db, user_id, 1, alert_code=self.module.WATCHLIST_LIMIT_UP_CODE)
+            self._insert_notification(db, user_id, 2, alert_code=self.module.WATCHLIST_OPEN_GAIN_CODE)
+            today = datetime.now().date().isoformat()
+            db.execute(
+                "UPDATE notifications SET created_at = ?, quote_time = ? WHERE title = ?",
+                (f"{today}T00:00:00", f"{today}T00:00:00", "通知标题 2"),
+            )
+
+        page = self.client.get(
+            f"/analysis/notifications?type={self.module.DAILY_ALERTS_FILTER_CODE}"
+        ).get_data(as_text=True)
+        daily_list = page.split('<div class="notification-page-list">', 1)[1].split("</div>", 1)[0]
+        self.assertIn("通知标题 2", daily_list)
+        self.assertNotIn("通知标题 1", daily_list)
+        self.assertIn("当前 1 条", page)
 
     def test_notifications_filter_pagination_preserves_type(self):
         with self.module.db_connect() as db:
@@ -1985,6 +2198,31 @@ class StockNotesTest(unittest.TestCase):
         text = response.get_data(as_text=True)
         self.assertIn("已保存三日低吸提醒参数", text)
         self.assertIn("9.0", text)
+
+    def test_daily_alert_settings_save_global_thresholds_and_switches(self):
+        page = self.client.get("/admin/alert-types/daily-alerts").get_data(as_text=True)
+        self.assertIn("日常提醒设置", page)
+        self.assertIn("跌停提醒", page)
+        response = self.client.post(
+            "/admin/alert-types/daily-alerts",
+            data={"gain_enabled": "on", "gain_threshold_percent": "5.5", "loss_threshold_percent": "3.5", "limit_down_enabled": "on"},
+            follow_redirects=True,
+        )
+        self.assertIn("已保存日常提醒设置", response.get_data(as_text=True))
+        with self.module.db_connect() as db:
+            rows = {
+                row["code"]: row for row in db.execute(
+                    "SELECT code, params_json, enabled FROM alert_types WHERE code IN (?, ?, ?, ?)",
+                    (self.module.WATCHLIST_OPEN_GAIN_CODE, self.module.WATCHLIST_OPEN_LOSS_CODE,
+                     self.module.WATCHLIST_LIMIT_UP_CODE, self.module.WATCHLIST_LIMIT_DOWN_CODE),
+                ).fetchall()
+            }
+        self.assertTrue(rows[self.module.WATCHLIST_OPEN_GAIN_CODE]["enabled"])
+        self.assertFalse(rows[self.module.WATCHLIST_OPEN_LOSS_CODE]["enabled"])
+        self.assertFalse(rows[self.module.WATCHLIST_LIMIT_UP_CODE]["enabled"])
+        self.assertTrue(rows[self.module.WATCHLIST_LIMIT_DOWN_CODE]["enabled"])
+        self.assertAlmostEqual(json.loads(rows[self.module.WATCHLIST_OPEN_GAIN_CODE]["params_json"])["threshold_ratio"], 0.055)
+        self.assertAlmostEqual(json.loads(rows[self.module.WATCHLIST_OPEN_LOSS_CODE]["params_json"])["threshold_ratio"], 0.035)
 
     def test_intraday_rebound_management_menu_and_parameters(self):
         page = self.client.get("/admin/alert-types/intraday-rebound").get_data(as_text=True)
@@ -2056,6 +2294,57 @@ class StockNotesTest(unittest.TestCase):
         self.assertEqual(params["trend_lookback_days"], 12)
         self.assertAlmostEqual(params["max_range_ratio"], 0.05)
         self.assertAlmostEqual(params["min_breakout_volume_ratio"], 1.3)
+
+    def test_consolidation_stabilization_pool_manual_sample_scan_and_review(self):
+        now = "2026-06-25T15:00:00"
+        prices = self._consolidation_stabilization_sample() + [
+            {"trade_date": "2026-06-19", "open": 22.55, "high": 23.20, "low": 22.40, "close": 23.00, "volume": 39000000},
+        ]
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            db.execute(
+                """INSERT INTO watchlist_stocks
+                (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                VALUES (?, '300759', '康龙化成', 3, '', ?, ?)""",
+                (user_id, now, now),
+            )
+            for row in prices:
+                db.execute(
+                    """INSERT INTO daily_prices
+                    (stock_code, trade_date, open, high, low, close, volume, source, fetched_at)
+                    VALUES ('300759', ?, ?, ?, ?, ?, ?, 'test', ?)""",
+                    (row["trade_date"], row["open"], row["high"], row["low"], row["close"], row["volume"], now),
+                )
+
+        response = self.client.post(
+            "/admin/alert-types/consolidation-stabilization/pool",
+            data={"stock_code": "300759", "stock_name": "康龙化成", "signal_date": "2026-06-18", "note": "金标准"},
+            follow_redirects=True,
+        )
+        text = response.get_data(as_text=True)
+        self.assertIn("已加入横盘整理企稳池", text)
+        self.assertIn("下跌企稳", text)
+        self.assertIn("整理区间", text)
+        with self.module.db_connect() as db:
+            sample = db.execute("SELECT * FROM alert_signal_samples").fetchone()
+            outcome = db.execute("SELECT * FROM alert_signal_outcomes").fetchone()
+        self.assertEqual(sample["pattern_type"], "DOWN_STABILIZATION")
+        self.assertEqual(sample["rule_version"], self.module.CONSOLIDATION_STABILIZATION_RULE_VERSION)
+        self.assertAlmostEqual(outcome["day_1_close_return"], 23.00 / 22.51 - 1)
+
+        response = self.client.post(
+            "/admin/alert-types/consolidation-stabilization/pool/scan",
+            data={"start_date": "2026-06-18", "end_date": "2026-06-18"}, follow_redirects=True,
+        )
+        self.assertIn("历史扫描完成，处理 1 个命中样本", response.get_data(as_text=True))
+        self.assertEqual(self.client.post(
+            f"/admin/alert-types/consolidation-stabilization/pool/{sample['id']}/review",
+            data={"review_status": "REJECTED", "note": "复核否决"},
+        ).status_code, 302)
+        with self.module.db_connect() as db:
+            sample = db.execute("SELECT review_status, note FROM alert_signal_samples").fetchone()
+        self.assertEqual(sample["review_status"], "REJECTED")
+        self.assertEqual(sample["note"], "复核否决")
 
     def test_three_day_dip_backtest_finds_hits_without_writing_notifications(self):
         now = "2026-08-15T10:00:00"
@@ -2190,6 +2479,7 @@ class StockNotesTest(unittest.TestCase):
         fields[35] = "11.50/1000/11500"
         fields[36] = "1000"
         fields[47] = "12.10"
+        fields[48] = "9.90"
         payload = ('v_sz002156="' + "~".join(fields) + '";').encode("gbk")
 
         class Response:
@@ -2216,6 +2506,7 @@ class StockNotesTest(unittest.TestCase):
         self.assertEqual(quote["previous_close"], 11.0)
         self.assertEqual(quote["stock_name"], "通富微电")
         self.assertEqual(quote["limit_up"], 12.1)
+        self.assertEqual(quote["limit_down"], 9.9)
 
     def test_fetch_realtime_prices_keeps_quote_when_limit_price_is_invalid(self):
         fields = [""] * 88
@@ -2238,6 +2529,7 @@ class StockNotesTest(unittest.TestCase):
             quote = self.module.fetch_realtime_prices(["002156"])["002156"]
         self.assertEqual(quote["close"], 11.5)
         self.assertIsNone(quote["limit_up"])
+        self.assertIsNone(quote["limit_down"])
 
     def test_watchlist_limit_up_alert_is_daily_and_user_scoped(self):
         now = "2026-08-21T10:15:00"
@@ -2303,6 +2595,217 @@ class StockNotesTest(unittest.TestCase):
             self.assertEqual(self.module.evaluate_watchlist_limit_up_alerts(db, quote), 0)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 0)
 
+    def test_watchlist_open_gain_alert_triggers_at_four_percent_once_per_day_and_user(self):
+        now = "2026-08-21T10:15:00"
+        with self.module.db_connect() as db:
+            first_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            second_id = db.execute("INSERT INTO users (name, created_at) VALUES ('gain-second', ?)", (now,)).lastrowid
+            for user_id in (first_id, second_id):
+                db.execute(
+                    """INSERT INTO watchlist_stocks
+                    (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                    VALUES (?, '002156', '通富微电', 2, '', ?, ?)""",
+                    (user_id, now, now),
+                )
+
+        below = {
+            "002156": {
+                "trade_date": "2026-08-21", "quote_time": now, "open": 9.8,
+                "previous_close": 10.0, "close": 10.399,
+                "fetched_at": now,
+            },
+        }
+        threshold = {"002156": dict(below["002156"], close=10.4)}
+        with self.module.db_connect() as db:
+            self.assertEqual(self.module.evaluate_watchlist_open_gain_alerts(db, below), 0)
+            self.assertEqual(self.module.evaluate_watchlist_open_gain_alerts(db, threshold), 2)
+            self.assertEqual(self.module.evaluate_watchlist_open_gain_alerts(db, threshold), 0)
+            notifications = db.execute(
+                "SELECT user_id, title, content, details_json FROM notifications ORDER BY user_id"
+            ).fetchall()
+        self.assertEqual([row["user_id"] for row in notifications], [first_id, second_id])
+        self.assertTrue(all(row["title"] == "通富微电涨幅达到 4%" for row in notifications))
+        self.assertIn("当日上涨 4.00%", notifications[0]["content"])
+        self.assertAlmostEqual(json.loads(notifications[0]["details_json"])["gain_ratio"], 0.04)
+        self.assertEqual(json.loads(notifications[0]["details_json"])["previous_close"], 10.0)
+
+        next_day = {
+            "002156": dict(
+                threshold["002156"], trade_date="2026-08-24", quote_time="2026-08-24T10:15:00",
+                fetched_at="2026-08-24T10:15:00",
+            ),
+        }
+        with self.module.db_connect() as db:
+            self.assertEqual(self.module.evaluate_watchlist_open_gain_alerts(db, next_day), 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 4)
+
+    def test_watchlist_open_gain_alert_requires_valid_previous_close_and_watch(self):
+        now = "2026-08-21T10:15:00"
+        quotes = {
+            "002156": {
+                "trade_date": "2026-08-21", "quote_time": now, "previous_close": 0, "close": 10.4,
+                "fetched_at": now,
+            },
+            "600000": {
+                "trade_date": "2026-08-21", "quote_time": now, "previous_close": 10.0, "close": 10.4,
+                "fetched_at": now,
+            },
+        }
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            db.execute(
+                """INSERT INTO watchlist_stocks
+                (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                VALUES (?, '002156', '通富微电', 2, '', ?, ?)""",
+                (user_id, now, now),
+            )
+            self.assertEqual(self.module.evaluate_watchlist_open_gain_alerts(db, quotes), 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 0)
+
+    def test_watchlist_open_gain_alert_uses_saved_threshold_and_enabled_switch(self):
+        now = "2026-08-21T10:15:00"
+        quote = {"002156": {
+            "trade_date": "2026-08-21", "quote_time": now, "previous_close": 10.0, "close": 10.5,
+            "fetched_at": now,
+        }}
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            db.execute(
+                """INSERT INTO watchlist_stocks
+                (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                VALUES (?, '002156', '通富微电', 2, '', ?, ?)""",
+                (user_id, now, now),
+            )
+            db.execute(
+                "UPDATE alert_types SET params_json = ?, enabled = 1 WHERE code = ?",
+                (json.dumps({"threshold_ratio": 0.06}), self.module.WATCHLIST_OPEN_GAIN_CODE),
+            )
+            self.assertEqual(self.module.evaluate_watchlist_open_gain_alerts(db, quote), 0)
+            db.execute(
+                "UPDATE alert_types SET params_json = ?, enabled = 0 WHERE code = ?",
+                (json.dumps({"threshold_ratio": 0.04}), self.module.WATCHLIST_OPEN_GAIN_CODE),
+            )
+            self.assertEqual(self.module.evaluate_watchlist_open_gain_alerts(db, quote), 0)
+            db.execute("UPDATE alert_types SET enabled = 1 WHERE code = ?", (self.module.WATCHLIST_OPEN_GAIN_CODE,))
+            self.assertEqual(self.module.evaluate_watchlist_open_gain_alerts(db, quote), 1)
+
+    def test_watchlist_limit_down_alert_is_daily_and_user_scoped(self):
+        now = "2026-08-21T10:15:00"
+        with self.module.db_connect() as db:
+            first_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            second_id = db.execute("INSERT INTO users (name, created_at) VALUES ('limit-down-second', ?)", (now,)).lastrowid
+            for user_id in (first_id, second_id):
+                db.execute(
+                    """INSERT INTO watchlist_stocks
+                    (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                    VALUES (?, '002156', '通富微电', 2, '', ?, ?)""",
+                    (user_id, now, now),
+                )
+        quote = {"002156": {
+            "trade_date": "2026-08-21", "quote_time": now, "close": 9.9,
+            "previous_close": 11.0, "limit_down": 9.9, "fetched_at": now,
+        }}
+        with self.module.db_connect() as db:
+            self.assertEqual(self.module.evaluate_watchlist_limit_down_alerts(db, quote), 2)
+            self.assertEqual(self.module.evaluate_watchlist_limit_down_alerts(db, quote), 0)
+            notifications = db.execute(
+                "SELECT user_id, title, content, details_json FROM notifications ORDER BY user_id"
+            ).fetchall()
+        self.assertEqual([row["user_id"] for row in notifications], [first_id, second_id])
+        self.assertTrue(all(row["title"] == "通富微电达到跌停" for row in notifications))
+        self.assertIn("今日跌停价 9.90 元", notifications[0]["content"])
+        self.assertEqual(json.loads(notifications[0]["details_json"])["limit_down"], 9.9)
+
+        next_day = {"002156": dict(
+            quote["002156"], trade_date="2026-08-24", quote_time="2026-08-24T10:15:00", fetched_at="2026-08-24T10:15:00",
+        )}
+        with self.module.db_connect() as db:
+            self.assertEqual(self.module.evaluate_watchlist_limit_down_alerts(db, next_day), 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 4)
+
+    def test_watchlist_limit_down_alert_requires_explicit_limit_price_and_watch(self):
+        now = "2026-08-21T10:15:00"
+        quotes = {
+            "002156": {"trade_date": "2026-08-21", "quote_time": now, "close": 9.9, "limit_down": None, "fetched_at": now},
+            "600000": {"trade_date": "2026-08-21", "quote_time": now, "close": 9.0, "limit_down": 9.0, "fetched_at": now},
+        }
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            db.execute(
+                """INSERT INTO watchlist_stocks
+                (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                VALUES (?, '002156', '通富微电', 2, '', ?, ?)""",
+                (user_id, now, now),
+            )
+            self.assertEqual(self.module.evaluate_watchlist_limit_down_alerts(db, quotes), 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 0)
+
+    def test_watchlist_open_loss_alert_triggers_at_four_percent_once_per_day_and_user(self):
+        now = "2026-08-21T10:15:00"
+        with self.module.db_connect() as db:
+            first_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            second_id = db.execute("INSERT INTO users (name, created_at) VALUES ('loss-second', ?)", (now,)).lastrowid
+            for user_id in (first_id, second_id):
+                db.execute(
+                    """INSERT INTO watchlist_stocks
+                    (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                    VALUES (?, '002156', '通富微电', 2, '', ?, ?)""",
+                    (user_id, now, now),
+                )
+
+        below_threshold = {
+            "002156": {
+                "trade_date": "2026-08-21", "quote_time": now, "open": 10.1,
+                "previous_close": 10.0, "close": 9.601, "fetched_at": now,
+            },
+        }
+        threshold = {"002156": dict(below_threshold["002156"], close=9.6)}
+        with self.module.db_connect() as db:
+            self.assertEqual(self.module.evaluate_watchlist_open_loss_alerts(db, below_threshold), 0)
+            self.assertEqual(self.module.evaluate_watchlist_open_loss_alerts(db, threshold), 2)
+            self.assertEqual(self.module.evaluate_watchlist_open_loss_alerts(db, threshold), 0)
+            notifications = db.execute(
+                "SELECT user_id, title, content, details_json FROM notifications ORDER BY user_id"
+            ).fetchall()
+        self.assertEqual([row["user_id"] for row in notifications], [first_id, second_id])
+        self.assertTrue(all(row["title"] == "通富微电跌幅达到 4%" for row in notifications))
+        self.assertIn("当日下跌 4.00%", notifications[0]["content"])
+        self.assertAlmostEqual(json.loads(notifications[0]["details_json"])["loss_ratio"], 0.04)
+        self.assertEqual(json.loads(notifications[0]["details_json"])["previous_close"], 10.0)
+
+        next_day = {
+            "002156": dict(
+                threshold["002156"], trade_date="2026-08-24", quote_time="2026-08-24T10:15:00",
+                fetched_at="2026-08-24T10:15:00",
+            ),
+        }
+        with self.module.db_connect() as db:
+            self.assertEqual(self.module.evaluate_watchlist_open_loss_alerts(db, next_day), 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 4)
+
+    def test_watchlist_open_loss_alert_requires_valid_previous_close_and_watch(self):
+        now = "2026-08-21T10:15:00"
+        quotes = {
+            "002156": {
+                "trade_date": "2026-08-21", "quote_time": now, "previous_close": 0, "close": 9.6,
+                "fetched_at": now,
+            },
+            "600000": {
+                "trade_date": "2026-08-21", "quote_time": now, "previous_close": 10.0, "close": 9.6,
+                "fetched_at": now,
+            },
+        }
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            db.execute(
+                """INSERT INTO watchlist_stocks
+                (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                VALUES (?, '002156', '通富微电', 2, '', ?, ?)""",
+                (user_id, now, now),
+            )
+            self.assertEqual(self.module.evaluate_watchlist_open_loss_alerts(db, quotes), 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 0)
+
     def test_kline_volume_converts_standardized_realtime_shares_to_lots(self):
         with self.module.db_connect() as db:
             db.execute(
@@ -2357,6 +2860,90 @@ class StockNotesTest(unittest.TestCase):
         self.assertEqual(row["volume"], 89639600)
         self.assertEqual(self.module.kline_volume_lots(row), 896396)
 
+    def test_tencent_history_volume_is_normalized_only_when_returned_in_lots(self):
+        lots_frame = pd.DataFrame([{
+            "日期": "2026-08-24", "开盘": 69, "最高": 70, "最低": 64, "收盘": 66.76,
+            "成交量": 896396, "成交额": 5992712800,
+        }])
+        shares_frame = pd.DataFrame([{
+            "日期": "2026-08-25", "开盘": 69, "最高": 70, "最低": 64, "收盘": 66.76,
+            "成交量": 89639600, "成交额": 5992712800,
+        }])
+        with self.module.db_connect() as db:
+            self.module.save_daily_prices(
+                db, "000657", lots_frame, "akshare-tencent", "2026-08-24", "2026-08-24",
+            )
+            self.module.save_daily_prices(
+                db, "002156", shares_frame, "akshare-tencent", "2026-08-25", "2026-08-25",
+            )
+            rows = db.execute(
+                "SELECT stock_code, volume FROM daily_prices ORDER BY stock_code"
+            ).fetchall()
+        self.assertEqual(dict(rows), {"000657": 89639600, "002156": 89639600})
+
+    def test_daily_volume_migration_repairs_only_confirmed_tencent_lots_once(self):
+        with self.module.db_connect() as db:
+            db.execute(
+                """INSERT INTO daily_prices
+                (stock_code, trade_date, open, high, low, close, volume, amount, source, fetched_at)
+                VALUES ('000703', '2026-08-24', 19, 20, 18, 19, 1542976, 3006417500,
+                'akshare-tencent', '2026-08-25T10:12:23')"""
+            )
+            db.execute(
+                """INSERT INTO daily_prices
+                (stock_code, trade_date, open, high, low, close, volume, amount, source, fetched_at)
+                VALUES ('002156', '2026-08-24', 19, 20, 18, 19, 154297600, 3006417500,
+                'akshare-tencent', '2026-08-25T10:12:23')"""
+            )
+            db.execute("PRAGMA user_version = 17")
+
+        self.module.init_db()
+        self.module.init_db()
+
+        with self.module.db_connect() as db:
+            volumes = dict(db.execute(
+                "SELECT stock_code, volume FROM daily_prices ORDER BY stock_code"
+            ).fetchall())
+        self.assertEqual(volumes, {"000703": 154297600, "002156": 154297600})
+
+    def test_realtime_daily_volume_migration_reverses_only_confirmed_over_scaling_once(self):
+        with self.module.db_connect() as db:
+            db.execute(
+                """INSERT INTO daily_prices
+                (stock_code, trade_date, open, high, low, close, volume, amount, source, fetched_at)
+                VALUES ('688981', '2026-08-25', 118, 122, 117, 120, 3106434200, 3718701204,
+                'tencent-realtime', '2026-08-25T15:00:30')"""
+            )
+            db.execute(
+                """INSERT INTO daily_prices
+                (stock_code, trade_date, open, high, low, close, volume, amount, source, fetched_at)
+                VALUES ('000703', '2026-08-25', 18, 19, 18, 18.34, 119116800, 2207488955,
+                'tencent-realtime', '2026-08-25T15:00:30')"""
+            )
+            db.execute("PRAGMA user_version = 18")
+
+        self.module.init_db()
+        self.module.init_db()
+
+        with self.module.db_connect() as db:
+            volumes = dict(db.execute(
+                "SELECT stock_code, volume FROM daily_prices ORDER BY stock_code"
+            ).fetchall())
+        self.assertEqual(volumes, {"000703": 119116800, "688981": 31064342})
+
+    def test_realtime_daily_volume_trigger_corrects_legacy_writer_scaling(self):
+        with self.module.db_connect() as db:
+            db.execute(
+                """INSERT INTO daily_prices
+                (stock_code, trade_date, open, high, low, close, volume, amount, source, fetched_at)
+                VALUES ('688981', '2026-08-26', 120, 125, 120, 124, 3386636900, 4155943765,
+                'tencent-realtime', '2026-08-26T14:22:15')"""
+            )
+            volume = db.execute(
+                "SELECT volume FROM daily_prices WHERE stock_code = '688981'"
+            ).fetchone()["volume"]
+        self.assertEqual(volume, 33866369)
+
     def test_three_day_dip_volume_ratio_uses_standardized_daily_shares(self):
         prices = self._exhaustion_sample()
         for row in prices:
@@ -2366,7 +2953,7 @@ class StockNotesTest(unittest.TestCase):
 
         quote = {"000657": {
             "trade_date": "2026-08-24", "open": 69, "high": 70, "low": 64, "close": 66.76,
-            "volume": 896396, "amount": 600000000, "fetched_at": "2026-08-24T15:03:06",
+            "volume": 896396, "amount": 5992712800, "fetched_at": "2026-08-24T15:03:06",
         }}
         with self.module.db_connect() as db:
             self.module.save_realtime_prices(db, quote)
@@ -2445,13 +3032,16 @@ class StockNotesTest(unittest.TestCase):
 
         self.assertEqual([item["code"] for item in indexes], list(self.module.MARKET_INDEXES)[:4])
 
-    def test_portfolio_indexes_api_returns_error_without_name_error(self):
+    def test_portfolio_indexes_api_starts_first_refresh_in_background(self):
         with self.module.MARKET_INDEX_STATE_LOCK:
             self.module.MARKET_INDEX_STATE.update({"data": [], "updated_at": None, "error": None})
-        with patch.object(self.module, "fetch_market_indexes", return_value=[]):
+        with patch.object(self.module, "refresh_market_indexes_in_background") as refresh, \
+             patch.object(self.module, "fetch_market_indexes") as fetch:
             response = self.client.get("/analysis/portfolio/indexes")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["data"], [])
+        refresh.assert_called_once_with()
+        fetch.assert_not_called()
 
     def test_portfolio_indexes_api_returns_cached_indexes_without_waiting_for_refresh(self):
         with self.module.MARKET_INDEX_STATE_LOCK:
@@ -2483,8 +3073,7 @@ class StockNotesTest(unittest.TestCase):
         fetch.assert_not_called()
 
     def test_auto_sync_trading_windows(self):
-        self.assertEqual(self.module.AUTO_REALTIME_SYNC_INTERVAL_SECONDS, 30)
-        self.assertEqual(self.module.HOT_SECTORS_CACHE_TTL_SECONDS, 30)
+        self.assertEqual(self.module.AUTO_REALTIME_SYNC_INTERVAL_SECONDS, 5)
         self.assertFalse(self.module.is_auto_sync_time(datetime(2026, 8, 24, 9, 14)))
         self.assertTrue(self.module.is_auto_sync_time(datetime(2026, 8, 24, 9, 15)))
         self.assertTrue(self.module.is_auto_sync_time(datetime(2026, 8, 24, 11, 30, 59)))
@@ -2508,15 +3097,38 @@ class StockNotesTest(unittest.TestCase):
                     (user_id, stock_code, stock_code, now, now),
                 )
 
-        with patch.object(self.module, "sync_realtime_codes", return_value=(2, [])) as sync:
+        with patch.object(self.module, "sync_realtime_codes", return_value=(2, [])) as sync, \
+             patch.object(self.module, "refresh_market_indexes_in_background") as refresh:
             result = self.module.run_auto_realtime_sync(datetime(2026, 8, 24, 10, 0))
 
         self.assertTrue(result)
         sync.assert_called_once_with(["002156", "300308"])
+        refresh.assert_called_once_with()
         status = self.module.auto_sync_status()
         self.assertEqual(status["last_success_at"], "2026-08-24T10:00:00")
         self.assertEqual(status["last_synced"], 2)
         self.assertIsNone(status["last_error"])
+
+    def test_retired_realtime_stream_stops_existing_event_source_clients(self):
+        self.assertEqual(self.client.get("/api/realtime-stream?view=unknown").status_code, 400)
+        for view in ("portfolio", "watchlist", "notifications"):
+            response = self.client.get(f"/api/realtime-stream?view={view}")
+            self.assertEqual(response.status_code, 204)
+            self.assertEqual(response.get_data(), b"")
+
+    def test_realtime_sync_publishes_update(self):
+        quote = {
+            "002156": {
+                "trade_date": "2026-08-24", "quote_time": "2026-08-24T10:00:00",
+                "open": 10.0, "high": 10.5, "low": 9.9, "close": 10.4,
+                "previous_close": 10.0, "limit_up": 11.0, "volume": 1000,
+                "amount": 10400, "fetched_at": "2026-08-24T10:00:00",
+            },
+        }
+        with patch.object(self.module, "fetch_realtime_prices", return_value=quote), \
+             patch.object(self.module, "publish_realtime_stream_update", wraps=self.module.publish_realtime_stream_update) as publish:
+            self.module.sync_realtime_codes(["002156"])
+        publish.assert_called_once_with()
 
     def test_auto_sync_skips_outside_window_and_empty_watchlist(self):
         with patch.object(self.module, "sync_realtime_codes") as sync:
@@ -2783,151 +3395,6 @@ class StockNotesTest(unittest.TestCase):
         empty = self.client.get("/analysis/stocks?q=不存在").get_data(as_text=True)
         self.assertIn("没有匹配名称或代码的股票", empty)
 
-
-    def test_hot_sectors_page_renders(self):
-        response = self.client.get("/analysis/hot-sectors")
-        self.assertEqual(response.status_code, 200)
-        html = response.get_data(as_text=True)
-        self.assertIn("热门板块", html)
-        self.assertIn("hot-sectors-grid", html)
-        self.assertIn("hot-sectors-refresh", html)
-        self.assertIn("/api/hot-sectors", html)
-
-
-    def test_hot_sectors_df_records_conversion(self):
-        frame = pd.DataFrame([{
-            "排名": 1, "板块名称": "测试板块", "最新价": 9.9,
-            "涨跌幅": float("nan"), "上涨家数": 3, "领涨股票": None,
-        }])
-        records = self.module.df_records(frame, limit=1)
-        self.assertEqual(records[0]["排名"], 1)
-        self.assertEqual(records[0]["板块名称"], "测试板块")
-        self.assertEqual(records[0]["涨跌幅"], None)
-        self.assertEqual(records[0]["上涨家数"], 3)
-        self.assertIsNone(records[0]["领涨股票"])
-        self.assertEqual(self.module.df_records(None), [])
-        self.assertEqual(self.module.df_records(pd.DataFrame()), [])
-
-
-    def test_hot_sectors_normalize_board_frame(self):
-        frame = pd.DataFrame([
-            {"板块": "甲板块", "label": "new_abc", "平均价格": 10.0, "涨跌额": 0.5, "涨跌幅": 5.0,
-             "公司家数": 20, "总成交额": 3.2e9, "股票名称": "A股票", "个股-涨跌幅": 10.0},
-            {"板块": "乙板块", "label": "new_def", "平均价格": 5.0, "涨跌额": -0.2, "涨跌幅": -2.0,
-             "公司家数": 8, "总成交额": 1.1e8, "股票名称": "B股票", "个股-涨跌幅": 3.0},
-        ])
-        normalized = self.module.normalize_board_frame(frame)
-        self.assertEqual(list(normalized["板块名称"]), ["甲板块", "乙板块"])
-        self.assertEqual(normalized.loc[0, "板块代码"], "new_abc")
-        self.assertEqual(normalized.loc[0, "领涨股票"], "A股票")
-        self.assertEqual(normalized.loc[0, "成交额"], 3.2e9)
-        self.assertEqual(normalized.loc[0, "领涨股票-涨跌幅"], 10.0)
-        self.assertTrue(self.module.normalize_board_frame(pd.DataFrame()).empty)
-
-
-    def test_hot_sectors_build_hot_rank_records(self):
-        rank_rows = [
-            {"rank": 1, "code": "688836", "name": "sh688836"},
-            {"rank": 2, "code": "002716", "name": "sz002716"},
-            {"rank": 3, "code": "999999", "name": "sz999999"},
-        ]
-        quotes = {
-            "688836": {"close": 603.08, "previous_close": 672.41},
-            "002716": {"close": 11.46, "previous_close": 10.42},
-        }
-        records = self.module.build_hot_rank_records(rank_rows, quotes)
-        self.assertEqual(len(records), 3)
-        self.assertEqual(records[0]["排名"], 1)
-        self.assertEqual(records[0]["代码"], "688836")
-        self.assertAlmostEqual(records[0]["涨跌幅"], -10.3107, places=3)
-        self.assertAlmostEqual(records[1]["涨跌额"], 1.04, places=2)
-        self.assertIsNone(records[2]["最新价"])
-        self.assertIsNone(records[2]["涨跌幅"])
-
-
-    def test_hot_sectors_api_returns_three_modules(self):
-        industry = pd.DataFrame([{
-            "排名": 1, "板块名称": "小金属", "板块代码": 881101, "最新价": 1200.5,
-            "涨跌额": 45.0, "涨跌幅": 3.9, "总市值": 5.2e11, "换手率": 2.1,
-            "上涨家数": 20, "下跌家数": 3, "领涨股票": "X科技", "领涨股票-涨跌幅": 10.0,
-        }])
-        concept = pd.DataFrame([{
-            "排名": 1, "板块名称": "可控核聚变", "板块代码": 881202, "最新价": 888.8,
-            "涨跌额": -5.5, "涨跌幅": -0.6, "总市值": float("nan"), "换手率": 1.2,
-            "上涨家数": 5, "下跌家数": 9, "领涨股票": None, "领涨股票-涨跌幅": None,
-        }])
-        rank = pd.DataFrame([{
-            "当前排名": 1, "代码": "SZ000665", "股票名称": "湖北广电",
-            "最新价": 5.6, "涨跌额": 0.31, "涨跌幅": 5.9,
-        }])
-        with patch.object(self.module, "fetch_hot_industry", return_value=industry), \
-             patch.object(self.module, "fetch_hot_concept", return_value=concept), \
-             patch.object(self.module, "fetch_hot_rank", return_value=rank):
-            response = self.client.get("/api/hot-sectors?force=1")
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        modules = payload["modules"]
-        self.assertEqual(set(modules), {"industry", "concept", "hot_rank"})
-        self.assertEqual(modules["industry"]["records"][0]["板块代码"], 881101)
-        self.assertIsNone(modules["concept"]["records"][0]["总市值"])
-        self.assertEqual(modules["hot_rank"]["records"][0]["代码"], "SZ000665")
-        self.assertIsNone(modules["industry"]["error"])
-        self.assertIsNone(modules["concept"]["error"])
-        self.assertIsNone(modules["hot_rank"]["error"])
-        self.assertIsNotNone(payload["updated_at"])
-
-
-    def test_hot_sectors_fetches_modules_in_parallel(self):
-        started = threading.Event()
-        release = threading.Event()
-
-        def provider():
-            started.set()
-            self.assertTrue(release.wait(timeout=1))
-            return pd.DataFrame([{"涨跌幅": 1}])
-
-        with patch.object(self.module, "fetch_hot_industry", side_effect=provider) as industry, \
-             patch.object(self.module, "fetch_hot_concept", side_effect=provider) as concept, \
-             patch.object(self.module, "fetch_hot_rank", side_effect=provider) as rank:
-            worker = threading.Thread(target=self.module.hot_sectors_data, kwargs={"force": True})
-            worker.start()
-            self.assertTrue(started.wait(timeout=1))
-            time.sleep(0.05)
-            self.assertEqual(industry.call_count + concept.call_count + rank.call_count, 3)
-            release.set()
-            worker.join(timeout=1)
-            self.assertFalse(worker.is_alive())
-
-
-    def test_hot_sectors_partial_failure_keeps_last_good(self):
-        industry = pd.DataFrame([{"板块名称": "小金属", "涨跌幅": 3.9}])
-        rank = pd.DataFrame([{"代码": "SZ000665", "股票名称": "湖北广电", "最新价": 5.6, "涨跌幅": 5.9}])
-        with patch.object(self.module, "fetch_hot_industry", return_value=industry), \
-             patch.object(self.module, "fetch_hot_concept", return_value=industry), \
-             patch.object(self.module, "fetch_hot_rank", return_value=rank):
-            self.client.get("/api/hot-sectors?force=1")
-        with patch.object(self.module, "fetch_hot_industry", return_value=industry), \
-             patch.object(self.module, "fetch_hot_concept", return_value=industry), \
-             patch.object(self.module, "fetch_hot_rank", side_effect=RuntimeError("接口异常")):
-            payload = self.module.hot_sectors_data(force=True)
-        self.assertEqual(len(payload["modules"]["hot_rank"]["records"]), 1)
-        self.assertIn("人气榜：", payload["modules"]["hot_rank"]["error"])
-        self.assertEqual(len(payload["modules"]["industry"]["records"]), 1)
-        self.assertIsNone(payload["modules"]["industry"]["error"])
-
-
-    def test_hot_sectors_first_failure_surfaces_error(self):
-        self.module.HOT_SECTORS_CACHE.update({"modules": {}, "updated_at": None})
-        with patch.object(self.module, "fetch_hot_industry", side_effect=RuntimeError("网络错误")), \
-             patch.object(self.module, "fetch_hot_concept", return_value=pd.DataFrame()), \
-             patch.object(self.module, "fetch_hot_rank", side_effect=RuntimeError("接口错误")):
-            payload = self.module.hot_sectors_data(force=True)
-        self.assertEqual(payload["modules"]["industry"]["records"], [])
-        self.assertIn("行业板块：", payload["modules"]["industry"]["error"])
-        self.assertEqual(payload["modules"]["concept"]["records"], [])
-        self.assertIsNone(payload["modules"]["concept"]["error"])
-        self.assertEqual(payload["modules"]["hot_rank"]["records"], [])
-        self.assertIn("人气榜：", payload["modules"]["hot_rank"]["error"])
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 
 import certifi
 
-from flask import Flask, abort, flash, g, has_request_context, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, Response, abort, flash, g, has_request_context, jsonify, redirect, render_template, request, send_file, session, url_for
 from openpyxl import load_workbook
 import xlrd
 
@@ -30,7 +30,7 @@ DB_PATH = Path(os.environ.get("STOCKNOTES_DB", BASE_DIR / "stocknotes.db"))
 ALLOWED_EXTENSIONS = {"xlsx", "xls", "csv", "txt"}
 IGNORED_ACTIONS = {"申购配号", "股息入账", "股息红利税补", "指定交易"}
 STATEMENTS_PER_PAGE = 20
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 20
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 DEFAULT_USER_NAME = "yutaoGS"
 MAX_USER_NAME_LENGTH = 50
@@ -44,12 +44,14 @@ REVIEW_JUDGEMENT_RESULTS = ("CORRECT", "PARTIAL", "WRONG")
 PRICE_SYNC_INITIAL_DAYS = 250
 PRICE_SYNC_OVERLAP_DAYS = 7
 PRICE_SYNC_WORKERS = 4
-AUTO_REALTIME_SYNC_INTERVAL_SECONDS = 30
+AUTO_REALTIME_SYNC_INTERVAL_SECONDS = 5
 REALTIME_SYNC_LOCK = threading.Lock()
 AUTO_SYNC_STOP = threading.Event()
 AUTO_SYNC_STATE_LOCK = threading.Lock()
 AUTO_SYNC_START_LOCK = threading.Lock()
 AUTO_SYNC_THREAD = None
+REALTIME_STREAM_CONDITION = threading.Condition()
+REALTIME_STREAM_VERSION = 0
 AUTO_SYNC_STATE = {
     "running": False,
     "last_attempt_at": None,
@@ -64,9 +66,6 @@ MARKET_INDEX_STATE = {"data": [], "updated_at": None, "error": None}
 MARKET_INDEX_CACHE_TTL_SECONDS = 30
 MARKET_INDEX_REFRESH_LOCK = threading.Lock()
 MARKET_INDEX_REFRESHING = False
-HOT_SECTORS_CACHE_LOCK = threading.Lock()
-HOT_SECTORS_CACHE = {"modules": {}, "updated_at": None}
-HOT_SECTORS_CACHE_TTL_SECONDS = 30
 THREE_DAY_DIP_CODE = "THREE_DAY_DIP"
 THREE_DAY_DIP_DEFAULT_PARAMS = {
     "decline_days": 2,
@@ -97,6 +96,8 @@ THREE_DAY_DIP_RULE_VERSION = "three-day-dip-v7"
 CONSOLIDATION_STABILIZATION_CODE = "CONSOLIDATION_STABILIZATION"
 CONSOLIDATION_STABILIZATION_DEFAULT_PARAMS = {
     "consolidation_days": 3,
+    "setup_lookback_days": 4,
+    "setup_max_range_ratio": 0.10,
     "max_range_ratio": 0.04,
     "trend_lookback_days": 10,
     "trend_threshold_ratio": 0.05,
@@ -119,9 +120,17 @@ INTRADAY_REBOUND_DEFAULT_PARAMS = {
 }
 INTRADAY_REBOUND_RULE_VERSION = "intraday-rebound-v2"
 WATCHLIST_LIMIT_UP_CODE = "WATCHLIST_LIMIT_UP"
+WATCHLIST_OPEN_GAIN_CODE = "WATCHLIST_OPEN_GAIN"
+WATCHLIST_OPEN_LOSS_CODE = "WATCHLIST_OPEN_LOSS"
+WATCHLIST_LIMIT_DOWN_CODE = "WATCHLIST_LIMIT_DOWN"
+WATCHLIST_OPEN_GAIN_DEFAULT_PARAMS = {"threshold_ratio": 0.04}
+WATCHLIST_OPEN_LOSS_DEFAULT_PARAMS = {"threshold_ratio": 0.04}
+DAILY_ALERTS_FILTER_CODE = "DAILY_ALERTS"
 NOTIFICATION_FILTER_CODES = {
     THREE_DAY_DIP_CODE, CONSOLIDATION_STABILIZATION_CODE,
-    INTRADAY_REBOUND_CODE, WATCHLIST_LIMIT_UP_CODE,
+    INTRADAY_REBOUND_CODE, WATCHLIST_LIMIT_UP_CODE, WATCHLIST_OPEN_GAIN_CODE, WATCHLIST_OPEN_LOSS_CODE,
+    WATCHLIST_LIMIT_DOWN_CODE,
+    DAILY_ALERTS_FILTER_CODE,
 }
 REVIEW_MAIN_PROBLEMS = (
     "STOCK_SELECTION", "ENTRY_TIMING", "EXIT_TIMING", "POSITION_SIZE",
@@ -247,7 +256,7 @@ def init_db() -> None:
         signal_pool_sql = db.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'alert_signal_samples'"
         ).fetchone()
-        migrate_signal_pool = signal_pool_sql is not None and "SHADOW_STOP" not in signal_pool_sql["sql"]
+        migrate_signal_pool = signal_pool_sql is not None and "DOWN_STABILIZATION" not in signal_pool_sql["sql"]
         if migrate_signal_pool:
             db.execute("DROP INDEX IF EXISTS idx_alert_signal_samples_user_date")
             db.execute("ALTER TABLE alert_signal_outcomes RENAME TO __legacy_alert_signal_outcomes")
@@ -327,9 +336,9 @@ def init_db() -> None:
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 stock_code TEXT NOT NULL,
                 stock_name TEXT NOT NULL,
-                quantity REAL NOT NULL CHECK(quantity > 0),
-                avg_cost REAL NOT NULL CHECK(avg_cost > 0),
-                first_buy_date TEXT NOT NULL,
+                quantity REAL CHECK(quantity IS NULL OR quantity > 0),
+                avg_cost REAL CHECK(avg_cost IS NULL OR avg_cost > 0),
+                first_buy_date TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(user_id, stock_code)
@@ -561,7 +570,10 @@ def init_db() -> None:
                 stock_code TEXT NOT NULL,
                 stock_name TEXT NOT NULL,
                 signal_date TEXT NOT NULL,
-                pattern_type TEXT NOT NULL CHECK(pattern_type IN ('EXHAUSTION', 'SHADOW_STOP', 'STRONG_REVERSAL')),
+                pattern_type TEXT NOT NULL CHECK(pattern_type IN (
+                    'EXHAUSTION', 'SHADOW_STOP', 'STRONG_REVERSAL',
+                    'DOWN_STABILIZATION', 'UP_CONTINUATION', 'NEUTRAL_BREAKOUT'
+                )),
                 source TEXT NOT NULL CHECK(source IN ('AUTO', 'MANUAL')),
                 review_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(review_status IN ('PENDING', 'CONFIRMED', 'REJECTED')),
                 rule_version TEXT NOT NULL,
@@ -692,6 +704,30 @@ def init_db() -> None:
         db.execute(
             """INSERT INTO alert_types
             (code, name, signal_side, description, params_json, sample_json, enabled, created_at, updated_at)
+            VALUES (?, '涨幅提醒', 'NEUTRAL', '重点观察股票当前价较昨收上涨达到设定阈值时提醒。', ?, '{}', 1, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+            name = excluded.name, description = excluded.description""",
+            (WATCHLIST_OPEN_GAIN_CODE, json.dumps(WATCHLIST_OPEN_GAIN_DEFAULT_PARAMS), now, now),
+        )
+        db.execute(
+            """INSERT INTO alert_types
+            (code, name, signal_side, description, params_json, sample_json, enabled, created_at, updated_at)
+            VALUES (?, '跌幅提醒', 'NEUTRAL', '重点观察股票当前价较昨收下跌达到设定阈值时提醒。', ?, '{}', 1, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+            name = excluded.name, description = excluded.description""",
+            (WATCHLIST_OPEN_LOSS_CODE, json.dumps(WATCHLIST_OPEN_LOSS_DEFAULT_PARAMS), now, now),
+        )
+        db.execute(
+            """INSERT INTO alert_types
+            (code, name, signal_side, description, params_json, sample_json, enabled, created_at, updated_at)
+            VALUES (?, '重点观察跌停提醒', 'NEUTRAL', '重点观察股票当日首次达到行情源跌停价时提醒。', '{}', '{}', 1, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+            name = excluded.name, description = excluded.description""",
+            (WATCHLIST_LIMIT_DOWN_CODE, now, now),
+        )
+        db.execute(
+            """INSERT INTO alert_types
+            (code, name, signal_side, description, params_json, sample_json, enabled, created_at, updated_at)
             VALUES (?, '日内反弹', 'BUY', '急跌后形成更高低点，并放量突破第一波反弹高点。', ?, ?, 1, ?, ?)
             ON CONFLICT(code) DO NOTHING""",
             (
@@ -715,6 +751,61 @@ def init_db() -> None:
             )
         if previous_schema_version < 17:
             repair_stored_alert_volumes(db)
+        if previous_schema_version < 18:
+            normalize_stored_daily_volumes(db)
+            repair_stored_alert_volumes(db)
+        if previous_schema_version < 19:
+            normalize_stored_realtime_daily_volumes(db)
+            repair_stored_alert_volumes(db)
+        current_position_columns = {
+            column["name"]: column for column in db.execute("PRAGMA table_info(current_positions)")
+        }
+        if any(current_position_columns[name]["notnull"] for name in ("quantity", "avg_cost", "first_buy_date")):
+            db.execute(
+                """CREATE TABLE __current_positions_v20 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    quantity REAL CHECK(quantity IS NULL OR quantity > 0),
+                    avg_cost REAL CHECK(avg_cost IS NULL OR avg_cost > 0),
+                    first_buy_date TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(user_id, stock_code)
+                )"""
+            )
+            db.execute(
+                """INSERT INTO __current_positions_v20
+                (id, user_id, stock_code, stock_name, quantity, avg_cost, first_buy_date, created_at, updated_at)
+                SELECT id, user_id, stock_code, stock_name, quantity, avg_cost, first_buy_date, created_at, updated_at
+                FROM current_positions"""
+            )
+            db.execute("DROP TABLE current_positions")
+            db.execute("ALTER TABLE __current_positions_v20 RENAME TO current_positions")
+            db.execute(
+                """CREATE INDEX idx_current_positions_user
+                ON current_positions(user_id, stock_code)"""
+            )
+        normalize_stored_realtime_daily_volumes(db)
+        db.execute(
+            """CREATE TRIGGER IF NOT EXISTS normalize_realtime_daily_volume_on_insert
+            AFTER INSERT ON daily_prices
+            WHEN NEW.source = 'tencent-realtime' AND NEW.volume > 0 AND NEW.amount > 0 AND NEW.close > 0
+            AND NEW.amount / NEW.close / NEW.volume BETWEEN 0.0075 AND 0.0125
+            BEGIN
+                UPDATE daily_prices SET volume = volume / 100 WHERE id = NEW.id;
+            END"""
+        )
+        db.execute(
+            """CREATE TRIGGER IF NOT EXISTS normalize_realtime_daily_volume_on_update
+            AFTER UPDATE OF volume, amount, close, source ON daily_prices
+            WHEN NEW.source = 'tencent-realtime' AND NEW.volume > 0 AND NEW.amount > 0 AND NEW.close > 0
+            AND NEW.amount / NEW.close / NEW.volume BETWEEN 0.0075 AND 0.0125
+            BEGIN
+                UPDATE daily_prices SET volume = volume / 100 WHERE id = NEW.id;
+            END"""
+        )
         if needs_migration:
             for table in business_tables:
                 if table not in legacy_columns:
@@ -749,9 +840,17 @@ def init_db() -> None:
                 (new_fingerprint, row["id"]),
             )
         backfill_alert_signal_events(db)
+        db.execute(
+            """DELETE FROM alert_signal_event_outcomes
+            WHERE NOT EXISTS (
+                SELECT 1 FROM alert_signal_events
+                WHERE alert_signal_events.id = alert_signal_event_outcomes.event_id
+            )"""
+        )
         foreign_key_errors = db.execute("PRAGMA foreign_key_check").fetchall()
         if foreign_key_errors:
-            raise sqlite3.IntegrityError(f"数据库迁移外键检查失败：{foreign_key_errors}")
+            details = [tuple(error) for error in foreign_key_errors]
+            raise sqlite3.IntegrityError(f"数据库迁移外键检查失败：{details}")
         db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         db.commit()
     except Exception:
@@ -808,6 +907,18 @@ def to_number(value: object) -> float:
     if text.startswith("(") and text.endswith(")"):
         text = f"-{text[1:-1]}"
     return float(text or 0)
+
+
+def optional_positive_number(value: object, field_name: str) -> float | None:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        number = to_number(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name}格式不正确")
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{field_name}必须大于 0")
+    return number
 
 
 def normalize_date(value: object) -> str:
@@ -1207,22 +1318,25 @@ def upsert_current_position(
     user_id: int,
     stock_code: str,
     stock_name: str,
-    quantity: float,
-    avg_cost: float,
-    first_buy_date: str,
+    quantity: float | None,
+    avg_cost: float | None,
+    first_buy_date: str | None,
 ) -> None:
     stock_code = normalize_code(stock_code)
     stock_name = str(stock_name or "").strip()
     if not stock_name:
         raise ValueError("证券名称为空")
-    if quantity <= 0:
+    if quantity is not None and (not math.isfinite(quantity) or quantity <= 0):
         raise ValueError("持仓数量必须大于 0")
-    if avg_cost <= 0:
+    if avg_cost is not None and (not math.isfinite(avg_cost) or avg_cost <= 0):
         raise ValueError("成本均价必须大于 0")
-    try:
-        first_buy_date = normalize_date(first_buy_date)
-    except (ValueError, TypeError):
-        raise ValueError("建仓日期格式不正确")
+    if first_buy_date is not None and str(first_buy_date).strip():
+        try:
+            first_buy_date = normalize_date(first_buy_date)
+        except (ValueError, TypeError):
+            raise ValueError("建仓日期格式不正确")
+    else:
+        first_buy_date = None
     now = datetime.now().isoformat(timespec="seconds")
     existing = db.execute(
         "SELECT id FROM current_positions WHERE user_id = ? AND stock_code = ?",
@@ -1425,10 +1539,16 @@ def portfolio_analysis_data(db: sqlite3.Connection, user_id: int) -> dict:
     positions = []
     for row in position_rows:
         item = dict(row)
-        item["quantity"] = float(item["quantity"] or 0)
-        item["total_cost"] = float(item["total_cost"] or 0)
-        item["avg_cost"] = float(item["avg_cost"] or 0)
-        item["holding_days"] = max(0, (today - datetime.strptime(item["first_buy_date"], "%Y-%m-%d").date()).days)
+        item["quantity"] = float(item["quantity"]) if item["quantity"] is not None else None
+        item["avg_cost"] = float(item["avg_cost"]) if item["avg_cost"] is not None else None
+        item["calculation_complete"] = all(
+            item[field] is not None for field in ("quantity", "avg_cost", "first_buy_date")
+        )
+        item["total_cost"] = float(item["total_cost"]) if item["calculation_complete"] else None
+        item["holding_days"] = (
+            max(0, (today - datetime.strptime(item["first_buy_date"], "%Y-%m-%d").date()).days)
+            if item["calculation_complete"] else None
+        )
         prices = db.execute(
             """SELECT trade_date, close, fetched_at FROM daily_prices
             WHERE stock_code = ? AND close IS NOT NULL ORDER BY trade_date DESC LIMIT 2""",
@@ -1444,30 +1564,34 @@ def portfolio_analysis_data(db: sqlite3.Connection, user_id: int) -> dict:
         )
         item["price_date"] = price["trade_date"] if price is not None else None
         item["price_fetched_at"] = price["fetched_at"] if price is not None else None
-        if item["latest_price"] is not None:
+        if item["calculation_complete"] and item["latest_price"] is not None:
             item["market_value"] = item["quantity"] * item["latest_price"]
             item["unrealized_profit"] = item["market_value"] - item["total_cost"]
-            item["unrealized_rate"] = item["unrealized_profit"] / item["total_cost"] if item["total_cost"] else 0.0
+            item["unrealized_rate"] = item["unrealized_profit"] / item["total_cost"]
         else:
             item["market_value"] = None
             item["unrealized_profit"] = None
             item["unrealized_rate"] = None
         positions.append(item)
 
-    total_cost = sum(item["total_cost"] for item in positions)
-    priced_positions = [item for item in positions if item["market_value"] is not None]
-    prices_complete = bool(positions) and len(priced_positions) == len(positions)
+    calculated_positions = [item for item in positions if item["calculation_complete"]]
+    total_cost = sum(item["total_cost"] for item in calculated_positions)
+    priced_positions = [item for item in calculated_positions if item["market_value"] is not None]
+    prices_complete = bool(calculated_positions) and len(priced_positions) == len(calculated_positions)
     total_market_value = sum(item["market_value"] for item in priced_positions) if prices_complete else None
     total_unrealized_profit = total_market_value - total_cost if total_market_value is not None else None
     total_unrealized_rate = total_unrealized_profit / total_cost if total_unrealized_profit is not None and total_cost else None
-    positions.sort(key=lambda item: item["total_cost"] or 0, reverse=True)
+    positions.sort(
+        key=lambda item: (item["calculation_complete"], item["total_cost"] or 0), reverse=True,
+    )
     visible_positions = positions
 
     latest_price_date = max((item["price_date"] for item in priced_positions), default=None)
     latest_fetched_at = max((item["price_fetched_at"] for item in priced_positions), default=None)
     return {
         "summary": {
-            "count": len(positions), "total_cost": total_cost,
+            "count": len(positions), "calculated_count": len(calculated_positions),
+            "incomplete_count": len(positions) - len(calculated_positions), "total_cost": total_cost,
             "total_market_value": total_market_value, "unrealized_profit": total_unrealized_profit,
             "unrealized_rate": total_unrealized_rate, "prices_complete": prices_complete,
             "priced_count": len(priced_positions), "price_date": latest_price_date,
@@ -1578,8 +1702,9 @@ def consolidation_stabilization_params(raw: dict | None = None) -> dict:
     if raw:
         params.update(raw)
     params["consolidation_days"] = max(2, min(10, int(params["consolidation_days"])))
+    params["setup_lookback_days"] = max(2, min(8, int(params["setup_lookback_days"])))
     params["trend_lookback_days"] = max(2, min(60, int(params["trend_lookback_days"])))
-    for key in ("max_range_ratio", "trend_threshold_ratio", "min_breakout_volume_ratio"):
+    for key in ("setup_max_range_ratio", "max_range_ratio", "trend_threshold_ratio", "min_breakout_volume_ratio"):
         params[key] = max(0.0, min(10.0, float(params[key])))
     params["enabled"] = bool(params["enabled"])
     return params
@@ -1587,6 +1712,37 @@ def consolidation_stabilization_params(raw: dict | None = None) -> dict:
 
 def daily_volume_shares(candle: dict) -> float:
     return float(candle.get("volume") or 0)
+
+
+def normalize_daily_volume_shares(
+    volume: float | None, amount: float | None, close: float | None, source: str,
+) -> float | None:
+    if volume is None:
+        return None
+    if source == "akshare-eastmoney":
+        return volume * 100
+    if source not in ("akshare-tencent", "tencent-realtime") or not amount or not close or not volume:
+        return volume
+    implied_shares_per_unit = amount / close / volume
+    if 75 <= implied_shares_per_unit <= 125:
+        return volume * 100
+    return volume
+
+
+def normalize_stored_daily_volumes(db: sqlite3.Connection) -> None:
+    db.execute(
+        """UPDATE daily_prices SET volume = volume * 100
+        WHERE source = 'akshare-tencent' AND volume > 0 AND amount > 0 AND close > 0
+        AND amount / close / volume BETWEEN 75 AND 125"""
+    )
+
+
+def normalize_stored_realtime_daily_volumes(db: sqlite3.Connection) -> None:
+    db.execute(
+        """UPDATE daily_prices SET volume = volume / 100
+        WHERE source = 'tencent-realtime' AND volume > 0 AND amount > 0 AND close > 0
+        AND amount / close / volume BETWEEN 0.0075 AND 0.0125"""
+    )
 
 
 def repair_stored_alert_volumes(db: sqlite3.Connection) -> None:
@@ -1658,6 +1814,7 @@ def evaluate_consolidation_stabilization(prices: list[dict], params: dict | None
     trend = candles[:params["trend_lookback_days"]]
     consolidation = candles[params["trend_lookback_days"]:-1]
     signal = candles[-1]
+    setup = trend[-params["setup_lookback_days"]:]
     range_high = max(float(item["high"]) for item in consolidation)
     range_low = min(float(item["low"]) for item in consolidation)
     range_ratio = range_high / range_low - 1 if range_low else 0.0
@@ -1667,6 +1824,10 @@ def evaluate_consolidation_stabilization(prices: list[dict], params: dict | None
     trend_start_close = float(trend[0]["close"])
     trend_end_close = float(trend[-1]["close"])
     trend_change_ratio = trend_end_close / trend_start_close - 1 if trend_start_close else 0.0
+    setup_high = max(float(item["high"]) for item in setup)
+    setup_low = min(float(item["low"]) for item in setup)
+    setup_range_ratio = setup_high / setup_low - 1 if setup_low else 0.0
+    setup_has_lower_low = setup_low < range_low
     if trend_change_ratio <= -params["trend_threshold_ratio"]:
         pattern_type = "DOWN_STABILIZATION"
     elif trend_change_ratio >= params["trend_threshold_ratio"]:
@@ -1674,13 +1835,14 @@ def evaluate_consolidation_stabilization(prices: list[dict], params: dict | None
     else:
         pattern_type = "NEUTRAL_BREAKOUT"
     range_ok = range_ratio <= params["max_range_ratio"]
+    setup_ok = setup_range_ratio <= params["setup_max_range_ratio"] and setup_has_lower_low
     breakout_ok = float(signal["close"]) > range_high
     volume_ok = (
         breakout_volume_ratio is not None
         and breakout_volume_ratio >= params["min_breakout_volume_ratio"]
     )
     return {
-        "matched": range_ok and breakout_ok and volume_ok,
+        "matched": setup_ok and range_ok and breakout_ok and volume_ok,
         "pattern_type": pattern_type,
         "range_ok": range_ok,
         "breakout_ok": breakout_ok,
@@ -1688,6 +1850,11 @@ def evaluate_consolidation_stabilization(prices: list[dict], params: dict | None
         "range_high": range_high,
         "range_low": range_low,
         "range_ratio": range_ratio,
+        "setup_high": setup_high,
+        "setup_low": setup_low,
+        "setup_range_ratio": setup_range_ratio,
+        "setup_has_lower_low": setup_has_lower_low,
+        "setup_ok": setup_ok,
         "average_volume": average_volume,
         "breakout_volume_ratio": breakout_volume_ratio,
         "trend_change_ratio": trend_change_ratio,
@@ -1951,6 +2118,14 @@ def intraday_rebound_alert_type_data(db: sqlite3.Connection) -> tuple[sqlite3.Ro
     return alert_type, params
 
 
+def daily_alert_params(raw_params: dict | None, defaults: dict) -> dict:
+    params = {**defaults, **(raw_params or {})}
+    threshold_ratio = float(params["threshold_ratio"])
+    if not 0 < threshold_ratio <= 1:
+        raise ValueError("涨跌幅阈值必须大于 0 且不超过 100%")
+    return {"threshold_ratio": threshold_ratio}
+
+
 def backtest_three_day_dip(
     db: sqlite3.Connection, stock: sqlite3.Row, start_date: str, end_date: str, params: dict,
 ) -> dict:
@@ -2025,6 +2200,9 @@ def backtest_consolidation_stabilization(
                 "range_high": result["range_high"],
                 "range_low": result["range_low"],
                 "range_ratio": result["range_ratio"],
+                "setup_low": result["setup_low"],
+                "setup_high": result["setup_high"],
+                "setup_range_ratio": result["setup_range_ratio"],
                 "breakout_volume_ratio": result["breakout_volume_ratio"],
                 "trend_change_ratio": result["trend_change_ratio"],
                 "candles": candles,
@@ -2045,6 +2223,15 @@ def three_day_dip_metrics(result: dict) -> dict:
             "pattern_type", "baseline_bullish_ok", "decline_ratio", "signal_low_above_prior_ratio",
             "recovery_range_ratio", "repair_ratio",
             "body_range_ratio", "lower_shadow_body_ratio", "signal_change_ratio", "volume_ratio",
+        )
+    }
+
+
+def consolidation_stabilization_metrics(result: dict) -> dict:
+    return {
+        key: result.get(key) for key in (
+            "pattern_type", "range_high", "range_low", "range_ratio",
+            "breakout_volume_ratio", "trend_change_ratio",
         )
     }
 
@@ -2107,7 +2294,8 @@ def refresh_alert_signal_outcomes(db: sqlite3.Connection, stock_codes: list[str]
 def upsert_alert_signal_sample(
     db: sqlite3.Connection, user_id: int, alert_type_id: int, stock_code: str, stock_name: str,
     candles: list[dict], result: dict, source: str = "AUTO", review_status: str = "PENDING",
-    note: str = "", pattern_type: str | None = None,
+    note: str = "", pattern_type: str | None = None, rule_version: str = THREE_DAY_DIP_RULE_VERSION,
+    metrics: dict | None = None,
 ) -> int:
     now = datetime.now().isoformat(timespec="seconds")
     signal_date = candles[-1]["trade_date"]
@@ -2128,8 +2316,8 @@ def upsert_alert_signal_sample(
         RETURNING id""",
         (
             user_id, alert_type_id, stock_code, stock_name, signal_date, pattern_type, source,
-            review_status, THREE_DAY_DIP_RULE_VERSION,
-            json.dumps(three_day_dip_metrics(result), ensure_ascii=False),
+            review_status, rule_version,
+            json.dumps(metrics if metrics is not None else three_day_dip_metrics(result), ensure_ascii=False),
             json.dumps(candles, ensure_ascii=False), note, now, now,
             now if review_status != "PENDING" else None,
         ),
@@ -2139,12 +2327,14 @@ def upsert_alert_signal_sample(
     return sample_id
 
 
-def alert_signal_pool_data(db: sqlite3.Connection, user_id: int) -> dict:
+def alert_signal_pool_data(db: sqlite3.Connection, user_id: int, alert_type_id: int | None = None) -> dict:
+    type_filter = "AND s.alert_type_id = ?" if alert_type_id is not None else ""
+    arguments = (user_id, alert_type_id) if alert_type_id is not None else (user_id,)
     rows = [dict(row) for row in db.execute(
         """SELECT s.*, o.day_1_close_return, o.day_3_close_return, o.day_5_close_return,
         o.day_10_close_return, o.day_3_max_return, o.day_3_max_drawdown
         FROM alert_signal_samples s LEFT JOIN alert_signal_outcomes o ON o.sample_id = s.id
-        WHERE s.user_id = ? ORDER BY s.signal_date DESC, s.id DESC""", (user_id,)
+        WHERE s.user_id = ? """ + type_filter + " ORDER BY s.signal_date DESC, s.id DESC", arguments
     ).fetchall()]
     for row in rows:
         row["metrics"] = json.loads(row.pop("metrics_json"))
@@ -2310,24 +2500,33 @@ def backfill_alert_signal_events(db: sqlite3.Connection) -> int:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
         params["backfilled"] = True
-        cursor = db.execute(
-            """INSERT OR IGNORE INTO alert_signal_events
-            (user_id, alert_type_id, stock_code, stock_name, signal_date, signal_time, stage,
-             signal_price, rule_version, params_json, metrics_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                row["user_id"], row["alert_type_id"], row["stock_code"], row["stock_name"],
-                signal_time[:10], signal_time, row["stage"], signal_price, rule_version,
-                json.dumps(params, ensure_ascii=False), json.dumps(details, ensure_ascii=False), row["created_at"],
-            ),
-        )
-        if cursor.rowcount:
+        if row["alert_code"] == THREE_DAY_DIP_CODE:
+            event = db.execute(
+                """SELECT id FROM alert_signal_events
+                WHERE user_id = ? AND alert_type_id = ? AND stock_code = ?
+                AND signal_date = ? AND stage = ? ORDER BY id LIMIT 1""",
+                (row["user_id"], row["alert_type_id"], row["stock_code"], signal_time[:10], row["stage"]),
+            ).fetchone()
+        else:
+            event = db.execute(
+                """SELECT id FROM alert_signal_events WHERE user_id = ? AND alert_type_id = ?
+                AND stock_code = ? AND signal_time = ? AND stage = ?""",
+                (row["user_id"], row["alert_type_id"], row["stock_code"], signal_time, row["stage"]),
+            ).fetchone()
+        if event is None:
+            cursor = db.execute(
+                """INSERT INTO alert_signal_events
+                (user_id, alert_type_id, stock_code, stock_name, signal_date, signal_time, stage,
+                 signal_price, rule_version, params_json, metrics_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    row["user_id"], row["alert_type_id"], row["stock_code"], row["stock_name"],
+                    signal_time[:10], signal_time, row["stage"], signal_price, rule_version,
+                    json.dumps(params, ensure_ascii=False), json.dumps(details, ensure_ascii=False), row["created_at"],
+                ),
+            )
+            event = {"id": cursor.lastrowid}
             inserted += 1
-        event = db.execute(
-            """SELECT id FROM alert_signal_events WHERE user_id = ? AND alert_type_id = ?
-            AND stock_code = ? AND signal_time = ? AND stage = ?""",
-            (row["user_id"], row["alert_type_id"], row["stock_code"], signal_time, row["stage"]),
-        ).fetchone()
         update_alert_signal_event_outcome(db, int(event["id"]))
     return inserted
 
@@ -2397,8 +2596,16 @@ def notification_page_data(
     db: sqlite3.Connection, user_id: int, page: int, per_page: int = 20, alert_type_code: str | None = None,
 ) -> dict:
     alert_type_code = alert_type_code if alert_type_code in NOTIFICATION_FILTER_CODES else None
-    filter_sql = " AND alert.code = ?" if alert_type_code else ""
-    params = (user_id, alert_type_code) if alert_type_code else (user_id,)
+    if alert_type_code == DAILY_ALERTS_FILTER_CODE:
+        today = datetime.now().date()
+        tomorrow = today + timedelta(days=1)
+        filter_sql = " AND alert.code IN (?, ?, ?, ?) AND notification.created_at >= ? AND notification.created_at < ?"
+        params = (user_id, WATCHLIST_LIMIT_UP_CODE, WATCHLIST_OPEN_GAIN_CODE, WATCHLIST_OPEN_LOSS_CODE,
+                  WATCHLIST_LIMIT_DOWN_CODE,
+                  today.isoformat(), tomorrow.isoformat())
+    else:
+        filter_sql = " AND alert.code = ?" if alert_type_code else ""
+        params = (user_id, alert_type_code) if alert_type_code else (user_id,)
     unread = int(db.execute(
         "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL", (user_id,)
     ).fetchone()[0])
@@ -2682,6 +2889,10 @@ def fetch_realtime_prices(stock_codes: list[str]) -> dict[str, dict]:
                 limit_up = float(fields[47]) if len(fields) > 47 and fields[47].strip() else None
             except ValueError:
                 limit_up = None
+            try:
+                limit_down = float(fields[48]) if len(fields) > 48 and fields[48].strip() else None
+            except ValueError:
+                limit_down = None
             quotes[requested_code] = {
                 "stock_name": fields[1].strip(),
                 "trade_date": trade_date,
@@ -2692,6 +2903,7 @@ def fetch_realtime_prices(stock_codes: list[str]) -> dict[str, dict]:
                 "close": float(fields[3]),
                 "previous_close": float(fields[4]),
                 "limit_up": limit_up,
+                "limit_down": limit_down,
                 "volume": float(fields[36]),
                 "amount": float(fields[35].split("/")[2]),
                 "fetched_at": datetime.now().isoformat(timespec="seconds"),
@@ -2742,11 +2954,15 @@ def sync_market_indexes() -> tuple[list[dict], str | None]:
         updated_at = datetime.now().isoformat(timespec="seconds")
         with MARKET_INDEX_STATE_LOCK:
             MARKET_INDEX_STATE.update({"data": indexes, "updated_at": updated_at, "error": None})
+        with AUTO_SYNC_STATE_LOCK:
+            AUTO_SYNC_STATE.update({"indexes_last_success_at": updated_at, "indexes_last_error": None})
         return indexes, None
     except Exception as error:
         message = str(error)
         with MARKET_INDEX_STATE_LOCK:
             MARKET_INDEX_STATE["error"] = message
+        with AUTO_SYNC_STATE_LOCK:
+            AUTO_SYNC_STATE["indexes_last_error"] = message
         return [], message
 
 
@@ -2775,6 +2991,9 @@ def refresh_market_indexes_in_background() -> None:
 
 def save_realtime_prices(db: sqlite3.Connection, quotes: dict[str, dict]) -> int:
     for stock_code, quote in quotes.items():
+        volume = normalize_daily_volume_shares(
+            float(quote["volume"]), float(quote["amount"]), float(quote["close"]), "tencent-realtime",
+        )
         db.execute(
             """INSERT INTO daily_prices
             (stock_code, trade_date, open, high, low, close, volume, amount, source, fetched_at)
@@ -2784,7 +3003,7 @@ def save_realtime_prices(db: sqlite3.Connection, quotes: dict[str, dict]) -> int
             close = excluded.close, volume = excluded.volume, amount = excluded.amount,
             source = excluded.source, fetched_at = excluded.fetched_at""",
             (stock_code, quote["trade_date"], quote["open"], quote["high"], quote["low"],
-             quote["close"], float(quote["volume"]) * 100, quote["amount"], quote["fetched_at"]),
+             quote["close"], volume, quote["amount"], quote["fetched_at"]),
         )
     return len(quotes)
 
@@ -2992,6 +3211,122 @@ def create_watchlist_limit_up_notification(
     return cursor.rowcount > 0
 
 
+def create_watchlist_open_gain_notification(
+    db: sqlite3.Connection, alert_type_id: int, watch: sqlite3.Row, quote: dict, threshold_ratio: float,
+) -> bool:
+    try:
+        previous_close = float(quote["previous_close"])
+        price = float(quote["close"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if previous_close <= 0 or price <= 0:
+        return False
+    gain_ratio = price / previous_close - 1
+    if gain_ratio + 1e-12 < threshold_ratio:
+        return False
+    created_at = datetime.now().isoformat(timespec="seconds")
+    details = {
+        "price": price, "previous_close": previous_close, "gain_ratio": gain_ratio,
+        "trade_date": quote["trade_date"],
+    }
+    dedupe_key = f"{watch['user_id']}:{WATCHLIST_OPEN_GAIN_CODE}:{watch['stock_code']}:{quote['trade_date']}"
+    cursor = db.execute(
+        """INSERT OR IGNORE INTO notifications
+        (user_id, alert_type_id, stock_code, stock_name, stage, title, content,
+         details_json, quote_time, created_at, dedupe_key)
+        VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, ?, ?)""",
+        (
+            watch["user_id"], alert_type_id, watch["stock_code"], watch["stock_name"],
+            f"{watch['stock_name']}涨幅达到 {threshold_ratio * 100:g}%",
+            f"昨收 {previous_close:.2f} 元，当前价 {price:.2f} 元，当日上涨 {gain_ratio * 100:.2f}%。",
+            json.dumps(details, ensure_ascii=False), quote.get("quote_time", quote["fetched_at"]),
+            created_at, dedupe_key,
+        ),
+    )
+    return cursor.rowcount > 0
+
+
+def evaluate_watchlist_open_gain_alerts(db: sqlite3.Connection, quotes: dict[str, dict]) -> int:
+    if not quotes:
+        return 0
+    alert_type = db.execute(
+        "SELECT id, params_json FROM alert_types WHERE code = ? AND enabled = 1", (WATCHLIST_OPEN_GAIN_CODE,)
+    ).fetchone()
+    if alert_type is None:
+        return 0
+    params = daily_alert_params(json.loads(alert_type["params_json"] or "{}"), WATCHLIST_OPEN_GAIN_DEFAULT_PARAMS)
+    placeholders = ",".join("?" for _ in quotes)
+    watches = db.execute(
+        f"""SELECT user_id, stock_code, stock_name FROM watchlist_stocks
+        WHERE stock_code IN ({placeholders}) ORDER BY user_id, stock_code""",
+        tuple(quotes),
+    ).fetchall()
+    return sum(
+        create_watchlist_open_gain_notification(
+            db, alert_type["id"], watch, quotes[watch["stock_code"]], params["threshold_ratio"],
+        )
+        for watch in watches
+    )
+
+
+def create_watchlist_open_loss_notification(
+    db: sqlite3.Connection, alert_type_id: int, watch: sqlite3.Row, quote: dict, threshold_ratio: float,
+) -> bool:
+    try:
+        previous_close = float(quote["previous_close"])
+        price = float(quote["close"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if previous_close <= 0 or price <= 0:
+        return False
+    loss_ratio = 1 - price / previous_close
+    if loss_ratio + 1e-12 < threshold_ratio:
+        return False
+    created_at = datetime.now().isoformat(timespec="seconds")
+    details = {
+        "price": price, "previous_close": previous_close, "loss_ratio": loss_ratio,
+        "trade_date": quote["trade_date"],
+    }
+    dedupe_key = f"{watch['user_id']}:{WATCHLIST_OPEN_LOSS_CODE}:{watch['stock_code']}:{quote['trade_date']}"
+    cursor = db.execute(
+        """INSERT OR IGNORE INTO notifications
+        (user_id, alert_type_id, stock_code, stock_name, stage, title, content,
+         details_json, quote_time, created_at, dedupe_key)
+        VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, ?, ?)""",
+        (
+            watch["user_id"], alert_type_id, watch["stock_code"], watch["stock_name"],
+            f"{watch['stock_name']}跌幅达到 {threshold_ratio * 100:g}%",
+            f"昨收 {previous_close:.2f} 元，当前价 {price:.2f} 元，当日下跌 {loss_ratio * 100:.2f}%。",
+            json.dumps(details, ensure_ascii=False), quote.get("quote_time", quote["fetched_at"]),
+            created_at, dedupe_key,
+        ),
+    )
+    return cursor.rowcount > 0
+
+
+def evaluate_watchlist_open_loss_alerts(db: sqlite3.Connection, quotes: dict[str, dict]) -> int:
+    if not quotes:
+        return 0
+    alert_type = db.execute(
+        "SELECT id, params_json FROM alert_types WHERE code = ? AND enabled = 1", (WATCHLIST_OPEN_LOSS_CODE,)
+    ).fetchone()
+    if alert_type is None:
+        return 0
+    params = daily_alert_params(json.loads(alert_type["params_json"] or "{}"), WATCHLIST_OPEN_LOSS_DEFAULT_PARAMS)
+    placeholders = ",".join("?" for _ in quotes)
+    watches = db.execute(
+        f"""SELECT user_id, stock_code, stock_name FROM watchlist_stocks
+        WHERE stock_code IN ({placeholders}) ORDER BY user_id, stock_code""",
+        tuple(quotes),
+    ).fetchall()
+    return sum(
+        create_watchlist_open_loss_notification(
+            db, alert_type["id"], watch, quotes[watch["stock_code"]], params["threshold_ratio"],
+        )
+        for watch in watches
+    )
+
+
 def evaluate_watchlist_limit_up_alerts(db: sqlite3.Connection, quotes: dict[str, dict]) -> int:
     if not quotes:
         return 0
@@ -3008,6 +3343,62 @@ def evaluate_watchlist_limit_up_alerts(db: sqlite3.Connection, quotes: dict[str,
     ).fetchall()
     return sum(
         create_watchlist_limit_up_notification(db, alert_type["id"], watch, quotes[watch["stock_code"]])
+        for watch in watches
+    )
+
+
+def create_watchlist_limit_down_notification(
+    db: sqlite3.Connection, alert_type_id: int, watch: sqlite3.Row, quote: dict,
+) -> bool:
+    try:
+        price = float(quote["close"])
+        limit_down = float(quote["limit_down"])
+        previous_close = float(quote.get("previous_close") or 0)
+    except (KeyError, TypeError, ValueError):
+        return False
+    if price <= 0 or limit_down <= 0 or price - 1e-6 > limit_down:
+        return False
+    created_at = datetime.now().isoformat(timespec="seconds")
+    change_ratio = price / previous_close - 1 if previous_close > 0 else None
+    content = f"当前价 {price:.2f} 元，今日跌停价 {limit_down:.2f} 元"
+    if change_ratio is not None:
+        content += f"，较前收下跌 {-change_ratio * 100:.2f}%"
+    content += "。"
+    details = {
+        "price": price, "limit_down": limit_down, "previous_close": previous_close or None,
+        "change_ratio": change_ratio, "trade_date": quote["trade_date"],
+    }
+    dedupe_key = f"{watch['user_id']}:{WATCHLIST_LIMIT_DOWN_CODE}:{watch['stock_code']}:{quote['trade_date']}"
+    cursor = db.execute(
+        """INSERT OR IGNORE INTO notifications
+        (user_id, alert_type_id, stock_code, stock_name, stage, title, content,
+         details_json, quote_time, created_at, dedupe_key)
+        VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, ?, ?)""",
+        (
+            watch["user_id"], alert_type_id, watch["stock_code"], watch["stock_name"],
+            f"{watch['stock_name']}达到跌停", content, json.dumps(details, ensure_ascii=False),
+            quote.get("quote_time", quote["fetched_at"]), created_at, dedupe_key,
+        ),
+    )
+    return cursor.rowcount > 0
+
+
+def evaluate_watchlist_limit_down_alerts(db: sqlite3.Connection, quotes: dict[str, dict]) -> int:
+    if not quotes:
+        return 0
+    alert_type = db.execute(
+        "SELECT id FROM alert_types WHERE code = ? AND enabled = 1", (WATCHLIST_LIMIT_DOWN_CODE,)
+    ).fetchone()
+    if alert_type is None:
+        return 0
+    placeholders = ",".join("?" for _ in quotes)
+    watches = db.execute(
+        f"""SELECT user_id, stock_code, stock_name FROM watchlist_stocks
+        WHERE stock_code IN ({placeholders}) ORDER BY user_id, stock_code""",
+        tuple(quotes),
+    ).fetchall()
+    return sum(
+        create_watchlist_limit_down_notification(db, alert_type["id"], watch, quotes[watch["stock_code"]])
         for watch in watches
     )
 
@@ -3287,179 +3678,6 @@ def fetch_daily_prices(stock_code: str, start_date: str, end_date: str):
     return frame, source
 
 
-def fetch_hot_industry():
-    import akshare as ak
-
-    frame = ak.stock_sector_spot("新浪行业")
-    return normalize_board_frame(frame)
-
-
-def fetch_hot_concept():
-    import akshare as ak
-
-    frame = ak.stock_sector_spot("概念")
-    return normalize_board_frame(frame)
-
-
-def normalize_board_frame(frame):
-    if frame is None or getattr(frame, "empty", True):
-        return frame
-    frame = frame.sort_values("涨跌幅", ascending=False).reset_index(drop=True)
-    return frame.rename(columns={
-        "板块": "板块名称", "label": "板块代码", "平均价格": "最新价",
-        "公司家数": "公司家数", "总成交额": "成交额",
-        "股票名称": "领涨股票", "个股-涨跌幅": "领涨股票-涨跌幅",
-    })
-
-
-def build_hot_rank_records(rank_rows: list[dict], quotes: dict[str, dict]) -> list[dict]:
-    records = []
-    for item in sorted(rank_rows, key=lambda entry: entry["rank"]):
-        quote = quotes.get(item["code"])
-        if quote is None:
-            records.append({
-                "排名": item["rank"], "代码": item["code"], "股票名称": item["name"],
-                "最新价": None, "涨跌额": None, "涨跌幅": None,
-            })
-            continue
-        close = float(quote["close"])
-        previous_close = float(quote.get("previous_close") or 0)
-        change = close - previous_close if previous_close else None
-        change_rate = change / previous_close * 100 if change is not None and previous_close else None
-        records.append({
-            "排名": item["rank"], "代码": item["code"], "股票名称": item["name"],
-            "最新价": round(close, 4),
-            "涨跌额": round(change, 4) if change is not None else None,
-            "涨跌幅": round(change_rate, 4) if change_rate is not None else None,
-        })
-    return records
-
-
-def fetch_hot_rank():
-    payload = {
-        "appId": "appId01",
-        "globalId": "786e4c21-70dc-435a-93bb-38",
-        "marketType": "",
-        "pageNo": 1,
-        "pageSize": 20,
-    }
-    request = Request(
-        "https://emappdata.eastmoney.com/stockrank/getAllCurrentList",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
-    )
-    with urlopen(request, timeout=15, context=SSL_CONTEXT) as response:
-        raw_rows = json.loads(response.read().decode("utf-8"))["data"]
-    rank_rows = [
-        {"rank": int(row["rk"]), "code": str(row["sc"])[-6:], "name": str(row["sc"]).lower()}
-        for row in raw_rows
-    ]
-    quotes = fetch_realtime_prices([item["code"] for item in rank_rows])
-    name_rows = fetch_tencent_names([item["code"] for item in rank_rows])
-    for item in rank_rows:
-        if item["code"] in name_rows:
-            item["name"] = name_rows[item["code"]]
-    import pandas as pd
-
-    return pd.DataFrame(build_hot_rank_records(rank_rows, quotes))
-
-
-def fetch_tencent_names(stock_codes: list[str]) -> dict[str, str]:
-    symbols = ",".join(market_symbol(stock_code) for stock_code in stock_codes)
-    request = Request(
-        f"https://qt.gtimg.cn/q={symbols}",
-        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"},
-    )
-    with urlopen(request, timeout=15, context=SSL_CONTEXT) as response:
-        text = response.read().decode("gbk", errors="replace")
-    requested_symbols = {market_symbol(stock_code): stock_code for stock_code in stock_codes}
-    names = {}
-    for raw_record in text.split(";"):
-        if '="' not in raw_record:
-            continue
-        variable, raw_value = raw_record.split('="', 1)
-        variable = variable.strip()
-        requested_code = requested_symbols.get(variable.removeprefix("v_"))
-        if requested_code is None:
-            continue
-        fields = raw_value.rstrip('"\r\n').split("~")
-        if len(fields) >= 2:
-            names[requested_code] = fields[1]
-    return names
-
-
-
-def df_records(frame, limit: int = 20) -> list[dict]:
-    if frame is None or getattr(frame, "empty", True):
-        return []
-    records = []
-    for _, row in frame.head(limit).iterrows():
-        record = {}
-        for key, value in row.items():
-            if value is None:
-                record[key] = None
-            elif isinstance(value, bool):
-                record[key] = value
-            else:
-                try:
-                    number = float(value)
-                except (TypeError, ValueError):
-                    record[key] = value
-                else:
-                    if math.isnan(number) or math.isinf(number):
-                        record[key] = None
-                    elif number.is_integer():
-                        record[key] = int(number)
-                    else:
-                        record[key] = round(number, 4)
-        records.append(record)
-    return records
-
-
-def hot_sectors_snapshot_locked() -> dict:
-    return {
-        "modules": {
-            key: {"records": list(item["records"]), "error": item["error"]}
-            for key, item in HOT_SECTORS_CACHE["modules"].items()
-        },
-        "updated_at": HOT_SECTORS_CACHE["updated_at"],
-    }
-
-
-def hot_sectors_data(force: bool = False) -> dict:
-    now = time.time()
-    with HOT_SECTORS_CACHE_LOCK:
-        if (not force and HOT_SECTORS_CACHE["updated_at"] is not None
-                and now - HOT_SECTORS_CACHE["updated_at"] < HOT_SECTORS_CACHE_TTL_SECONDS):
-            return hot_sectors_snapshot_locked()
-    providers = (
-        ("industry", fetch_hot_industry, "行业板块"),
-        ("concept", fetch_hot_concept, "概念板块"),
-        ("hot_rank", fetch_hot_rank, "人气榜"),
-    )
-    modules: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=len(providers)) as executor:
-        futures = {
-            executor.submit(provider): (key, label)
-            for key, provider, label in providers
-        }
-        for future in as_completed(futures):
-            key, label = futures[future]
-            try:
-                modules[key] = {"records": df_records(future.result(), 20), "error": None}
-            except Exception as error:
-                with HOT_SECTORS_CACHE_LOCK:
-                    previous = HOT_SECTORS_CACHE["modules"].get(key)
-                modules[key] = {
-                    "records": previous["records"] if previous else [],
-                    "error": f"{label}：{error}",
-                }
-    with HOT_SECTORS_CACHE_LOCK:
-        HOT_SECTORS_CACHE["modules"] = modules
-        HOT_SECTORS_CACHE["updated_at"] = now
-        return hot_sectors_snapshot_locked()
-
-
 def save_daily_prices(db: sqlite3.Connection, stock_code: str, frame, source: str, start_date: str, end_date: str) -> int:
 
     inserted = 0
@@ -3476,9 +3694,12 @@ def save_daily_prices(db: sqlite3.Connection, stock_code: str, frame, source: st
             except (TypeError, ValueError):
                 return None
         seen_dates.add(trade_date)
-        volume = num(row.get("成交量", row.get("volume")))
-        if volume is not None and source == "akshare-eastmoney":
-            volume *= 100
+        volume = normalize_daily_volume_shares(
+            num(row.get("成交量", row.get("volume"))),
+            num(row.get("成交额", row.get("amount"))),
+            num(row.get("收盘", row.get("close"))),
+            source,
+        )
         db.execute(
             """INSERT INTO daily_prices
             (stock_code, trade_date, open, high, low, close, volume, amount, source, fetched_at)
@@ -3520,8 +3741,13 @@ def sync_realtime_codes(stock_codes: list[str]) -> tuple[int, list[str]]:
             evaluate_realtime_alerts(db, quotes)
             evaluate_consolidation_stabilization_alerts(db, quotes)
             evaluate_intraday_rebound_alerts(db, quotes)
+            evaluate_watchlist_open_gain_alerts(db, quotes)
+            evaluate_watchlist_open_loss_alerts(db, quotes)
             evaluate_watchlist_limit_up_alerts(db, quotes)
+            evaluate_watchlist_limit_down_alerts(db, quotes)
             refresh_alert_signal_event_outcomes(db, list(quotes))
+        if quotes:
+            publish_realtime_stream_update()
         return synced, [f"{stock_code}：未返回实时行情" for stock_code in missing_codes]
     finally:
         REALTIME_SYNC_LOCK.release()
@@ -3577,6 +3803,72 @@ def auto_sync_status() -> dict:
         return dict(AUTO_SYNC_STATE)
 
 
+def publish_realtime_stream_update() -> int:
+    global REALTIME_STREAM_VERSION
+    with REALTIME_STREAM_CONDITION:
+        REALTIME_STREAM_VERSION += 1
+        REALTIME_STREAM_CONDITION.notify_all()
+        return REALTIME_STREAM_VERSION
+
+
+def portfolio_quotes_payload(db: sqlite3.Connection, user_id: int) -> dict:
+    portfolio = portfolio_analysis_data(db, user_id)
+    return {
+        "summary": portfolio["summary"],
+        "positions": [
+            {key: item[key] for key in (
+                "stock_code", "latest_price", "price_date", "price_fetched_at", "change_rate",
+                "unrealized_profit", "unrealized_rate",
+            )}
+            for item in portfolio["positions"]
+        ],
+    }
+
+
+def watchlist_quotes_payload(
+    db: sqlite3.Connection, user_id: int, query: str = "", priority: str = "all",
+    sort: str = "priority", direction: str = "desc",
+) -> dict:
+    watchlist = watchlist_data(db, user_id, query, priority, sort, direction)
+    return {
+        "items": [
+            {key: item[key] for key in (
+                "stock_code", "latest_price", "price_date", "price_fetched_at", "change_amount",
+                "change_rate", "intraday_rebound",
+            )}
+            for item in watchlist["items"]
+        ],
+    }
+
+
+def notifications_payload(db: sqlite3.Connection, user_id: int) -> dict:
+    unread, notifications = notification_rows(db, user_id, 20)
+    return {"unread_count": unread, "notifications": notifications}
+
+
+def realtime_stream(user_id: int, view: str, filters: dict):
+    version = -1
+    while True:
+        with REALTIME_STREAM_CONDITION:
+            current_version = REALTIME_STREAM_VERSION
+            if version >= 0 and current_version == version:
+                REALTIME_STREAM_CONDITION.wait(timeout=15)
+                current_version = REALTIME_STREAM_VERSION
+        if current_version == version:
+            yield ": keep-alive\n\n"
+            continue
+        version = current_version
+        with db_connect() as db:
+            payload = (
+                portfolio_quotes_payload(db, user_id)
+                if view == "portfolio"
+                else watchlist_quotes_payload(db, user_id, **filters)
+                if view == "watchlist"
+                else notifications_payload(db, user_id)
+            )
+        yield f"event: {view}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 def run_auto_realtime_sync(moment: datetime | None = None) -> bool:
     moment = moment or datetime.now()
     if not is_auto_sync_time(moment):
@@ -3593,10 +3885,7 @@ def run_auto_realtime_sync(moment: datetime | None = None) -> bool:
         ]
     if not stock_codes:
         return False
-    indexes, index_error = sync_market_indexes()
-    with AUTO_SYNC_STATE_LOCK:
-        AUTO_SYNC_STATE["indexes_last_success_at"] = datetime.now().isoformat(timespec="seconds") if indexes else AUTO_SYNC_STATE["indexes_last_success_at"]
-        AUTO_SYNC_STATE["indexes_last_error"] = index_error
+    refresh_market_indexes_in_background()
 
     attempted_at = moment.isoformat(timespec="seconds")
     with AUTO_SYNC_STATE_LOCK:
@@ -4475,15 +4764,34 @@ def analysis_stocks():
             code = stocks[0]["stock_code"]
         if code:
             name = next((stock["stock_name"] for stock in stocks if stock["stock_code"] == code), "")
+            if not name and code in positions_by_code:
+                name = positions_by_code[code]["stock_name"]
             if not name:
                 name = db.execute("SELECT MAX(stock_name) stock_name FROM executions WHERE user_id = ? AND stock_code = ?", (user_id, code)).fetchone()["stock_name"] or ""
             current_position = positions_by_code.get(code)
             if current_position is not None:
-                current_position["quantity"] = float(current_position["quantity"] or 0)
-                current_position["total_cost"] = float(current_position["total_cost"] or 0)
-                current_position["avg_cost"] = float(current_position["avg_cost"] or 0)
-                current_position["holding_days"] = max(
-                    0, (date.today() - datetime.strptime(current_position["first_buy_date"], "%Y-%m-%d").date()).days,
+                current_position["quantity"] = (
+                    float(current_position["quantity"]) if current_position["quantity"] is not None else None
+                )
+                current_position["avg_cost"] = (
+                    float(current_position["avg_cost"]) if current_position["avg_cost"] is not None else None
+                )
+                current_position["calculation_complete"] = all(
+                    current_position[field] is not None
+                    for field in ("quantity", "avg_cost", "first_buy_date")
+                )
+                current_position["total_cost"] = (
+                    float(current_position["total_cost"])
+                    if current_position["calculation_complete"] else None
+                )
+                current_position["holding_days"] = (
+                    max(
+                        0,
+                        (date.today() - datetime.strptime(
+                            current_position["first_buy_date"], "%Y-%m-%d",
+                        ).date()).days,
+                    )
+                    if current_position["calculation_complete"] else None
                 )
                 latest_price = db.execute(
                     """SELECT trade_date, close FROM daily_prices WHERE stock_code = ? AND close IS NOT NULL
@@ -4494,7 +4802,8 @@ def analysis_stocks():
                 current_position["price_date"] = latest_price["trade_date"] if latest_price else None
                 current_position["market_value"] = (
                     current_position["quantity"] * current_position["latest_price"]
-                    if current_position["latest_price"] is not None else None
+                    if current_position["calculation_complete"] and current_position["latest_price"] is not None
+                    else None
                 )
                 current_position["unrealized_profit"] = (
                     current_position["market_value"] - current_position["total_cost"]
@@ -4831,16 +5140,8 @@ def watchlist_quotes():
     sort = request.args.get("sort", "priority")
     direction = request.args.get("direction", "desc")
     with db_connect() as db:
-        watchlist = watchlist_data(db, current_user_id(), query, priority, sort, direction)
-    response = jsonify({
-        "items": [
-            {key: item[key] for key in (
-                "stock_code", "latest_price", "price_date", "price_fetched_at", "change_amount",
-                "change_rate", "intraday_rebound",
-            )}
-            for item in watchlist["items"]
-        ],
-    })
+        payload = watchlist_quotes_payload(db, current_user_id(), query, priority, sort, direction)
+    response = jsonify(payload)
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -4999,9 +5300,9 @@ def save_portfolio_position():
     try:
         stock_code = normalize_code(request.form.get("stock_code", ""))
         stock_name = request.form.get("stock_name", "").strip()
-        quantity = to_number(request.form.get("quantity", ""))
-        avg_cost = to_number(request.form.get("avg_cost", ""))
-        first_buy_date = request.form.get("first_buy_date", "")
+        quantity = optional_positive_number(request.form.get("quantity", ""), "持仓数量")
+        avg_cost = optional_positive_number(request.form.get("avg_cost", ""), "成本均价")
+        first_buy_date = request.form.get("first_buy_date", "").strip() or None
     except (ValueError, TypeError) as error:
         flash(f"保存持仓失败：{error}", "error")
         return redirect(url_for("analysis_portfolio"))
@@ -5034,43 +5335,28 @@ def delete_portfolio_position():
 @app.get("/analysis/portfolio/quotes")
 def portfolio_quotes():
     with db_connect() as db:
-        portfolio = portfolio_analysis_data(db, current_user_id())
-    response = jsonify({
-        "summary": portfolio["summary"],
-        "positions": [
-            {key: item[key] for key in ("stock_code", "latest_price", "price_date", "price_fetched_at", "change_rate", "unrealized_profit", "unrealized_rate")}
-            for item in portfolio["positions"]
-        ],
-    })
+        payload = portfolio_quotes_payload(db, current_user_id())
+    response = jsonify(payload)
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.get("/api/realtime-stream")
+def realtime_stream_api():
+    view = request.args.get("view", "")
+    if view not in ("portfolio", "watchlist", "notifications"):
+        abort(400)
+    # HTTP 204 tells existing EventSource clients to stop reconnecting.
+    return Response(status=204)
 
 
 @app.get("/analysis/portfolio/indexes")
 def portfolio_indexes():
     status = market_index_status()
-    if status["data"]:
-        updated_at = datetime.fromisoformat(status["updated_at"]) if status["updated_at"] else None
-        if updated_at is None or (datetime.now() - updated_at).total_seconds() >= MARKET_INDEX_CACHE_TTL_SECONDS:
-            refresh_market_indexes_in_background()
-    else:
-        indexes, error = sync_market_indexes()
-        status = {"data": indexes, "updated_at": datetime.now().isoformat(timespec="seconds") if indexes else None, "error": error}
+    updated_at = datetime.fromisoformat(status["updated_at"]) if status["updated_at"] else None
+    if updated_at is None or (datetime.now() - updated_at).total_seconds() >= MARKET_INDEX_CACHE_TTL_SECONDS:
+        refresh_market_indexes_in_background()
     return jsonify(status)
-
-
-@app.get("/analysis/hot-sectors")
-def analysis_hot_sectors():
-    return render_template("index.html", page="hot_sectors")
-
-
-@app.get("/api/hot-sectors")
-def hot_sectors_api():
-    force = request.args.get("force", "") == "1"
-    payload = hot_sectors_data(force=force)
-    response = jsonify(payload)
-    response.headers["Cache-Control"] = "no-store"
-    return response
 
 
 @app.get("/analysis/portfolio/kline/<stock_code>")
@@ -5103,7 +5389,7 @@ def portfolio_kline(stock_code: str):
         bs_points = kline_bs_points(db, current_user_id(), stock_code)
     return jsonify({
         "stock_code": stock_code, "stock_name": position["stock_name"],
-        "avg_cost": float(position["avg_cost"] or 0), "data": chart,
+        "avg_cost": float(position["avg_cost"]) if position["avg_cost"] is not None else None, "data": chart,
         "bs_points": bs_points, "volume_unit": "lot",
     })
 
@@ -5124,9 +5410,12 @@ def sync_portfolio_prices():
         failed = []
         volatility_start = date.today() - timedelta(days=100)
         for position in positions:
-            first_buy = datetime.strptime(position["first_buy_date"], "%Y-%m-%d").date()
-            start_date = min(first_buy, volatility_start).isoformat()
             try:
+                first_buy = (
+                    datetime.strptime(position["first_buy_date"], "%Y-%m-%d").date()
+                    if position["first_buy_date"] else volatility_start
+                )
+                start_date = min(first_buy, volatility_start).isoformat()
                 synced += sync_daily_prices(db, position["stock_code"], start_date, date.today().isoformat())
             except Exception as error:
                 failed.append(f"{position['stock_code']}：{error}")
@@ -5150,9 +5439,7 @@ def sync_portfolio_realtime():
     if not stock_codes:
         return portfolio_sync_response("当前没有持仓，无需同步实时行情。", "warning")
     synced, failed = sync_realtime_codes(stock_codes)
-    _, index_error = sync_market_indexes()
-    if index_error:
-        failed.append(f"指数行情：{index_error}")
+    refresh_market_indexes_in_background()
     message = f"已同步 {synced} 条实时行情。" if not failed else f"实时行情部分同步失败：{'；'.join(failed)}"
     return portfolio_sync_response(message, "success" if not failed else "warning")
 
@@ -5303,8 +5590,59 @@ def admin():
 @app.get("/admin/alert-types")
 def alert_types_management():
     query = request.query_string.decode("utf-8")
-    target = url_for("three_day_dip_management")
+    target = url_for("daily_alerts_management")
     return redirect(f"{target}?{query}" if query else target)
+
+
+@app.get("/admin/alert-types/daily-alerts")
+def daily_alerts_management():
+    with db_connect() as db:
+        alert_types = {
+            row["code"]: row for row in db.execute(
+                """SELECT * FROM alert_types WHERE code IN (?, ?, ?, ?)""",
+                (WATCHLIST_OPEN_GAIN_CODE, WATCHLIST_OPEN_LOSS_CODE,
+                 WATCHLIST_LIMIT_UP_CODE, WATCHLIST_LIMIT_DOWN_CODE),
+            ).fetchall()
+        }
+    gain_params = daily_alert_params(
+        json.loads(alert_types[WATCHLIST_OPEN_GAIN_CODE]["params_json"] or "{}"),
+        WATCHLIST_OPEN_GAIN_DEFAULT_PARAMS,
+    )
+    loss_params = daily_alert_params(
+        json.loads(alert_types[WATCHLIST_OPEN_LOSS_CODE]["params_json"] or "{}"),
+        WATCHLIST_OPEN_LOSS_DEFAULT_PARAMS,
+    )
+    return render_template(
+        "index.html", page="daily_alerts", daily_alert_types=alert_types,
+        daily_gain_params=gain_params, daily_loss_params=loss_params,
+    )
+
+
+@app.post("/admin/alert-types/daily-alerts")
+def save_daily_alerts():
+    try:
+        gain_params = daily_alert_params({
+            "threshold_ratio": float(request.form.get("gain_threshold_percent", "4")) / 100,
+        }, WATCHLIST_OPEN_GAIN_DEFAULT_PARAMS)
+        loss_params = daily_alert_params({
+            "threshold_ratio": float(request.form.get("loss_threshold_percent", "4")) / 100,
+        }, WATCHLIST_OPEN_LOSS_DEFAULT_PARAMS)
+        now = datetime.now().isoformat(timespec="seconds")
+        updates = (
+            (json.dumps(gain_params), int("gain_enabled" in request.form), WATCHLIST_OPEN_GAIN_CODE),
+            (json.dumps(loss_params), int("loss_enabled" in request.form), WATCHLIST_OPEN_LOSS_CODE),
+            ("{}", int("limit_up_enabled" in request.form), WATCHLIST_LIMIT_UP_CODE),
+            ("{}", int("limit_down_enabled" in request.form), WATCHLIST_LIMIT_DOWN_CODE),
+        )
+        with db_connect() as db:
+            db.executemany(
+                "UPDATE alert_types SET params_json = ?, enabled = ?, updated_at = ? WHERE code = ?",
+                [(params_json, enabled, now, code) for params_json, enabled, code in updates],
+            )
+        flash("已保存日常提醒设置。", "success")
+    except (TypeError, ValueError):
+        flash("提醒参数格式无效，请检查涨跌幅阈值。", "error")
+    return redirect(url_for("daily_alerts_management"))
 
 
 @app.get("/admin/alert-types/three-day-dip")
@@ -5431,6 +5769,8 @@ def save_consolidation_stabilization_alert_type():
     try:
         params = consolidation_stabilization_params({
             "consolidation_days": int(request.form.get("consolidation_days", "3")),
+            "setup_lookback_days": int(request.form.get("setup_lookback_days", "4")),
+            "setup_max_range_ratio": float(request.form.get("setup_max_range_percent", "10")) / 100,
             "max_range_ratio": float(request.form.get("max_range_percent", "4")) / 100,
             "trend_lookback_days": int(request.form.get("trend_lookback_days", "10")),
             "trend_threshold_ratio": float(request.form.get("trend_threshold_percent", "5")) / 100,
@@ -5516,7 +5856,8 @@ def save_intraday_rebound_alert_type():
 @app.get("/admin/alert-types/three-day-dip/pool")
 def three_day_dip_pool():
     with db_connect() as db:
-        pool = alert_signal_pool_data(db, current_user_id())
+        alert_type, _ = alert_type_data(db)
+        pool = alert_signal_pool_data(db, current_user_id(), alert_type["id"])
     return render_template("index.html", page="three_day_dip_pool", signal_pool=pool)
 
 
@@ -5572,10 +5913,11 @@ def review_three_day_dip_sample(sample_id: int):
         abort(400)
     now = datetime.now().isoformat(timespec="seconds")
     with db_connect() as db:
+        alert_type, _ = alert_type_data(db)
         cursor = db.execute(
             """UPDATE alert_signal_samples SET review_status = ?, note = ?, reviewed_at = ?, updated_at = ?
-            WHERE id = ? AND user_id = ?""",
-            (status, note, now, now, sample_id, current_user_id()),
+            WHERE id = ? AND user_id = ? AND alert_type_id = ?""",
+            (status, note, now, now, sample_id, current_user_id(), alert_type["id"]),
         )
     if cursor.rowcount == 0:
         abort(404)
@@ -5611,6 +5953,107 @@ def scan_three_day_dip_history():
     return redirect(url_for("three_day_dip_pool"))
 
 
+@app.get("/admin/alert-types/consolidation-stabilization/pool")
+def consolidation_stabilization_pool():
+    with db_connect() as db:
+        alert_type, _ = consolidation_stabilization_alert_type_data(db)
+        pool = alert_signal_pool_data(db, current_user_id(), alert_type["id"])
+    return render_template("index.html", page="consolidation_stabilization_pool", signal_pool=pool)
+
+
+@app.post("/admin/alert-types/consolidation-stabilization/pool")
+def add_consolidation_stabilization_sample():
+    try:
+        stock_code = normalize_code(request.form.get("stock_code", ""))
+        stock_name = request.form.get("stock_name", "").strip()
+        signal_date = normalize_date(request.form.get("signal_date", ""))
+        note = request.form.get("note", "").strip()
+        if not stock_name or len(stock_name) > 50 or len(note) > 500:
+            raise ValueError("证券名称不能为空，备注不能超过 500 字")
+        with db_connect() as db:
+            alert_type, params = consolidation_stabilization_alert_type_data(db)
+            required = params["trend_lookback_days"] + params["consolidation_days"] + 1
+            prices = [dict(row) for row in reversed(db.execute(
+                """SELECT trade_date, open, high, low, close, volume, source FROM daily_prices
+                WHERE stock_code = ? AND trade_date <= ? AND open IS NOT NULL AND high IS NOT NULL
+                AND low IS NOT NULL AND close IS NOT NULL ORDER BY trade_date DESC LIMIT ?""",
+                (stock_code, signal_date, required),
+            ).fetchall())]
+            if len(prices) < required or prices[-1]["trade_date"] != signal_date:
+                start_date = (date.fromisoformat(signal_date) - timedelta(days=required * 3)).isoformat()
+                sync_daily_prices(db, stock_code, start_date, signal_date)
+                prices = [dict(row) for row in reversed(db.execute(
+                    """SELECT trade_date, open, high, low, close, volume, source FROM daily_prices
+                    WHERE stock_code = ? AND trade_date <= ? AND open IS NOT NULL AND high IS NOT NULL
+                    AND low IS NOT NULL AND close IS NOT NULL ORDER BY trade_date DESC LIMIT ?""",
+                    (stock_code, signal_date, required),
+                ).fetchall())]
+            if len(prices) < required or prices[-1]["trade_date"] != signal_date:
+                raise ValueError("信号日前行情不足，无法建立样本")
+            result = evaluate_consolidation_stabilization(prices, params)
+            pattern_type = request.form.get("pattern_type", "").strip() or result.get("pattern_type")
+            if pattern_type not in ("DOWN_STABILIZATION", "UP_CONTINUATION", "NEUTRAL_BREAKOUT"):
+                raise ValueError("当前规则未识别形态，请手工选择形态类型")
+            upsert_alert_signal_sample(
+                db, current_user_id(), alert_type["id"], stock_code, stock_name, prices, result,
+                source="MANUAL", review_status="CONFIRMED", note=note, pattern_type=pattern_type,
+                rule_version=CONSOLIDATION_STABILIZATION_RULE_VERSION,
+                metrics=consolidation_stabilization_metrics(result),
+            )
+        flash(f"已加入横盘整理企稳池：{stock_name} {signal_date}", "success")
+    except (RuntimeError, TypeError, ValueError) as error:
+        flash(f"加入样本失败：{error}", "error")
+    return redirect(url_for("consolidation_stabilization_pool"))
+
+
+@app.post("/admin/alert-types/consolidation-stabilization/pool/<int:sample_id>/review")
+def review_consolidation_stabilization_sample(sample_id: int):
+    status = request.form.get("review_status", "")
+    note = request.form.get("note", "").strip()
+    if status not in ("CONFIRMED", "REJECTED") or len(note) > 500:
+        abort(400)
+    now = datetime.now().isoformat(timespec="seconds")
+    with db_connect() as db:
+        alert_type, _ = consolidation_stabilization_alert_type_data(db)
+        cursor = db.execute(
+            """UPDATE alert_signal_samples SET review_status = ?, note = ?, reviewed_at = ?, updated_at = ?
+            WHERE id = ? AND user_id = ? AND alert_type_id = ?""",
+            (status, note, now, now, sample_id, current_user_id(), alert_type["id"]),
+        )
+    if cursor.rowcount == 0:
+        abort(404)
+    flash("样本审核结果已保存。", "success")
+    return redirect(url_for("consolidation_stabilization_pool"))
+
+
+@app.post("/admin/alert-types/consolidation-stabilization/pool/scan")
+def scan_consolidation_stabilization_history():
+    try:
+        start_date = normalize_date(request.form.get("start_date", ""))
+        end_date = normalize_date(request.form.get("end_date", ""))
+        if start_date > end_date:
+            raise ValueError("开始日期不能晚于截止日期")
+        created = 0
+        with db_connect() as db:
+            alert_type, params = consolidation_stabilization_alert_type_data(db)
+            watches = db.execute(
+                "SELECT stock_code, stock_name FROM watchlist_stocks WHERE user_id = ?", (current_user_id(),)
+            ).fetchall()
+            for stock in watches:
+                for hit in backtest_consolidation_stabilization(db, stock, start_date, end_date, params)["hits"]:
+                    result = evaluate_consolidation_stabilization(hit["candles"], params)
+                    upsert_alert_signal_sample(
+                        db, current_user_id(), alert_type["id"], stock["stock_code"], stock["stock_name"],
+                        hit["candles"], result, rule_version=CONSOLIDATION_STABILIZATION_RULE_VERSION,
+                        metrics=consolidation_stabilization_metrics(result),
+                    )
+                    created += 1
+        flash(f"历史扫描完成，处理 {created} 个命中样本。", "success")
+    except (TypeError, ValueError) as error:
+        flash(f"历史扫描失败：{error}", "error")
+    return redirect(url_for("consolidation_stabilization_pool"))
+
+
 @app.get("/analysis/notifications")
 def notifications():
     try:
@@ -5626,8 +6069,8 @@ def notifications():
 @app.get("/api/notifications")
 def notifications_api():
     with db_connect() as db:
-        unread, notifications = notification_rows(db, current_user_id(), 20)
-    return jsonify({"unread_count": unread, "notifications": notifications})
+        payload = notifications_payload(db, current_user_id())
+    return jsonify(payload)
 
 
 @app.post("/api/notifications/<int:notification_id>/read")
