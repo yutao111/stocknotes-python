@@ -1,6 +1,6 @@
 # StockNotes 提醒系统规范
 
-本文件是三日低吸、横盘整理企稳、日内反弹及其后续回测功能的单一规则文档。
+本文件是三日低吸、异动提醒、日内反弹及其后续回测功能的单一规则文档。
 
 修改任何提醒逻辑、参数、通知、样本、回测或相关数据库结构前，必须先阅读本文件。修改完成后必须同步更新本文件，并运行完整测试。
 
@@ -144,13 +144,13 @@ baseline.close > baseline.open
 user_id:alert_type:stock_code:trade_date:stage
 ```
 
-## 4A. 横盘整理企稳
+## 4A. 异动提醒
 
-状态：独立提醒类型、收盘确认、历史测试、研究样本池、真实通知事件和日线后续收益为**已实现**。
+状态：独立提醒类型、盘中候选、收盘确认、历史测试、研究样本池、真实通知事件和日线后续收益为**已实现**。
 
 策略代码：`CONSOLIDATION_STABILIZATION`
 
-规则版本：`consolidation-stabilization-v1`
+规则版本：`anomaly-v1`
 
 核心函数：
 
@@ -158,51 +158,62 @@ user_id:alert_type:stock_code:trade_date:stage
 - `evaluate_consolidation_stabilization()`。
 - `evaluate_consolidation_stabilization_alerts()`。
 
-### 4A.1 计算窗口
+### 4A.1 基础前提
 
-默认使用横盘前 `10` 个交易日、横盘期 `3` 个交易日和确认日，共 `14` 根日 K。横盘前最后 `4` 日作为背景探底窗口，背景区间振幅不得超过 `10%`，且必须出现低于最后横盘区最低价的低点。确认日只能使用当日收盘后完整的开高低收和成交量，不产生盘中候选。
-
-### 4A.2 横盘与确认
-
-横盘期区间定义为：
+横盘不是触发前提。交易日 T 的基础条件只有价格上涨和成交量放大：
 
 ```text
-range_high = max(consolidation.high)
-range_low = min(consolidation.low)
-range_ratio = range_high / range_low - 1
+change_ratio = close[T] / close[T-1] - 1
+volume_baseline = median(volume[T-20:T-1])
+volume_ratio = volume[T] / volume_baseline
 ```
 
-默认要求：
+默认收盘确认要求 `change_ratio > 2%` 且 `volume_ratio >= 2.0`。涨幅刚好 `2.00%` 不触发，量比刚好 `2.0` 可以触发。历史窗口严格截止到 T-1，不包含 T 日；不足 20 个完整交易日时不触发。
 
-- 背景窗口存在低于最后横盘区最低价的探底低点。
-- 背景窗口振幅不超过 `10%`。
-- 横盘区间振幅不超过 `4%`。
-- 确认日收盘价严格高于横盘期最高价。
-- 确认日成交量至少为横盘期平均成交量的 `1.2` 倍。
+盘中候选使用同样的实时涨幅条件，并要求当日累计成交量达到前 20 日中位量的 `1.5` 倍。盘中累计量直接与完整日中位量比较，不做简单线性全天外推。
 
 `daily_prices.volume` 统一保存“股”。东方财富历史接口返回“手”，写入时乘以 `100`。腾讯实时和腾讯历史接口对不同标的都可能返回“手”或“股”：仅当 `成交额 / 收盘价 / 成交量` 位于 `75–125` 时判定为“手”并乘以 `100`，其余保留原值，避免误改 ETF 等无法可靠由收盘价反推成交股数的记录。新浪历史接口直接写入。K 线 API 输出时统一除以 `100` 转成“手”。`intraday_quotes.volume` 单独保存腾讯当日累计原始单位，只用于同源分钟差分和量比。
 
-探底回收不是硬条件，普通窄幅横盘也可识别。趋势分类只生成标签，不阻止提醒。
+### 4A.2 强度和背景
 
-### 4A.3 趋势标签
+基础确认类型为 `ANOMALY`。确认成立后，涨幅达到 `4%` 或量比达到 `3.0` 时升级为 `STRONG_ANOMALY`。突破前 20 日最高价、前三日收盘区间不超过 `3%`、前 20 日趋势为下跌或上涨都只作为解释标签，不阻止基础信号。
 
-以横盘前趋势窗口首尾收盘涨跌分类，默认阈值为 `5%`：
+### 4A.3 下跌异动分支
 
-- `DOWN_STABILIZATION`：前置涨跌不高于 `-5%`，显示“下跌企稳”。
-- `UP_CONTINUATION`：前置涨跌不低于 `+5%`，显示“上涨中继”。
-- `NEUTRAL_BREAKOUT`：其余情况，显示“中性横盘突破”。
+为了捕捉持续下跌后近期量能开始活跃、但尚未达到普通 20 日量比标准的标的，增加独立低级观察分支。默认要求：
 
-康龙化成 `300759` 的基准样本为 `2026-06-15` 至 `2026-06-17` 横盘，`2026-06-18` 收盘放量突破，分类为 `DOWN_STABILIZATION`。
+```text
+前20日收盘变化 <= -8%
+AND 当日涨幅 > 2%
+AND 当日成交量 / 前10日成交量中位数 >= 1.5
+```
+
+满足后产生 `DOWNTREND_ANOMALY`，中文为“下跌异动观察”，只作为 `CANDIDATE`。该分支不降低普通异动的 20 日量比标准。
+
+如果同时满足：
+
+```text
+close[T] > open[T]
+AND close_position >= 60%
+```
+
+则升级为 `DOWNTREND_REVERSAL`，中文为“下跌反转确认”，允许生成 `CONFIRMED`。其中 `close_position = (close-low)/(high-low)`。
+
+中科曙光 `603019` 在 `2026-06-10`：涨幅 `2.86%`，前 20 日量比 `1.16`，前 10 日量比 `1.56`，前 20 日下跌约 `19.86%`，但收盘位置仅 `18.61%`，因此只触发“下跌异动观察”，不确认。
+
+康龙化成 `300759` 的基准样本改为 `2026-06-12`：涨幅 `3.07%`，成交量约为前 20 日中位量的 `2.89` 倍，触发 `ANOMALY`；前三日收盘区间约 `2.60%`，标记短期收敛；前 20 日趋势明显向下，标记下跌后反弹。
+
+管理页的“测试是否命中”只验证一个指定信号日，因此只输入 `signal_date`。区间批量扫描由异动样本池的开始/截止日期表单负责，两种入口不重复。
 
 ### 4A.4 通知与收益
 
-只生成 `CONFIRMED` 通知。同一用户、股票和交易日最多一条：
+同一用户、股票和交易日分别最多生成一条候选和一条确认：
 
 ```text
-user_id:CONSOLIDATION_STABILIZATION:stock_code:trade_date:CONFIRMED
+user_id:CONSOLIDATION_STABILIZATION:stock_code:trade_date:stage
 ```
 
-成功生成通知后写入 `alert_signal_events`，保存实际触发价、规则版本、完整参数快照，以及整理区上下沿、区间振幅、突破量比和前置趋势涨跌。复用 `alert_signal_event_outcomes` 计算 T+1、T+3、T+5、T+10 收盘收益、最高收益和最大回撤。
+成功生成通知后写入 `alert_signal_events`，候选和确认分别保存真实触发价、规则版本、完整参数及指标快照。收盘确认另写入研究样本池。指标至少包含涨幅、中位量、量比、成交量分位、短期收敛、背景趋势、突破和 K 线解释特征。复用 `alert_signal_event_outcomes` 计算分钟、会话和 T+N 后续收益。
 
 ## 5. 日内反弹
 
@@ -411,17 +422,23 @@ user_id:WATCHLIST_LIMIT_DOWN:stock_code:trade_date
 
 代码默认值、管理页面和 `stocknotes.db` 中 `alert_types.params_json` 必须保持一致。修改参数后必须核对数据库中的实际生效值。
 
-横盘整理企稳默认基线：
+异动提醒默认基线：
 
 ```json
 {
-  "consolidation_days": 3,
-  "setup_lookback_days": 4,
-  "setup_max_range_ratio": 0.10,
-  "max_range_ratio": 0.04,
-  "trend_lookback_days": 10,
-  "trend_threshold_ratio": 0.05,
-  "min_breakout_volume_ratio": 1.2,
+  "volume_window": 20,
+  "candidate_volume_ratio": 1.5,
+  "confirmation_volume_ratio": 2.0,
+  "min_change_ratio": 0.02,
+  "strong_change_ratio": 0.04,
+  "strong_volume_ratio": 3.0,
+  "short_consolidation_days": 3,
+  "short_close_range_ratio": 0.03,
+  "downtrend_lookback_days": 20,
+  "downtrend_min_drop_ratio": 0.08,
+  "downtrend_volume_window": 10,
+  "downtrend_candidate_volume_ratio": 1.5,
+  "downtrend_confirmation_close_position": 0.60,
   "enabled": true
 }
 ```
@@ -474,16 +491,16 @@ user_id:WATCHLIST_LIMIT_DOWN:stock_code:trade_date
 
 数据不足时使用 `NULL`，不能把不完整窗口当作完整结果。必须保存计算截止日期。
 
-### 7.3 横盘整理企稳样本
+### 7.3 异动提醒样本
 
 状态：**已实现**，复用 `alert_signal_samples` 和 `alert_signal_outcomes`，但必须按 `alert_type_id` 与三日低吸样本隔离展示、扫描和审核。
 
 手工加入和历史扫描分别保存：
 
 - 用户、标的、信号日期和来源。
-- 趋势标签：`DOWN_STABILIZATION`、`UP_CONTINUATION` 或 `NEUTRAL_BREAKOUT`。
-- 完整趋势窗口、横盘期和确认日 K 线。
-- 整理区上下沿、区间振幅、突破量比和前置趋势涨跌。
+- 强度类型：`ANOMALY` 或 `STRONG_ANOMALY`。
+- 前 20 日基准窗口和信号日 K 线。
+- 涨幅、成交量中位数、量比、短期收敛、突破及背景趋势。
 - 规则版本、审核状态和备注。
 
 手工样本默认直接确认；历史扫描样本默认待确认。两类样本都以确认日收盘价为基准，复用 T+1、T+3、T+5、T+10 收盘收益、最高收益和最大回撤计算。
@@ -662,7 +679,7 @@ INTRADAY_REBOUND_RULE_VERSION
 
 状态：三类策略提醒均已将独立规则版本写入统一事件表。
 
-横盘整理企稳使用独立版本常量 `CONSOLIDATION_STABILIZATION_RULE_VERSION`，当前版本为 `consolidation-stabilization-v1`。
+异动提醒沿用内部 code 和独立版本常量 `CONSOLIDATION_STABILIZATION_RULE_VERSION`，当前版本为 `anomaly-v1`。历史 `consolidation-stabilization-v1` 事件和样本保留原版本，不重写。
 
 规则版本必须写入：
 
@@ -677,7 +694,7 @@ INTRADAY_REBOUND_RULE_VERSION
 
 修改前必须回答：
 
-1. 修改的是三日低吸、横盘整理企稳还是日内反弹？
+1. 修改的是三日低吸、异动提醒还是日内反弹？
 2. 使用的是日线还是分钟线？
 3. 是否改变触发条件？
 4. 是否改变通知阶段？

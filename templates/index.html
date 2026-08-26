@@ -32,7 +32,7 @@
             <summary>提醒类型</summary>
             <a class="{{ 'active' if page == 'daily_alerts' else '' }}" href="{{ url_for('daily_alerts_management') }}">日常提醒</a>
             <a class="{{ 'active' if page in ('three_day_dip', 'three_day_dip_pool') else '' }}" href="{{ url_for('three_day_dip_management') }}">三日低吸</a>
-            <a class="{{ 'active' if page in ('consolidation_stabilization', 'consolidation_stabilization_pool') else '' }}" href="{{ url_for('consolidation_stabilization_management') }}">横盘整理企稳</a>
+            <a class="{{ 'active' if page in ('consolidation_stabilization', 'consolidation_stabilization_pool') else '' }}" href="{{ url_for('consolidation_stabilization_management') }}">异动提醒</a>
             <a class="{{ 'active' if page == 'intraday_rebound' else '' }}" href="{{ url_for('intraday_rebound_management') }}">日内反弹</a>
           </details>
         </details>
@@ -42,7 +42,7 @@
     <main class="main{{ ' summary-page' if page == 'summary' else '' }}">
       {% set return_to = request.full_path if request.query_string else request.path %}
       <header class="top">
-          <div><small>STOCKNOTES / LOCAL</small><h1>{{ {'stocks': '个股分析', 'trade_detail': '交易复盘详情', 'portfolio': '持仓分析', 'watchlist': '重点观察', 'notifications': '通知', 'summary': '汇总', 'reviews': '交易复盘', 'recent': '近期表现', 'timing': '时机把握', 'strategy': '策略验证', 'discipline': '情绪纪律', 'statements': '交割单', 'import': '导入交割单', 'account': '账户资金', 'daily_alerts': '日常提醒', 'three_day_dip': '三日低吸', 'three_day_dip_pool': '三日低吸池', 'consolidation_stabilization': '横盘整理企稳', 'intraday_rebound': '日内反弹'}.get(page, '后台管理') }}</h1></div>
+          <div><small>STOCKNOTES / LOCAL</small><h1>{{ {'stocks': '个股分析', 'trade_detail': '交易复盘详情', 'portfolio': '持仓分析', 'watchlist': '重点观察', 'notifications': '通知', 'summary': '汇总', 'reviews': '交易复盘', 'recent': '近期表现', 'timing': '时机把握', 'strategy': '策略验证', 'discipline': '情绪纪律', 'statements': '交割单', 'import': '导入交割单', 'account': '账户资金', 'daily_alerts': '日常提醒', 'three_day_dip': '三日低吸', 'three_day_dip_pool': '三日低吸池', 'consolidation_stabilization': '异动提醒', 'intraday_rebound': '日内反弹'}.get(page, '后台管理') }}</h1></div>
         <div class="workspace-tools">
           <div class="local-badge">● SQLite 本地数据库</div>
           <a class="database-backup" href="{{ url_for('export_database') }}" title="下载包含本机全部用户及所有业务数据的完整 SQLite 数据库">备份</a>
@@ -1011,7 +1011,7 @@
       <nav class="notification-filters" aria-label="通知类型筛选">
         <a class="{{ 'active' if not nd.alert_type_code else '' }}" href="{{ url_for('notifications') }}">全部</a>
         <a class="{{ 'active' if nd.alert_type_code == 'THREE_DAY_DIP' else '' }}" href="{{ url_for('notifications', type='THREE_DAY_DIP') }}">三日低吸</a>
-        <a class="{{ 'active' if nd.alert_type_code == 'CONSOLIDATION_STABILIZATION' else '' }}" href="{{ url_for('notifications', type='CONSOLIDATION_STABILIZATION') }}">横盘企稳</a>
+        <a class="{{ 'active' if nd.alert_type_code == 'CONSOLIDATION_STABILIZATION' else '' }}" href="{{ url_for('notifications', type='CONSOLIDATION_STABILIZATION') }}">异动提醒</a>
         <a class="{{ 'active' if nd.alert_type_code == 'INTRADAY_REBOUND' else '' }}" href="{{ url_for('notifications', type='INTRADAY_REBOUND') }}">日内反弹</a>
         <a class="{{ 'active' if nd.alert_type_code == 'DAILY_ALERTS' else '' }}" href="{{ url_for('notifications', type='DAILY_ALERTS') }}">日常提醒</a>
       </nav>
@@ -2005,44 +2005,79 @@
       </section>
 
       {% elif page == 'consolidation_stabilization' %}
-      <nav class="alert-page-tabs" aria-label="横盘整理企稳功能"><a class="active" href="{{ url_for('consolidation_stabilization_management') }}">规则参数</a><a href="{{ url_for('consolidation_stabilization_pool') }}">样本池</a></nav>
+      <nav class="alert-page-tabs" aria-label="异动提醒功能"><a class="active" href="{{ url_for('consolidation_stabilization_management') }}">规则参数</a><a href="{{ url_for('consolidation_stabilization_pool') }}">样本池</a></nav>
       <section class="intro">
-        <div><span class="eyebrow">ALERTS / CONSOLIDATION</span><p>识别窄幅横盘后的收盘放量突破，并按前置趋势标记下跌企稳、上涨中继或中性横盘突破。</p></div>
+        <div><span class="eyebrow">ALERTS / ANOMALY</span><p>识别涨幅超过 2% 且成交量显著偏离近期常态的股票；横盘、趋势和突破只作为背景解释。</p></div>
         <a class="button secondary" href="{{ url_for('analysis_watchlist') }}">查看重点观察</a>
       </section>
       <section class="panel alert-settings">
-        <div class="panel-title">横盘整理企稳 <span class="pill">收盘确认</span></div>
-        <p class="hint">仅在收盘价突破整理区最高价，且成交量达到整理期均量要求时发送确认提醒。</p>
+        <div class="panel-title">异动提醒 <span class="pill">候选 + 确认</span></div>
+        <p class="hint">盘中量比达到候选阈值先观察；收盘涨幅和完整成交量达到确认阈值后升级。</p>
         <form method="post" action="{{ url_for('save_consolidation_stabilization_alert_type') }}">
-          <label class="alert-toggle"><input type="checkbox" name="enabled" {{ 'checked' if alert_type.enabled else '' }}><span><b>启用横盘整理企稳</b><small>应用于所有用户各自的重点观察股票</small></span></label>
-          <div class="alert-field-grid">
-             <label><span>横盘交易日</span><input name="consolidation_days" type="number" min="2" max="10" value="{{ alert_params.consolidation_days }}" required></label>
-             <label><span>背景观察日</span><input name="setup_lookback_days" type="number" min="2" max="8" value="{{ alert_params.setup_lookback_days }}" required><small>最后横盘前的探底背景</small></label>
-             <label><span>背景区间最多</span><div class="input-suffix"><input name="setup_max_range_percent" type="number" min="0.1" max="30" step="0.1" value="{{ '%.1f'|format(alert_params.setup_max_range_ratio * 100) }}" required><i>%</i></div></label>
-            <label><span>横盘区间振幅最多</span><div class="input-suffix"><input name="max_range_percent" type="number" min="0.1" max="30" step="0.1" value="{{ '%.1f'|format(alert_params.max_range_ratio * 100) }}" required><i>%</i></div></label>
-            <label><span>前置趋势观察日</span><input name="trend_lookback_days" type="number" min="2" max="60" value="{{ alert_params.trend_lookback_days }}" required></label>
-            <label><span>趋势分类阈值</span><div class="input-suffix"><input name="trend_threshold_percent" type="number" min="0" max="50" step="0.1" value="{{ '%.1f'|format(alert_params.trend_threshold_ratio * 100) }}" required><i>%</i></div></label>
-            <label><span>突破成交量至少</span><input name="min_breakout_volume_ratio" type="number" min="1" max="10" step="0.1" value="{{ '%.1f'|format(alert_params.min_breakout_volume_ratio) }}" required><small>相对横盘期平均成交量</small></label>
+          <label class="alert-toggle"><input type="checkbox" name="enabled" {{ 'checked' if alert_type.enabled else '' }}><span><b>启用异动提醒</b><small>应用于所有用户各自的重点观察股票</small></span></label>
+          <fieldset class="anomaly-common-rule">
+            <legend><span>01</span> 共同前提</legend>
+            <div class="rule-formula"><b>所有异动分支都必须先满足</b><code>当日涨幅 &gt; 最低涨幅</code><small>涨幅按当前价或收盘价相对前一交易日收盘计算。未通过时，不进入下面任何分支。</small></div>
+            <div class="alert-field-grid anomaly-common-fields">
+              <label><span>共同最低涨幅</span><div class="input-suffix"><input name="min_change_percent" type="number" min="0" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.min_change_ratio * 100) }}" required><i>%</i></div><small>普通异动和下跌异动共同使用</small></label>
+            </div>
+          </fieldset>
+
+          <div class="anomaly-branch-heading"><span>共同前提通过后，满足下面任意一条分支即可产生信号</span></div>
+          <div class="anomaly-rule-branches">
+            <fieldset>
+              <legend><span>02-A</span> 普通异动分支</legend>
+              <div class="rule-formula"><b>不限制前期趋势</b><code>共同涨幅 + 前 N 日中位量比</code></div>
+              <div class="rule-outcomes"><span><i>候选</i>量比 ≥ {{ '%.1f'|format(alert_params.candidate_volume_ratio) }}</span><span><i>确认</i>量比 ≥ {{ '%.1f'|format(alert_params.confirmation_volume_ratio) }}</span></div>
+              <div class="alert-field-grid">
+                <label><span>成交量基准窗口</span><input name="volume_window" type="number" min="5" max="60" value="{{ alert_params.volume_window }}" required><small>使用窗口内成交量中位数</small></label>
+                <label><span>盘中候选量比</span><input name="candidate_volume_ratio" type="number" min="1" max="10" step="0.1" value="{{ '%.1f'|format(alert_params.candidate_volume_ratio) }}" required></label>
+                <label><span>收盘确认量比</span><input name="confirmation_volume_ratio" type="number" min="1" max="10" step="0.1" value="{{ '%.1f'|format(alert_params.confirmation_volume_ratio) }}" required></label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend><span>02-B</span> 下跌异动分支</legend>
+              <div class="rule-formula"><b>用于抓下跌后的首次量能活跃</b><code>共同涨幅 + 前期下跌 + 近期量比</code></div>
+              <div class="rule-outcomes"><span><i>观察</i>下跌达标 + 近期量比达标</span><span><i>确认</i>再加收阳 + 收盘位置达标</span></div>
+              <div class="alert-field-grid">
+                <label><span>下跌观察窗口</span><input name="downtrend_lookback_days" type="number" min="5" max="60" value="{{ alert_params.downtrend_lookback_days }}" required></label>
+                <label><span>下跌趋势至少</span><div class="input-suffix"><input name="downtrend_min_drop_percent" type="number" min="1" max="50" step="0.1" value="{{ '%.1f'|format(alert_params.downtrend_min_drop_ratio * 100) }}" required><i>%</i></div></label>
+                <label><span>近期量能窗口</span><input name="downtrend_volume_window" type="number" min="5" max="60" value="{{ alert_params.downtrend_volume_window }}" required><small>使用近期成交量中位数</small></label>
+                <label><span>下跌观察量比</span><input name="downtrend_candidate_volume_ratio" type="number" min="1" max="10" step="0.1" value="{{ '%.1f'|format(alert_params.downtrend_candidate_volume_ratio) }}" required></label>
+                <label><span>反转确认收盘位置</span><div class="input-suffix"><input name="downtrend_confirmation_close_position_percent" type="number" min="0" max="100" step="1" value="{{ '%.0f'|format(alert_params.downtrend_confirmation_close_position * 100) }}" required><i>%</i></div><small>确认还要求信号日收阳</small></label>
+              </div>
+            </fieldset>
           </div>
+
+          <fieldset class="anomaly-label-rules">
+            <legend><span>03</span> 确认后的升级与背景标签</legend>
+            <div class="rule-formula"><b>这些条件不会单独触发异动</b><small>强异动用于升级已确认信号；短期收敛只用于解释此前价格结构。</small></div>
+            <div class="alert-field-grid">
+              <label><span>强异动涨幅</span><div class="input-suffix"><input name="strong_change_percent" type="number" min="0" max="30" step="0.1" value="{{ '%.1f'|format(alert_params.strong_change_ratio * 100) }}" required><i>%</i></div><small>确认后满足涨幅或量比任一项</small></label>
+              <label><span>强异动量比</span><input name="strong_volume_ratio" type="number" min="1" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.strong_volume_ratio) }}" required></label>
+              <label><span>短期收敛天数</span><input name="short_consolidation_days" type="number" min="2" max="10" value="{{ alert_params.short_consolidation_days }}" required></label>
+              <label><span>短期收盘区间最多</span><div class="input-suffix"><input name="short_close_range_percent" type="number" min="0.1" max="20" step="0.1" value="{{ '%.1f'|format(alert_params.short_close_range_ratio * 100) }}" required><i>%</i></div><small>仅作为背景标签</small></label>
+            </div>
+          </fieldset>
           <button class="button" type="submit">保存提醒参数</button>
         </form>
       </section>
       {% set ae = alert_effectiveness %}
       <section class="panel alert-backtest-panel">
-        <div class="alert-backtest-head"><div><span class="eyebrow">REAL OUTCOMES</span><div class="panel-title">横盘整理企稳提醒效果</div><p class="hint">只统计真实收盘确认事件，以实际触发价计算后续收益。</p></div><div class="pill">{{ ae.summary.total }} 个事件</div></div>
+        <div class="alert-backtest-head"><div><span class="eyebrow">REAL OUTCOMES</span><div class="panel-title">异动提醒效果</div><p class="hint">候选和确认分别使用真实触发价统计后续收益。</p></div><div class="pill">{{ ae.summary.total }} 个事件</div></div>
         <div class="backtest-summary">
           {% for key, label in [('day_1_close_return','T+1'),('day_3_close_return','T+3'),('day_5_close_return','T+5'),('day_10_close_return','T+10')] %}{% set p = ae.performance[key] %}<div class="{{ 'hit' if p.average is not none and p.average > 0 else '' }}"><span>{{ label }}</span><b>{{ p.average|percent if p.average is not none else '--' }}</b><small>{{ p.samples }} 个完整样本{% if p.win_rate is not none %} · 胜率 {{ p.win_rate|percent }}{% endif %}</small></div>{% endfor %}
         </div>
-        {% if ae.rows %}<div class="table-wrap"><table class="sample-table"><thead><tr><th>信号日</th><th>证券</th><th>信号价</th><th>T+1</th><th>T+3</th><th>T+5</th></tr></thead><tbody>{% for row in ae.rows %}<tr><td>{{ row.signal_date }}</td><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ row.signal_price|money }}</td><td>{{ row.day_1_close_return|percent if row.day_1_close_return is not none else '--' }}</td><td>{{ row.day_3_close_return|percent if row.day_3_close_return is not none else '--' }}</td><td>{{ row.day_5_close_return|percent if row.day_5_close_return is not none else '--' }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="empty">暂无真实横盘整理企稳事件，后续收盘确认会自动进入统计。</div>{% endif %}
+        {% if ae.rows %}<div class="table-wrap"><table class="sample-table"><thead><tr><th>信号日</th><th>证券</th><th>阶段</th><th>信号价</th><th>T+1</th><th>T+3</th><th>T+5</th></tr></thead><tbody>{% for row in ae.rows %}<tr><td>{{ row.signal_date }}</td><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ '盘中观察' if row.stage == 'CANDIDATE' else '收盘确认' }}</td><td>{{ row.signal_price|money }}</td><td>{{ row.day_1_close_return|percent if row.day_1_close_return is not none else '--' }}</td><td>{{ row.day_3_close_return|percent if row.day_3_close_return is not none else '--' }}</td><td>{{ row.day_5_close_return|percent if row.day_5_close_return is not none else '--' }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="empty">暂无真实异动事件，后续候选和确认会自动进入统计。</div>{% endif %}
       </section>
       <section class="panel alert-backtest-panel">
-        <div class="alert-backtest-head"><div><span class="eyebrow">HISTORICAL TEST</span><div class="panel-title">重点观察历史命中测试</div><p class="hint">测试只读取已有日线，不生成通知。趋势分类只影响标签，不阻止提醒。</p></div>{% if alert_watchlist %}<a class="button secondary" href="{{ url_for('analysis_watchlist') }}">同步历史行情</a>{% endif %}</div>
+        <div class="alert-backtest-head"><div><span class="eyebrow">SIGNAL TEST</span><div class="panel-title">指定信号日命中测试</div><p class="hint">选择一个交易日，系统读取该日之前的历史行情并判断当天是否触发异动；测试不会生成通知。</p></div>{% if alert_watchlist %}<a class="button secondary" href="{{ url_for('analysis_watchlist') }}">同步历史行情</a>{% endif %}</div>
         {% if alert_watchlist %}
         <form class="alert-backtest-form" method="get" action="{{ url_for('consolidation_stabilization_management') }}">
           <input type="hidden" name="run_test" value="1">
           <label><span>重点观察股票</span><select name="stock_code" required><option value="">请选择股票</option>{% for stock in alert_watchlist %}<option value="{{ stock.stock_code }}" {{ 'selected' if stock.stock_code == selected_stock_code else '' }}>{{ stock.stock_name }} · {{ stock.stock_code }}</option>{% endfor %}</select></label>
-          <label><span>开始日期</span><input name="start_date" type="date" value="{{ test_start_date }}" required></label>
-          <label><span>截止日期</span><input name="end_date" type="date" value="{{ test_end_date }}" required></label>
+          <label><span>信号日</span><input name="signal_date" type="date" value="{{ test_signal_date }}" required></label>
           <button class="button" type="submit">测试是否命中</button>
         </form>
         {% else %}<div class="empty">当前用户还没有重点观察股票，请先添加股票并同步历史行情。</div>{% endif %}
@@ -2050,21 +2085,21 @@
         {% if backtest %}
         <div class="backtest-summary"><div><span>测试股票</span><b>{{ backtest.stock_name }}</b><small>{{ backtest.stock_code }}</small></div><div><span>参与扫描</span><b>{{ backtest.scanned_days }}</b><small>个交易日</small></div><div class="{{ 'hit' if backtest.hits else '' }}"><span>命中次数</span><b>{{ backtest.hits|length }}</b><small>次</small></div></div>
         {% if backtest.insufficient %}<div class="backtest-message warning"><b>历史行情不足，无法完成测试。</b><span>数据库行情范围：{{ backtest.first_price_date or '无' }} 至 {{ backtest.last_price_date or '无' }}。</span></div>
-        {% elif not backtest.hits %}<div class="backtest-message neutral"><b>所选日期范围内没有命中“横盘整理企稳”。</b><span>已扫描 {{ backtest.scanned_days }} 个交易日。</span></div>
-        {% else %}<div class="backtest-hit-list">{% for hit in backtest.hits %}<details class="backtest-hit" open><summary><div><span class="backtest-hit-date">{{ hit.signal_date }}</span><b>{{ {'DOWN_STABILIZATION':'下跌企稳','UP_CONTINUATION':'上涨中继','NEUTRAL_BREAKOUT':'中性横盘突破'}[hit.pattern_type] }}</b></div><div><span>放量 <b>{{ '%.2f'|format(hit.breakout_volume_ratio) }} 倍</b></span></div></summary><div class="backtest-checks"><span class="pass">✓ 背景探底 {{ hit.setup_low|money }}</span><span class="pass">✓ 整理振幅 {{ '%.2f'|format(hit.range_ratio * 100) }}%</span><span class="pass">✓ 收盘突破 {{ hit.range_high|money }}</span><span class="pass">✓ 前置趋势 {{ hit.trend_change_ratio|percent }}</span></div><div class="table-wrap"><table class="backtest-candles"><thead><tr><th>日期</th><th>开盘</th><th>最高</th><th>最低</th><th>收盘</th><th>成交量（手）</th></tr></thead><tbody>{% for candle in hit.candles %}<tr><td>{{ candle.trade_date }}</td><td>{{ candle.open|money }}</td><td>{{ candle.high|money }}</td><td>{{ candle.low|money }}</td><td>{{ candle.close|money }}</td><td>{{ '%.0f'|format((candle.volume or 0) / 100) }}</td></tr>{% endfor %}</tbody></table></div></details>{% endfor %}</div>{% endif %}
+        {% elif not backtest.hits %}<div class="backtest-message neutral"><b>所选日期范围内没有命中“异动提醒”。</b><span>已扫描 {{ backtest.scanned_days }} 个交易日。</span></div>
+        {% else %}<div class="backtest-hit-list">{% for hit in backtest.hits %}<details class="backtest-hit" open><summary><div><span class="backtest-hit-date">{{ hit.signal_date }}</span><b>{{ '下跌反转确认' if hit.downtrend_reversal_ok else '下跌异动观察' if hit.downtrend_observation_ok else '强异动' if hit.pattern_type == 'STRONG_ANOMALY' else '放量上涨异动' }}</b></div><div><span>量比 <b>{{ '%.2f'|format(hit.effective_volume_ratio) }} 倍</b></span></div></summary><div class="backtest-checks"><span class="pass">✓ 涨幅 {{ hit.change_ratio|percent }}</span><span class="{{ 'pass' if hit.short_consolidation else '' }}">{{ '✓' if hit.short_consolidation else '·' }} 三日收盘区间 {{ '%.2f'|format(hit.short_close_range_ratio * 100) }}%</span><span class="{{ 'pass' if hit.breakout_up else '' }}">{{ '✓ 突破近期高点' if hit.breakout_up else '· 未突破近期高点' }}</span><span>背景趋势 {{ hit.trend_change_ratio|percent }}</span></div></details>{% endfor %}</div>{% endif %}
         {% endif %}
       </section>
 
       {% elif page == 'consolidation_stabilization_pool' %}
-      <nav class="alert-page-tabs" aria-label="横盘整理企稳功能"><a href="{{ url_for('consolidation_stabilization_management') }}">规则参数</a><a class="active" href="{{ url_for('consolidation_stabilization_pool') }}">样本池</a></nav>
-      <section class="intro"><div><span class="eyebrow">RESEARCH / SAMPLE POOL</span><p>沉淀横盘整理后的收盘突破样本，以真实后续表现评估下跌企稳、上涨中继和中性突破。</p></div></section>
+      <nav class="alert-page-tabs" aria-label="异动提醒功能"><a href="{{ url_for('consolidation_stabilization_management') }}">规则参数</a><a class="active" href="{{ url_for('consolidation_stabilization_pool') }}">样本池</a></nav>
+      <section class="intro"><div><span class="eyebrow">RESEARCH / SAMPLE POOL</span><p>沉淀放量上涨异动和强异动样本，用真实后续收益持续验证量价阈值。</p></div></section>
       {% set ps = signal_pool.summary %}
       <section class="signal-pool-tools">
-        <form class="panel signal-pool-form" method="post" action="{{ url_for('add_consolidation_stabilization_sample') }}"><div class="panel-title">手工加入样本</div><p class="hint">允许加入非重点观察股票；行情缺失时自动读取。手工类型用于保留研究判断。</p><div><label><span>股票代码</span><input name="stock_code" required></label><label><span>股票名称</span><input name="stock_name" required></label><label><span>信号日</span><input name="signal_date" type="date" required></label><label><span>形态类型</span><select name="pattern_type"><option value="">自动识别</option><option value="DOWN_STABILIZATION">下跌企稳</option><option value="UP_CONTINUATION">上涨中继</option><option value="NEUTRAL_BREAKOUT">中性横盘突破</option></select></label><label class="wide"><span>备注</span><input name="note" maxlength="500"></label><button class="button" type="submit">确认加入</button></div></form>
+        <form class="panel signal-pool-form" method="post" action="{{ url_for('add_consolidation_stabilization_sample') }}"><div class="panel-title">手工加入样本</div><p class="hint">允许加入非重点观察股票；行情缺失时自动读取。</p><div><label><span>股票代码</span><input name="stock_code" required></label><label><span>股票名称</span><input name="stock_name" required></label><label><span>信号日</span><input name="signal_date" type="date" required></label><label><span>异动强度</span><select name="pattern_type"><option value="">自动识别</option><option value="ANOMALY">放量上涨异动</option><option value="STRONG_ANOMALY">强异动</option></select></label><label class="wide"><span>备注</span><input name="note" maxlength="500"></label><button class="button" type="submit">确认加入</button></div></form>
         <form class="panel signal-pool-scan" method="post" action="{{ url_for('scan_consolidation_stabilization_history') }}"><div class="panel-title">扫描重点观察历史</div><p class="hint">命中结果进入待确认池，不生成通知。</p><label><span>开始日期</span><input name="start_date" type="date" required></label><label><span>截止日期</span><input name="end_date" type="date" required></label><button class="button secondary" type="submit">开始扫描</button></form>
       </section>
-      <section class="panel signal-pool-panel"><div class="signal-pool-heading"><div class="panel-title">样本记录 <span class="pill">规则版本可追溯</span></div><div class="signal-pool-counts"><span>全部 <b>{{ ps.total }}</b></span><span>待确认 <b>{{ ps.pending }}</b></span><span>已确认 <b>{{ ps.confirmed }}</b></span><span>已否决 <b>{{ ps.rejected }}</b></span></div></div><div class="table-wrap"><table><thead><tr><th>信号日</th><th>股票</th><th>类型</th><th>来源/状态</th><th>整理区间</th><th>整理振幅</th><th>突破量比</th><th>前置趋势</th><th>次日</th><th>3日</th><th>5日</th><th>备注</th><th>操作</th></tr></thead><tbody>
-      {% for row in signal_pool.rows %}<tr><td>{{ row.signal_date }}</td><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ {'DOWN_STABILIZATION':'下跌企稳','UP_CONTINUATION':'上涨中继','NEUTRAL_BREAKOUT':'中性横盘突破'}[row.pattern_type] }}</td><td>{{ '手工' if row.source == 'MANUAL' else '系统' }}<br><span class="episode-status {{ 'closed' if row.review_status == 'CONFIRMED' else 'open' if row.review_status == 'PENDING' else 'pending' }}">{{ {'PENDING':'待确认','CONFIRMED':'已确认','REJECTED':'已否决'}[row.review_status] }}</span></td><td>{{ row.metrics.range_low|money }} - {{ row.metrics.range_high|money }}</td><td>{{ '%.2f'|format(row.metrics.range_ratio * 100) }}%</td><td>{{ '%.2f'|format(row.metrics.breakout_volume_ratio) }} 倍</td><td>{{ row.metrics.trend_change_ratio|percent }}</td><td>{{ (row.day_1_close_return|percent) if row.day_1_close_return is not none else '--' }}</td><td>{{ (row.day_3_close_return|percent) if row.day_3_close_return is not none else '--' }}</td><td>{{ (row.day_5_close_return|percent) if row.day_5_close_return is not none else '--' }}</td><td class="pool-note"><input form="consolidation-sample-review-{{ row.id }}" name="note" value="{{ row.note }}" maxlength="500" placeholder="备注"></td><td class="pool-actions"><form id="consolidation-sample-review-{{ row.id }}" method="post" action="{{ url_for('review_consolidation_stabilization_sample', sample_id=row.id) }}"></form><button form="consolidation-sample-review-{{ row.id }}" name="review_status" value="CONFIRMED">确认</button><button form="consolidation-sample-review-{{ row.id }}" class="reject" name="review_status" value="REJECTED">否决</button></td></tr>
+      <section class="panel signal-pool-panel"><div class="signal-pool-heading"><div class="panel-title">样本记录 <span class="pill">规则版本可追溯</span></div><div class="signal-pool-counts"><span>全部 <b>{{ ps.total }}</b></span><span>待确认 <b>{{ ps.pending }}</b></span><span>已确认 <b>{{ ps.confirmed }}</b></span><span>已否决 <b>{{ ps.rejected }}</b></span></div></div><div class="table-wrap"><table><thead><tr><th>信号日</th><th>股票</th><th>强度</th><th>来源/状态</th><th>涨幅</th><th>量比</th><th>短期收敛</th><th>背景</th><th>次日</th><th>3日</th><th>5日</th><th>备注</th><th>操作</th></tr></thead><tbody>
+      {% for row in signal_pool.rows %}<tr><td>{{ row.signal_date }}</td><td><b>{{ row.stock_name }}</b><small>{{ row.stock_code }}</small></td><td>{{ {'ANOMALY':'放量上涨异动','STRONG_ANOMALY':'强异动','DOWN_STABILIZATION':'旧·下跌企稳','UP_CONTINUATION':'旧·上涨中继','NEUTRAL_BREAKOUT':'旧·中性突破'}.get(row.pattern_type, row.pattern_type) }}</td><td>{{ '手工' if row.source == 'MANUAL' else '系统' }}<br><span class="episode-status {{ 'closed' if row.review_status == 'CONFIRMED' else 'open' if row.review_status == 'PENDING' else 'pending' }}">{{ {'PENDING':'待确认','CONFIRMED':'已确认','REJECTED':'已否决'}[row.review_status] }}</span></td><td>{{ row.metrics.change_ratio|percent if row.metrics.change_ratio is defined else '--' }}</td><td>{{ ('%.2f'|format(row.metrics.volume_ratio) ~ ' 倍') if row.metrics.volume_ratio is defined else '--' }}</td><td>{{ ('是 · ' ~ '%.2f'|format(row.metrics.short_close_range_ratio * 100) ~ '%') if row.metrics.short_consolidation is defined and row.metrics.short_consolidation else '否' }}</td><td>{{ {'DOWNTREND_REBOUND':'下跌后反弹','UPTREND_ACCELERATION':'上涨加速','NEUTRAL':'中性'}.get(row.metrics.background_type, '--') }}</td><td>{{ (row.day_1_close_return|percent) if row.day_1_close_return is not none else '--' }}</td><td>{{ (row.day_3_close_return|percent) if row.day_3_close_return is not none else '--' }}</td><td>{{ (row.day_5_close_return|percent) if row.day_5_close_return is not none else '--' }}</td><td class="pool-note"><input form="consolidation-sample-review-{{ row.id }}" name="note" value="{{ row.note }}" maxlength="500" placeholder="备注"></td><td class="pool-actions"><form id="consolidation-sample-review-{{ row.id }}" method="post" action="{{ url_for('review_consolidation_stabilization_sample', sample_id=row.id) }}"></form><button form="consolidation-sample-review-{{ row.id }}" name="review_status" value="CONFIRMED">确认</button><button form="consolidation-sample-review-{{ row.id }}" class="reject" name="review_status" value="REJECTED">否决</button></td></tr>
       {% else %}<tr><td colspan="13" class="empty">样本池为空。可手工加入金标准，或扫描重点观察历史行情。</td></tr>{% endfor %}
       </tbody></table></div></section>
 

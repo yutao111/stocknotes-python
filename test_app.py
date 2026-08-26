@@ -1465,21 +1465,20 @@ class StockNotesTest(unittest.TestCase):
         self.assertEqual(self.client.get("/analysis/watchlist").get_data(as_text=True).count("通富微电"), 0)
         self.assertEqual(self.client.get("/analysis/watchlist/kline/002156").status_code, 404)
 
-    def test_watchlist_sync_uses_incremental_date_range(self):
+    def test_watchlist_sync_fetches_recent_two_years(self):
         with patch.object(self.module, "sync_history_codes", return_value=(0, [])):
             self.client.post(
                 "/analysis/watchlist",
                 data={"stock_code": "2156", "stock_name": "通富微电", "priority": "2"},
             )
         today = date.today()
-        expected_initial = (today - timedelta(days=250)).isoformat()
+        expected_start = (today - timedelta(days=730)).isoformat()
         latest_date = today - timedelta(days=1)
-        expected_incremental = (latest_date - timedelta(days=7)).isoformat()
 
         with patch.object(self.module, "fetch_daily_prices", return_value=(None, None)) as fetch:
             response = self.client.post("/analysis/watchlist/sync-history")
             self.assertEqual(response.status_code, 302)
-            fetch.assert_called_once_with("002156", expected_initial, today.isoformat())
+            fetch.assert_called_once_with("002156", expected_start, today.isoformat())
 
         with self.module.db_connect() as db:
             db.execute(
@@ -1492,7 +1491,7 @@ class StockNotesTest(unittest.TestCase):
         with patch.object(self.module, "fetch_daily_prices", return_value=(None, None)) as fetch:
             response = self.client.post("/analysis/watchlist/sync-history")
             self.assertEqual(response.status_code, 302)
-            fetch.assert_called_once_with("002156", expected_incremental, today.isoformat())
+            fetch.assert_called_once_with("002156", expected_start, today.isoformat())
 
     def test_watchlist_sync_fetches_stocks_in_parallel(self):
         with patch.object(self.module, "sync_history_codes", return_value=(0, [])):
@@ -1899,6 +1898,17 @@ class StockNotesTest(unittest.TestCase):
 
     def _consolidation_stabilization_sample(self):
         return [
+            {"trade_date": "2026-05-15", "open": 26.20, "high": 26.60, "low": 25.80, "close": 26.39, "volume": 24000000},
+            {"trade_date": "2026-05-18", "open": 26.30, "high": 26.70, "low": 26.00, "close": 26.35, "volume": 25000000},
+            {"trade_date": "2026-05-19", "open": 26.20, "high": 26.55, "low": 25.90, "close": 26.10, "volume": 23500000},
+            {"trade_date": "2026-05-20", "open": 26.07, "high": 26.72, "low": 25.91, "close": 26.47, "volume": 24648000},
+            {"trade_date": "2026-05-21", "open": 26.40, "high": 27.17, "low": 26.14, "close": 26.48, "volume": 33710600},
+            {"trade_date": "2026-05-22", "open": 26.53, "high": 26.60, "low": 25.53, "close": 25.73, "volume": 33067700},
+            {"trade_date": "2026-05-25", "open": 25.52, "high": 25.88, "low": 25.20, "close": 25.59, "volume": 20576500},
+            {"trade_date": "2026-05-26", "open": 25.46, "high": 25.61, "low": 25.02, "close": 25.30, "volume": 20339000},
+            {"trade_date": "2026-05-27", "open": 25.30, "high": 25.52, "low": 24.82, "close": 25.11, "volume": 26173800},
+            {"trade_date": "2026-05-28", "open": 25.39, "high": 25.42, "low": 24.65, "close": 24.82, "volume": 22240500},
+            {"trade_date": "2026-05-29", "open": 24.85, "high": 25.46, "low": 24.53, "close": 24.90, "volume": 31425500},
             {"trade_date": "2026-06-01", "open": 24.46, "high": 24.98, "low": 23.90, "close": 24.34, "volume": 24089000},
             {"trade_date": "2026-06-02", "open": 24.28, "high": 24.38, "low": 23.50, "close": 23.84, "volume": 22939900},
             {"trade_date": "2026-06-03", "open": 23.73, "high": 23.73, "low": 23.14, "close": 23.29, "volume": 30451400},
@@ -1915,37 +1925,141 @@ class StockNotesTest(unittest.TestCase):
             {"trade_date": "2026-06-18", "open": 21.82, "high": 22.74, "low": 21.66, "close": 22.51, "volume": 41863700},
         ]
 
-    def test_consolidation_stabilization_kanglong_sample_confirms_on_june_18(self):
+    def test_consolidation_stabilization_kanglong_sample_confirms_on_june_12(self):
         prices = self._consolidation_stabilization_sample()
-        result = self.module.evaluate_consolidation_stabilization(prices)
+        signal_index = next(index for index, row in enumerate(prices) if row["trade_date"] == "2026-06-12")
+        result = self.module.evaluate_consolidation_stabilization(prices[:signal_index + 1])
         self.assertTrue(result["matched"])
-        self.assertEqual(result["pattern_type"], "DOWN_STABILIZATION")
-        self.assertTrue(result["setup_ok"])
-        self.assertAlmostEqual(result["setup_range_ratio"], 22.35 / 20.81 - 1)
-        self.assertEqual(result["signal"]["trade_date"], "2026-06-18")
-        self.assertAlmostEqual(result["range_high"], 22.28)
-        self.assertAlmostEqual(result["range_ratio"], 22.28 / 21.60 - 1)
-        self.assertGreater(result["breakout_volume_ratio"], 1.2)
+        self.assertEqual(result["pattern_type"], "ANOMALY")
+        self.assertEqual(result["signal_type"], "DOWNTREND_REVERSAL")
+        self.assertEqual(result["signal"]["trade_date"], "2026-06-12")
+        self.assertAlmostEqual(result["change_ratio"], 22.18 / 21.52 - 1)
+        self.assertEqual(result["volume_window"], 20)
+        expected_median = sorted(row["volume"] for row in prices[signal_index - 20:signal_index])
+        self.assertAlmostEqual(result["volume_baseline"], (expected_median[9] + expected_median[10]) / 2)
+        self.assertGreater(result["volume_ratio"], 2.8)
+        self.assertLess(result["volume_ratio"], 3.0)
+        self.assertTrue(result["short_consolidation"])
+        self.assertAlmostEqual(result["short_close_range_ratio"], (22.08 - 21.52) / 21.52)
+        self.assertEqual(result["background_type"], "DOWNTREND_REBOUND")
+        self.assertTrue(result["downtrend_observation_ok"])
+        self.assertTrue(result["downtrend_reversal_ok"])
+        self.assertFalse(result["breakout_up"])
 
-        realtime_volume = [dict(row) for row in prices]
+        realtime_volume = [dict(row) for row in prices[:signal_index + 1]]
         realtime_volume[-1]["source"] = "tencent-realtime"
         self.assertTrue(self.module.evaluate_consolidation_stabilization(realtime_volume)["matched"])
         self.assertAlmostEqual(
-            self.module.evaluate_consolidation_stabilization(realtime_volume)["breakout_volume_ratio"],
-            result["breakout_volume_ratio"],
+            self.module.evaluate_consolidation_stabilization(realtime_volume)["volume_ratio"],
+            result["volume_ratio"],
         )
 
-        self.assertFalse(self.module.evaluate_consolidation_stabilization(prices[:-1])["matched"])
-        no_volume = [dict(row) for row in prices]
+        no_volume = [dict(row) for row in prices[:signal_index + 1]]
         no_volume[-1]["volume"] = 30000000
         self.assertFalse(self.module.evaluate_consolidation_stabilization(no_volume)["matched"])
-        no_breakout = [dict(row) for row in prices]
-        no_breakout[-1]["close"] = 22.20
-        self.assertFalse(self.module.evaluate_consolidation_stabilization(no_breakout)["matched"])
+        low_change = [dict(row) for row in prices[:signal_index + 1]]
+        low_change[-1]["close"] = 21.90
+        self.assertFalse(self.module.evaluate_consolidation_stabilization(low_change)["matched"])
+
+    def test_anomaly_boundaries_strength_and_no_future_data(self):
+        prices = self._consolidation_stabilization_sample()
+        signal_index = next(index for index, row in enumerate(prices) if row["trade_date"] == "2026-06-12")
+        signal_prices = [dict(row) for row in prices[:signal_index + 1]]
+        baseline_result = self.module.evaluate_consolidation_stabilization(signal_prices)
+
+        future_changed = signal_prices + [
+            {"trade_date": "2026-06-15", "open": 1, "high": 100, "low": 1, "close": 100, "volume": 9999999999},
+        ]
+        historical_result = self.module.evaluate_consolidation_stabilization(future_changed[:-1])
+        self.assertEqual(historical_result["signal"]["trade_date"], "2026-06-12")
+        self.assertAlmostEqual(historical_result["volume_ratio"], baseline_result["volume_ratio"])
+
+        exactly_two_percent = [dict(row) for row in signal_prices]
+        exactly_two_percent[-1]["close"] = exactly_two_percent[-2]["close"] * 1.02
+        self.assertFalse(self.module.evaluate_consolidation_stabilization(exactly_two_percent)["matched"])
+
+        strong_by_change = [dict(row) for row in signal_prices]
+        strong_by_change[-1]["close"] = strong_by_change[-2]["close"] * 1.04
+        self.assertEqual(
+            self.module.evaluate_consolidation_stabilization(strong_by_change)["pattern_type"],
+            "STRONG_ANOMALY",
+        )
+        strong_by_volume = [dict(row) for row in signal_prices]
+        strong_by_volume[-1]["volume"] = baseline_result["volume_baseline"] * 3
+        self.assertEqual(
+            self.module.evaluate_consolidation_stabilization(strong_by_volume)["pattern_type"],
+            "STRONG_ANOMALY",
+        )
+
+    def test_zhongke_downtrend_anomaly_is_observation_only(self):
+        raw = [
+            ("2026-05-13", 95.62, 100.62, 94.64, 100.33, 82187000),
+            ("2026-05-14", 104.62, 104.62, 97.12, 97.21, 97816700),
+            ("2026-05-15", 97.14, 98.98, 93.62, 94.08, 80334000),
+            ("2026-05-18", 93.91, 101.22, 93.72, 98.32, 92563800),
+            ("2026-05-19", 97.62, 98.17, 94.62, 97.88, 64716700),
+            ("2026-05-20", 96.85, 99.11, 96.62, 98.00, 55467800),
+            ("2026-05-21", 100.48, 100.62, 92.60, 92.87, 83566200),
+            ("2026-05-22", 92.88, 95.06, 92.64, 94.42, 55590400),
+            ("2026-05-25", 94.92, 96.07, 93.22, 96.07, 66580000),
+            ("2026-05-26", 95.52, 95.60, 91.53, 93.95, 68746400),
+            ("2026-05-27", 93.71, 95.58, 89.91, 90.61, 59121000),
+            ("2026-05-28", 90.54, 91.78, 88.62, 90.87, 48132700),
+            ("2026-05-29", 92.92, 93.62, 87.51, 87.84, 53148500),
+            ("2026-06-01", 88.50, 89.54, 85.36, 85.40, 40355800),
+            ("2026-06-02", 86.03, 86.54, 83.45, 86.02, 38634400),
+            ("2026-06-03", 85.56, 88.78, 85.06, 86.32, 44761300),
+            ("2026-06-04", 85.00, 86.21, 84.12, 84.40, 33937500),
+            ("2026-06-05", 83.67, 84.82, 82.14, 82.37, 38642200),
+            ("2026-06-08", 79.90, 80.69, 77.77, 78.51, 42722300),
+            ("2026-06-09", 79.60, 80.49, 78.90, 80.40, 30629600),
+            ("2026-06-10", 81.87, 86.33, 81.87, 82.70, 64650600),
+        ]
+        prices = [
+            {"trade_date": day, "open": open_, "high": high, "low": low, "close": close, "volume": volume}
+            for day, open_, high, low, close, volume in raw
+        ]
+        result = self.module.evaluate_consolidation_stabilization(prices)
+        self.assertTrue(result["downtrend_observation_ok"])
+        self.assertFalse(result["downtrend_reversal_ok"])
+        self.assertTrue(result["candidate_ok"])
+        self.assertFalse(result["confirmed_ok"])
+        self.assertEqual(result["signal_type"], "DOWNTREND_ANOMALY")
+        self.assertAlmostEqual(result["downtrend_volume_ratio"], 1.5563812845984681)
+        self.assertAlmostEqual(result["close_position"], 0.18609865470852005)
+
+        now = "2026-06-10T15:01:00"
+        with self.module.db_connect() as db:
+            user_id = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
+            db.execute(
+                """INSERT INTO watchlist_stocks
+                (user_id, stock_code, stock_name, priority, note, created_at, updated_at)
+                VALUES (?, '603019', '中科曙光', 3, '', ?, ?)""",
+                (user_id, now, now),
+            )
+            for row in prices:
+                db.execute(
+                    """INSERT INTO daily_prices
+                    (stock_code, trade_date, open, high, low, close, volume, source, fetched_at)
+                    VALUES ('603019', ?, ?, ?, ?, ?, ?, 'test', ?)""",
+                    (row["trade_date"], row["open"], row["high"], row["low"], row["close"], row["volume"], now),
+                )
+            quote = {"603019": dict(prices[-1], fetched_at=now, quote_time=now)}
+            self.assertEqual(self.module.evaluate_consolidation_stabilization_alerts(db, quote), 1)
+            self.assertEqual(self.module.evaluate_consolidation_stabilization_alerts(db, quote), 0)
+            notification = db.execute("SELECT stage, content FROM notifications").fetchone()
+            event = db.execute("SELECT stage, metrics_json FROM alert_signal_events").fetchone()
+        self.assertEqual(notification["stage"], "CANDIDATE")
+        self.assertIn("下跌异动观察", notification["content"])
+        self.assertIn("前 10 日中位量的 1.56 倍", notification["content"])
+        self.assertEqual(event["stage"], "CANDIDATE")
+        self.assertEqual(json.loads(event["metrics_json"])["signal_type"], "DOWNTREND_ANOMALY")
 
     def test_consolidation_stabilization_realtime_is_confirmed_user_scoped_and_deduplicated(self):
         prices = self._consolidation_stabilization_sample()
-        now = "2026-06-18T15:01:00"
+        signal_index = next(index for index, row in enumerate(prices) if row["trade_date"] == "2026-06-12")
+        signal_prices = prices[:signal_index + 1]
+        now = "2026-06-12T14:30:00"
         with self.module.db_connect() as db:
             first_user = db.execute("SELECT id FROM users WHERE name = 'yutaoGS'").fetchone()["id"]
             second_user = db.execute(
@@ -1959,14 +2073,18 @@ class StockNotesTest(unittest.TestCase):
                     VALUES (?, '300759', '康龙化成', 3, '', ?, ?)""",
                     (user_id, now, now),
                 )
-            for row in prices:
+            for row in signal_prices:
                 db.execute(
                     """INSERT INTO daily_prices
                     (stock_code, trade_date, open, high, low, close, volume, source, fetched_at)
                     VALUES ('300759', ?, ?, ?, ?, ?, ?, 'test', ?)""",
                     (row["trade_date"], row["open"], row["high"], row["low"], row["close"], row["volume"], now),
                 )
-            quote = {"300759": dict(prices[-1], fetched_at=now, quote_time=now)}
+            quote = {"300759": dict(signal_prices[-1], fetched_at=now, quote_time=now)}
+            self.assertEqual(self.module.evaluate_consolidation_stabilization_alerts(db, quote), 2)
+            self.assertEqual(self.module.evaluate_consolidation_stabilization_alerts(db, quote), 0)
+            closing_time = "2026-06-12T15:01:00"
+            quote["300759"].update({"fetched_at": closing_time, "quote_time": closing_time})
             self.assertEqual(self.module.evaluate_consolidation_stabilization_alerts(db, quote), 2)
             self.assertEqual(self.module.evaluate_consolidation_stabilization_alerts(db, quote), 0)
             notifications = db.execute(
@@ -1975,11 +2093,13 @@ class StockNotesTest(unittest.TestCase):
             events = db.execute(
                 "SELECT stage, rule_version, metrics_json FROM alert_signal_events ORDER BY user_id"
             ).fetchall()
-        self.assertEqual([row["stage"] for row in notifications], ["CONFIRMED", "CONFIRMED"])
-        self.assertTrue(all("下跌企稳" in row["content"] for row in notifications))
-        self.assertEqual(len(events), 2)
+        self.assertEqual([row["stage"] for row in notifications].count("CANDIDATE"), 2)
+        self.assertEqual([row["stage"] for row in notifications].count("CONFIRMED"), 2)
+        self.assertTrue(any("下跌异动观察" in row["content"] for row in notifications))
+        self.assertTrue(any("下跌反转确认" in row["content"] for row in notifications))
+        self.assertEqual(len(events), 4)
         self.assertTrue(all(row["rule_version"] == self.module.CONSOLIDATION_STABILIZATION_RULE_VERSION for row in events))
-        self.assertTrue(all(json.loads(row["metrics_json"])["pattern_type"] == "DOWN_STABILIZATION" for row in events))
+        self.assertTrue(all(json.loads(row["metrics_json"])["pattern_type"] == "ANOMALY" for row in events))
 
     def test_notification_api_is_user_scoped(self):
         now = "2026-08-14T15:00:00"
@@ -2267,33 +2387,54 @@ class StockNotesTest(unittest.TestCase):
                 )
 
         page = self.client.get(
-            "/admin/alert-types/consolidation-stabilization?run_test=1&stock_code=300759&start_date=2026-06-18&end_date=2026-06-18"
+            "/admin/alert-types/consolidation-stabilization?run_test=1&stock_code=300759&signal_date=2026-06-12"
         ).get_data(as_text=True)
-        self.assertIn("横盘整理企稳", page)
+        self.assertIn("异动提醒", page)
         self.assertIn("康龙化成", page)
-        self.assertIn("下跌企稳", page)
-        self.assertIn("1.34 倍", page)
+        self.assertIn("下跌反转确认", page)
+        self.assertIn("2.89 倍", page)
+        self.assertIn("共同前提", page)
+        self.assertIn("所有异动分支都必须先满足", page)
+        self.assertIn("普通异动分支", page)
+        self.assertIn("下跌异动分支", page)
+        self.assertIn("共同最低涨幅", page)
+        self.assertIn("这些条件不会单独触发异动", page)
+        self.assertIn('name="signal_date"', page)
+        self.assertNotIn('name="end_date"', page)
+
+        legacy_page = self.client.get(
+            "/admin/alert-types/consolidation-stabilization?run_test=1&stock_code=300759&start_date=2026-06-12&end_date=2026-06-12"
+        ).get_data(as_text=True)
+        self.assertIn("下跌反转确认", legacy_page)
 
         response = self.client.post(
             "/admin/alert-types/consolidation-stabilization",
             data={
-                "enabled": "on", "consolidation_days": "4", "max_range_percent": "5",
-                "trend_lookback_days": "12", "trend_threshold_percent": "6",
-                "min_breakout_volume_ratio": "1.3",
+                "enabled": "on", "volume_window": "15", "candidate_volume_ratio": "1.6",
+                "confirmation_volume_ratio": "2.2", "min_change_percent": "2.5",
+                "strong_change_percent": "5", "strong_volume_ratio": "3.5",
+                "short_consolidation_days": "4", "short_close_range_percent": "4",
+                "downtrend_lookback_days": "18", "downtrend_min_drop_percent": "9",
+                "downtrend_volume_window": "8", "downtrend_candidate_volume_ratio": "1.6",
+                "downtrend_confirmation_close_position_percent": "65",
             },
             follow_redirects=True,
         )
-        self.assertIn("已保存横盘整理企稳提醒参数", response.get_data(as_text=True))
+        self.assertIn("已保存异动提醒参数", response.get_data(as_text=True))
         with self.module.db_connect() as db:
             row = db.execute(
                 "SELECT params_json FROM alert_types WHERE code = ?",
                 (self.module.CONSOLIDATION_STABILIZATION_CODE,),
             ).fetchone()
         params = json.loads(row["params_json"])
-        self.assertEqual(params["consolidation_days"], 4)
-        self.assertEqual(params["trend_lookback_days"], 12)
-        self.assertAlmostEqual(params["max_range_ratio"], 0.05)
-        self.assertAlmostEqual(params["min_breakout_volume_ratio"], 1.3)
+        self.assertEqual(params["volume_window"], 15)
+        self.assertEqual(params["short_consolidation_days"], 4)
+        self.assertEqual(params["downtrend_lookback_days"], 18)
+        self.assertEqual(params["downtrend_volume_window"], 8)
+        self.assertAlmostEqual(params["min_change_ratio"], 0.025)
+        self.assertAlmostEqual(params["confirmation_volume_ratio"], 2.2)
+        self.assertAlmostEqual(params["downtrend_min_drop_ratio"], 0.09)
+        self.assertAlmostEqual(params["downtrend_confirmation_close_position"], 0.65)
 
     def test_consolidation_stabilization_pool_manual_sample_scan_and_review(self):
         now = "2026-06-25T15:00:00"
@@ -2318,23 +2459,22 @@ class StockNotesTest(unittest.TestCase):
 
         response = self.client.post(
             "/admin/alert-types/consolidation-stabilization/pool",
-            data={"stock_code": "300759", "stock_name": "康龙化成", "signal_date": "2026-06-18", "note": "金标准"},
+            data={"stock_code": "300759", "stock_name": "康龙化成", "signal_date": "2026-06-12", "note": "金标准"},
             follow_redirects=True,
         )
         text = response.get_data(as_text=True)
-        self.assertIn("已加入横盘整理企稳池", text)
-        self.assertIn("下跌企稳", text)
-        self.assertIn("整理区间", text)
+        self.assertIn("已加入异动样本池", text)
+        self.assertIn("放量上涨异动", text)
         with self.module.db_connect() as db:
             sample = db.execute("SELECT * FROM alert_signal_samples").fetchone()
             outcome = db.execute("SELECT * FROM alert_signal_outcomes").fetchone()
-        self.assertEqual(sample["pattern_type"], "DOWN_STABILIZATION")
+        self.assertEqual(sample["pattern_type"], "ANOMALY")
         self.assertEqual(sample["rule_version"], self.module.CONSOLIDATION_STABILIZATION_RULE_VERSION)
-        self.assertAlmostEqual(outcome["day_1_close_return"], 23.00 / 22.51 - 1)
+        self.assertAlmostEqual(outcome["day_1_close_return"], 22.27 / 22.18 - 1)
 
         response = self.client.post(
             "/admin/alert-types/consolidation-stabilization/pool/scan",
-            data={"start_date": "2026-06-18", "end_date": "2026-06-18"}, follow_redirects=True,
+            data={"start_date": "2026-06-12", "end_date": "2026-06-12"}, follow_redirects=True,
         )
         self.assertIn("历史扫描完成，处理 1 个命中样本", response.get_data(as_text=True))
         self.assertEqual(self.client.post(

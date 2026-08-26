@@ -30,7 +30,7 @@ DB_PATH = Path(os.environ.get("STOCKNOTES_DB", BASE_DIR / "stocknotes.db"))
 ALLOWED_EXTENSIONS = {"xlsx", "xls", "csv", "txt"}
 IGNORED_ACTIONS = {"申购配号", "股息入账", "股息红利税补", "指定交易"}
 STATEMENTS_PER_PAGE = 20
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 22
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 DEFAULT_USER_NAME = "yutaoGS"
 MAX_USER_NAME_LENGTH = 50
@@ -41,7 +41,7 @@ REVIEW_REASON_TYPES = (
     "VALUATION", "SECTOR_CONFIRMATION", "TECHNICAL_PATTERN", "SENTIMENT", "OTHER",
 )
 REVIEW_JUDGEMENT_RESULTS = ("CORRECT", "PARTIAL", "WRONG")
-PRICE_SYNC_INITIAL_DAYS = 250
+PRICE_SYNC_INITIAL_DAYS = 730
 PRICE_SYNC_OVERLAP_DAYS = 7
 PRICE_SYNC_WORKERS = 4
 AUTO_REALTIME_SYNC_INTERVAL_SECONDS = 5
@@ -95,16 +95,22 @@ THREE_DAY_DIP_DEFAULT_PARAMS = {
 THREE_DAY_DIP_RULE_VERSION = "three-day-dip-v7"
 CONSOLIDATION_STABILIZATION_CODE = "CONSOLIDATION_STABILIZATION"
 CONSOLIDATION_STABILIZATION_DEFAULT_PARAMS = {
-    "consolidation_days": 3,
-    "setup_lookback_days": 4,
-    "setup_max_range_ratio": 0.10,
-    "max_range_ratio": 0.04,
-    "trend_lookback_days": 10,
-    "trend_threshold_ratio": 0.05,
-    "min_breakout_volume_ratio": 1.2,
+    "volume_window": 20,
+    "candidate_volume_ratio": 1.5,
+    "confirmation_volume_ratio": 2.0,
+    "min_change_ratio": 0.02,
+    "strong_change_ratio": 0.04,
+    "strong_volume_ratio": 3.0,
+    "short_consolidation_days": 3,
+    "short_close_range_ratio": 0.03,
+    "downtrend_lookback_days": 20,
+    "downtrend_min_drop_ratio": 0.08,
+    "downtrend_volume_window": 10,
+    "downtrend_candidate_volume_ratio": 1.5,
+    "downtrend_confirmation_close_position": 0.60,
     "enabled": True,
 }
-CONSOLIDATION_STABILIZATION_RULE_VERSION = "consolidation-stabilization-v1"
+CONSOLIDATION_STABILIZATION_RULE_VERSION = "anomaly-v1"
 INTRADAY_REBOUND_CODE = "INTRADAY_REBOUND"
 INTRADAY_REBOUND_DEFAULT_PARAMS = {
     "lookback_minutes": 120,
@@ -256,7 +262,7 @@ def init_db() -> None:
         signal_pool_sql = db.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'alert_signal_samples'"
         ).fetchone()
-        migrate_signal_pool = signal_pool_sql is not None and "DOWN_STABILIZATION" not in signal_pool_sql["sql"]
+        migrate_signal_pool = signal_pool_sql is not None and "ANOMALY" not in signal_pool_sql["sql"]
         if migrate_signal_pool:
             db.execute("DROP INDEX IF EXISTS idx_alert_signal_samples_user_date")
             db.execute("ALTER TABLE alert_signal_outcomes RENAME TO __legacy_alert_signal_outcomes")
@@ -572,7 +578,8 @@ def init_db() -> None:
                 signal_date TEXT NOT NULL,
                 pattern_type TEXT NOT NULL CHECK(pattern_type IN (
                     'EXHAUSTION', 'SHADOW_STOP', 'STRONG_REVERSAL',
-                    'DOWN_STABILIZATION', 'UP_CONTINUATION', 'NEUTRAL_BREAKOUT'
+                    'DOWN_STABILIZATION', 'UP_CONTINUATION', 'NEUTRAL_BREAKOUT',
+                    'ANOMALY', 'STRONG_ANOMALY'
                 )),
                 source TEXT NOT NULL CHECK(source IN ('AUTO', 'MANUAL')),
                 review_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(review_status IN ('PENDING', 'CONFIRMED', 'REJECTED')),
@@ -685,7 +692,7 @@ def init_db() -> None:
         db.execute(
             """INSERT INTO alert_types
             (code, name, signal_side, description, params_json, sample_json, enabled, created_at, updated_at)
-            VALUES (?, '横盘整理企稳', 'BUY', '窄幅横盘后，收盘放量突破整理区上沿。', ?, '{}', 1, ?, ?)
+            VALUES (?, '异动提醒', 'BUY', '涨幅超过阈值且成交量相对近期中位量显著放大。', ?, '{}', 1, ?, ?)
             ON CONFLICT(code) DO NOTHING""",
             (
                 CONSOLIDATION_STABILIZATION_CODE,
@@ -757,6 +764,38 @@ def init_db() -> None:
         if previous_schema_version < 19:
             normalize_stored_realtime_daily_volumes(db)
             repair_stored_alert_volumes(db)
+        if previous_schema_version < 21:
+            db.execute(
+                """UPDATE alert_types SET name = '异动提醒',
+                description = '涨幅超过阈值且成交量相对近期中位量显著放大。',
+                params_json = ?, updated_at = ? WHERE code = ?""",
+                (
+                    json.dumps(CONSOLIDATION_STABILIZATION_DEFAULT_PARAMS, ensure_ascii=False),
+                    now, CONSOLIDATION_STABILIZATION_CODE,
+                ),
+            )
+        if previous_schema_version < 22:
+            anomaly_row = db.execute(
+                "SELECT params_json FROM alert_types WHERE code = ?",
+                (CONSOLIDATION_STABILIZATION_CODE,),
+            ).fetchone()
+            if anomaly_row is not None:
+                try:
+                    anomaly_params = json.loads(anomaly_row["params_json"])
+                except (TypeError, json.JSONDecodeError):
+                    anomaly_params = {}
+                for key in (
+                    "downtrend_lookback_days", "downtrend_min_drop_ratio", "downtrend_volume_window",
+                    "downtrend_candidate_volume_ratio", "downtrend_confirmation_close_position",
+                ):
+                    anomaly_params.setdefault(key, CONSOLIDATION_STABILIZATION_DEFAULT_PARAMS[key])
+                db.execute(
+                    "UPDATE alert_types SET params_json = ?, updated_at = ? WHERE code = ?",
+                    (
+                        json.dumps(consolidation_stabilization_params(anomaly_params), ensure_ascii=False),
+                        now, CONSOLIDATION_STABILIZATION_CODE,
+                    ),
+                )
         current_position_columns = {
             column["name"]: column for column in db.execute("PRAGMA table_info(current_positions)")
         }
@@ -1701,10 +1740,16 @@ def consolidation_stabilization_params(raw: dict | None = None) -> dict:
     params = dict(CONSOLIDATION_STABILIZATION_DEFAULT_PARAMS)
     if raw:
         params.update(raw)
-    params["consolidation_days"] = max(2, min(10, int(params["consolidation_days"])))
-    params["setup_lookback_days"] = max(2, min(8, int(params["setup_lookback_days"])))
-    params["trend_lookback_days"] = max(2, min(60, int(params["trend_lookback_days"])))
-    for key in ("setup_max_range_ratio", "max_range_ratio", "trend_threshold_ratio", "min_breakout_volume_ratio"):
+    params["volume_window"] = max(5, min(60, int(params["volume_window"])))
+    params["short_consolidation_days"] = max(2, min(10, int(params["short_consolidation_days"])))
+    params["downtrend_lookback_days"] = max(5, min(60, int(params["downtrend_lookback_days"])))
+    params["downtrend_volume_window"] = max(5, min(60, int(params["downtrend_volume_window"])))
+    for key in (
+        "candidate_volume_ratio", "confirmation_volume_ratio", "min_change_ratio",
+        "strong_change_ratio", "strong_volume_ratio", "short_close_range_ratio",
+        "downtrend_min_drop_ratio", "downtrend_candidate_volume_ratio",
+        "downtrend_confirmation_close_position",
+    ):
         params[key] = max(0.0, min(10.0, float(params[key])))
     params["enabled"] = bool(params["enabled"])
     return params
@@ -1807,59 +1852,135 @@ def repair_stored_alert_volumes(db: sqlite3.Connection) -> None:
 
 def evaluate_consolidation_stabilization(prices: list[dict], params: dict | None = None) -> dict:
     params = consolidation_stabilization_params(params)
-    required = params["trend_lookback_days"] + params["consolidation_days"] + 1
+    required = max(
+        params["volume_window"], params["short_consolidation_days"],
+        params["downtrend_lookback_days"], params["downtrend_volume_window"],
+    ) + 1
     if len(prices) < required:
         return {"matched": False, "reason": f"至少需要 {required} 个交易日行情"}
-    candles = [dict(row) for row in prices[-required:]]
-    trend = candles[:params["trend_lookback_days"]]
-    consolidation = candles[params["trend_lookback_days"]:-1]
+    candles = [dict(row) for row in prices]
     signal = candles[-1]
-    setup = trend[-params["setup_lookback_days"]:]
-    range_high = max(float(item["high"]) for item in consolidation)
-    range_low = min(float(item["low"]) for item in consolidation)
-    range_ratio = range_high / range_low - 1 if range_low else 0.0
-    average_volume = sum(daily_volume_shares(item) for item in consolidation) / len(consolidation)
+    history = candles[:-1]
+    volume_history = history[-params["volume_window"]:]
+    short_history = history[-params["short_consolidation_days"]:]
+    downtrend_history = history[-params["downtrend_lookback_days"]:]
+    downtrend_volume_history = history[-params["downtrend_volume_window"]:]
+    volumes = sorted(daily_volume_shares(item) for item in volume_history)
+    middle = len(volumes) // 2
+    volume_baseline = (
+        volumes[middle] if len(volumes) % 2 else (volumes[middle - 1] + volumes[middle]) / 2
+    )
     signal_volume = daily_volume_shares(signal)
-    breakout_volume_ratio = signal_volume / average_volume if average_volume and signal_volume else None
-    trend_start_close = float(trend[0]["close"])
-    trend_end_close = float(trend[-1]["close"])
-    trend_change_ratio = trend_end_close / trend_start_close - 1 if trend_start_close else 0.0
-    setup_high = max(float(item["high"]) for item in setup)
-    setup_low = min(float(item["low"]) for item in setup)
-    setup_range_ratio = setup_high / setup_low - 1 if setup_low else 0.0
-    setup_has_lower_low = setup_low < range_low
-    if trend_change_ratio <= -params["trend_threshold_ratio"]:
-        pattern_type = "DOWN_STABILIZATION"
-    elif trend_change_ratio >= params["trend_threshold_ratio"]:
-        pattern_type = "UP_CONTINUATION"
-    else:
-        pattern_type = "NEUTRAL_BREAKOUT"
-    range_ok = range_ratio <= params["max_range_ratio"]
-    setup_ok = setup_range_ratio <= params["setup_max_range_ratio"] and setup_has_lower_low
-    breakout_ok = float(signal["close"]) > range_high
-    volume_ok = (
-        breakout_volume_ratio is not None
-        and breakout_volume_ratio >= params["min_breakout_volume_ratio"]
+    volume_ratio = signal_volume / volume_baseline if volume_baseline and signal_volume else None
+    downtrend_volumes = sorted(daily_volume_shares(item) for item in downtrend_volume_history)
+    downtrend_middle = len(downtrend_volumes) // 2
+    downtrend_volume_baseline = (
+        downtrend_volumes[downtrend_middle] if len(downtrend_volumes) % 2
+        else (downtrend_volumes[downtrend_middle - 1] + downtrend_volumes[downtrend_middle]) / 2
+    )
+    downtrend_volume_ratio = (
+        signal_volume / downtrend_volume_baseline if downtrend_volume_baseline and signal_volume else None
+    )
+    previous_close = float(history[-1]["close"])
+    signal_close = float(signal["close"])
+    change_ratio = signal_close / previous_close - 1 if previous_close else 0.0
+    consolidation_high = max(float(item["high"]) for item in volume_history)
+    consolidation_low = min(float(item["low"]) for item in volume_history)
+    breakout_up = signal_close > consolidation_high
+    breakdown_down = signal_close < consolidation_low
+    short_closes = [float(item["close"]) for item in short_history]
+    short_close_range_ratio = (
+        (max(short_closes) - min(short_closes)) / short_closes[-1] if short_closes[-1] else 0.0
+    )
+    short_consolidation = short_close_range_ratio <= params["short_close_range_ratio"]
+    trend_start_close = float(downtrend_history[0]["close"])
+    trend_change_ratio = previous_close / trend_start_close - 1 if trend_start_close else 0.0
+    background_type = (
+        "DOWNTREND_REBOUND" if trend_change_ratio <= -0.05
+        else "UPTREND_ACCELERATION" if trend_change_ratio >= 0.05
+        else "NEUTRAL"
+    )
+    price_range = max(0.0, float(signal["high"]) - float(signal["low"]))
+    body_amount = abs(signal_close - float(signal["open"]))
+    lower_shadow = max(0.0, min(float(signal["open"]), signal_close) - float(signal["low"]))
+    close_position = (signal_close - float(signal["low"])) / price_range if price_range else 0.0
+    change_ok = change_ratio > params["min_change_ratio"] + 1e-12
+    ordinary_candidate_ok = (
+        change_ok and volume_ratio is not None
+        and volume_ratio >= params["candidate_volume_ratio"]
+    )
+    ordinary_confirmed_ok = (
+        change_ok and volume_ratio is not None
+        and volume_ratio >= params["confirmation_volume_ratio"]
+    )
+    downtrend_ok = trend_change_ratio <= -params["downtrend_min_drop_ratio"]
+    downtrend_observation_ok = (
+        downtrend_ok and change_ok and downtrend_volume_ratio is not None
+        and downtrend_volume_ratio >= params["downtrend_candidate_volume_ratio"]
+    )
+    bullish_signal = signal_close > float(signal["open"])
+    downtrend_reversal_ok = (
+        downtrend_observation_ok and bullish_signal
+        and close_position >= params["downtrend_confirmation_close_position"]
+    )
+    candidate_ok = ordinary_candidate_ok or downtrend_observation_ok
+    confirmed_ok = ordinary_confirmed_ok or downtrend_reversal_ok
+    strong = confirmed_ok and (
+        change_ratio >= params["strong_change_ratio"] or volume_ratio >= params["strong_volume_ratio"]
+    )
+    pattern_type = "STRONG_ANOMALY" if strong else "ANOMALY"
+    signal_type = (
+        "DOWNTREND_REVERSAL" if downtrend_reversal_ok
+        else "DOWNTREND_ANOMALY" if downtrend_observation_ok and not ordinary_confirmed_ok
+        else "VOLUME_PRICE_BREAKOUT_UP" if breakout_up
+        else "VOLUME_PRICE_ANOMALY"
+    )
+    percentile_history = [daily_volume_shares(item) for item in history[-250:]]
+    volume_percentile = (
+        sum(value <= signal_volume for value in percentile_history) / len(percentile_history)
+        if percentile_history else None
     )
     return {
-        "matched": setup_ok and range_ok and breakout_ok and volume_ok,
+        "matched": confirmed_ok,
+        "candidate_ok": candidate_ok,
+        "confirmed_ok": confirmed_ok,
         "pattern_type": pattern_type,
-        "range_ok": range_ok,
-        "breakout_ok": breakout_ok,
-        "volume_ok": volume_ok,
-        "range_high": range_high,
-        "range_low": range_low,
-        "range_ratio": range_ratio,
-        "setup_high": setup_high,
-        "setup_low": setup_low,
-        "setup_range_ratio": setup_range_ratio,
-        "setup_has_lower_low": setup_has_lower_low,
-        "setup_ok": setup_ok,
-        "average_volume": average_volume,
-        "breakout_volume_ratio": breakout_volume_ratio,
+        "signal_type": signal_type,
+        "strong": strong,
+        "change_ratio": change_ratio,
+        "previous_close": previous_close,
+        "volume": signal_volume,
+        "volume_window": params["volume_window"],
+        "volume_baseline": volume_baseline,
+        "volume_ratio": volume_ratio,
+        "effective_volume_ratio": (
+            downtrend_volume_ratio if downtrend_observation_ok and not ordinary_candidate_ok else volume_ratio
+        ),
+        "effective_volume_window": (
+            params["downtrend_volume_window"] if downtrend_observation_ok and not ordinary_candidate_ok
+            else params["volume_window"]
+        ),
+        "ordinary_candidate_ok": ordinary_candidate_ok,
+        "ordinary_confirmed_ok": ordinary_confirmed_ok,
+        "downtrend_ok": downtrend_ok,
+        "downtrend_observation_ok": downtrend_observation_ok,
+        "downtrend_reversal_ok": downtrend_reversal_ok,
+        "downtrend_volume_baseline": downtrend_volume_baseline,
+        "downtrend_volume_ratio": downtrend_volume_ratio,
+        "bullish_signal": bullish_signal,
+        "volume_percentile": volume_percentile,
+        "consolidation_high": consolidation_high,
+        "consolidation_low": consolidation_low,
+        "breakout_up": breakout_up,
+        "breakdown_down": breakdown_down,
+        "short_close_range_ratio": short_close_range_ratio,
+        "short_consolidation": short_consolidation,
+        "background_type": background_type,
         "trend_change_ratio": trend_change_ratio,
-        "trend": trend,
-        "consolidation": consolidation,
+        "intraday_range_ratio": price_range / previous_close if previous_close else 0.0,
+        "close_position": close_position,
+        "body_ratio": body_amount / price_range if price_range else 0.0,
+        "lower_shadow_ratio": lower_shadow / price_range if price_range else 0.0,
         "signal": signal,
     }
 
@@ -2184,7 +2305,10 @@ def backtest_consolidation_stabilization(
         AND low IS NOT NULL AND close IS NOT NULL ORDER BY trade_date""",
         (stock["stock_code"], end_date),
     ).fetchall()]
-    required = params["trend_lookback_days"] + params["consolidation_days"] + 1
+    required = max(
+        params["volume_window"], params["short_consolidation_days"],
+        params["downtrend_lookback_days"], params["downtrend_volume_window"],
+    ) + 1
     signal_indexes = [
         index for index, price in enumerate(prices)
         if start_date <= price["trade_date"] <= end_date and index + 1 >= required
@@ -2193,17 +2317,23 @@ def backtest_consolidation_stabilization(
     for index in signal_indexes:
         candles = prices[index - required + 1:index + 1]
         result = evaluate_consolidation_stabilization(candles, params)
-        if result["matched"]:
+        if result["candidate_ok"]:
             hits.append({
                 "signal_date": result["signal"]["trade_date"],
                 "pattern_type": result["pattern_type"],
-                "range_high": result["range_high"],
-                "range_low": result["range_low"],
-                "range_ratio": result["range_ratio"],
-                "setup_low": result["setup_low"],
-                "setup_high": result["setup_high"],
-                "setup_range_ratio": result["setup_range_ratio"],
-                "breakout_volume_ratio": result["breakout_volume_ratio"],
+                "signal_type": result["signal_type"],
+                "change_ratio": result["change_ratio"],
+                "volume_ratio": result["volume_ratio"],
+                "effective_volume_ratio": result["effective_volume_ratio"],
+                "downtrend_volume_ratio": result["downtrend_volume_ratio"],
+                "downtrend_observation_ok": result["downtrend_observation_ok"],
+                "downtrend_reversal_ok": result["downtrend_reversal_ok"],
+                "volume_baseline": result["volume_baseline"],
+                "volume_percentile": result["volume_percentile"],
+                "short_close_range_ratio": result["short_close_range_ratio"],
+                "short_consolidation": result["short_consolidation"],
+                "background_type": result["background_type"],
+                "breakout_up": result["breakout_up"],
                 "trend_change_ratio": result["trend_change_ratio"],
                 "candles": candles,
             })
@@ -2230,8 +2360,16 @@ def three_day_dip_metrics(result: dict) -> dict:
 def consolidation_stabilization_metrics(result: dict) -> dict:
     return {
         key: result.get(key) for key in (
-            "pattern_type", "range_high", "range_low", "range_ratio",
-            "breakout_volume_ratio", "trend_change_ratio",
+            "pattern_type", "signal_type", "strong", "change_ratio", "previous_close",
+            "volume", "volume_baseline", "volume_ratio", "volume_percentile",
+            "effective_volume_ratio", "effective_volume_window", "ordinary_candidate_ok",
+            "ordinary_confirmed_ok", "downtrend_ok", "downtrend_observation_ok",
+            "downtrend_reversal_ok", "downtrend_volume_baseline", "downtrend_volume_ratio",
+            "bullish_signal",
+            "consolidation_high", "consolidation_low", "breakout_up", "breakdown_down",
+            "short_close_range_ratio", "short_consolidation", "background_type",
+            "trend_change_ratio", "intraday_range_ratio", "close_position",
+            "body_ratio", "lower_shadow_ratio",
         )
     }
 
@@ -2482,10 +2620,12 @@ def backfill_alert_signal_events(db: sqlite3.Connection) -> int:
             signal_time = datetime.fromisoformat(row["quote_time"]).isoformat(timespec="seconds")
             if row["alert_code"] in (THREE_DAY_DIP_CODE, CONSOLIDATION_STABILIZATION_CODE):
                 signal_price = float(details["price"])
-                rule_version = (
-                    THREE_DAY_DIP_RULE_VERSION if row["alert_code"] == THREE_DAY_DIP_CODE
-                    else CONSOLIDATION_STABILIZATION_RULE_VERSION
-                )
+                if row["alert_code"] == THREE_DAY_DIP_CODE:
+                    rule_version = THREE_DAY_DIP_RULE_VERSION
+                elif "volume_ratio" in details or "change_ratio" in details:
+                    rule_version = CONSOLIDATION_STABILIZATION_RULE_VERSION
+                else:
+                    rule_version = "consolidation-stabilization-v1"
             else:
                 minute = datetime.fromisoformat(signal_time).isoformat(timespec="minutes")
                 quote = db.execute(
@@ -3085,40 +3225,40 @@ def create_alert_notification(
 
 
 def create_consolidation_stabilization_notification(
-    db: sqlite3.Connection, alert_type_id: int, watch: sqlite3.Row, quote: dict, result: dict,
+    db: sqlite3.Connection, alert_type_id: int, watch: sqlite3.Row, quote: dict, stage: str, result: dict,
 ) -> bool:
-    labels = {
-        "DOWN_STABILIZATION": "下跌企稳",
-        "UP_CONTINUATION": "上涨中继",
-        "NEUTRAL_BREAKOUT": "中性横盘突破",
-    }
-    pattern_label = labels[result["pattern_type"]]
     created_at = datetime.now().isoformat(timespec="seconds")
-    title = f"{watch['stock_name']}触发横盘整理企稳·收盘确认"
-    content = (
-        f"{pattern_label}：整理区间 {result['range_low']:.2f}-{result['range_high']:.2f}，"
-        f"收盘 {float(quote['close']):.2f} 突破上沿，成交量为整理期均量的 "
-        f"{result['breakout_volume_ratio']:.2f} 倍。"
+    stage_label = "异动观察" if stage == "CANDIDATE" else "异动确认"
+    strength_label = (
+        "下跌异动观察" if stage == "CANDIDATE" and result["downtrend_observation_ok"]
+        else "下跌反转确认" if result["signal_type"] == "DOWNTREND_REVERSAL"
+        else "强异动" if result["strong"] else "放量上涨异动"
     )
+    title = f"{watch['stock_name']}触发{stage_label}"
+    content = (
+        f"{strength_label}：当前上涨 {result['change_ratio'] * 100:.2f}%，"
+        f"累计成交量为前 {result['effective_volume_window']} 日中位量的 "
+        f"{result['effective_volume_ratio']:.2f} 倍。"
+    )
+    if result["short_consolidation"]:
+        content += f" 前期 {result['short_close_range_ratio'] * 100:.2f}% 收盘收敛。"
+    if result["breakout_up"]:
+        content += " 当前已突破近期高点。"
     details = {
-        "price": float(quote["close"]), "pattern_type": result["pattern_type"],
-        "range_low": result["range_low"], "range_high": result["range_high"],
-        "range_ratio": result["range_ratio"],
-        "breakout_volume_ratio": result["breakout_volume_ratio"],
-        "trend_change_ratio": result["trend_change_ratio"],
+        "price": float(quote["close"]), **consolidation_stabilization_metrics(result),
     }
     dedupe_key = (
         f"{watch['user_id']}:{CONSOLIDATION_STABILIZATION_CODE}:"
-        f"{watch['stock_code']}:{quote['trade_date']}:CONFIRMED"
+        f"{watch['stock_code']}:{quote['trade_date']}:{stage}"
     )
     cursor = db.execute(
         """INSERT OR IGNORE INTO notifications
         (user_id, alert_type_id, stock_code, stock_name, stage, title, content,
          details_json, quote_time, created_at, dedupe_key)
-        VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             watch["user_id"], alert_type_id, watch["stock_code"], watch["stock_name"],
-            title, content, json.dumps(details, ensure_ascii=False),
+            stage, title, content, json.dumps(details, ensure_ascii=False),
             quote.get("quote_time", quote["fetched_at"]), created_at, dedupe_key,
         ),
     )
@@ -3497,7 +3637,10 @@ def evaluate_consolidation_stabilization_alerts(db: sqlite3.Connection, quotes: 
         WHERE stock_code IN ({placeholders}) ORDER BY user_id, stock_code""",
         tuple(quotes),
     ).fetchall()
-    required = params["trend_lookback_days"] + params["consolidation_days"] + 1
+    required = max(
+        params["volume_window"], params["short_consolidation_days"],
+        params["downtrend_lookback_days"], params["downtrend_volume_window"],
+    ) + 1
     results = {}
     created = 0
     for watch in watches:
@@ -3512,37 +3655,59 @@ def evaluate_consolidation_stabilization_alerts(db: sqlite3.Connection, quotes: 
             results[watch["stock_code"]] = evaluate_consolidation_stabilization(prices, params)
         result = results[watch["stock_code"]]
         state = db.execute(
-            """SELECT confirmation_triggered_at FROM alert_rule_states
+            """SELECT candidate_triggered_at, confirmation_triggered_at FROM alert_rule_states
             WHERE user_id = ? AND alert_type_id = ? AND stock_code = ? AND trade_date = ?""",
             (watch["user_id"], alert_type["id"], watch["stock_code"], quote["trade_date"]),
         ).fetchone()
+        candidate_at = state["candidate_triggered_at"] if state else None
         confirmation_at = state["confirmation_triggered_at"] if state else None
         closing = is_closing_quote(quote)
-        if result.get("matched") and closing and not confirmation_at:
-            if create_consolidation_stabilization_notification(db, alert_type["id"], watch, quote, result):
+        candidate_should_notify = result.get("candidate_ok") and (
+            not closing or result.get("downtrend_observation_ok") and not result.get("confirmed_ok")
+        )
+        if candidate_should_notify and not candidate_at:
+            if create_consolidation_stabilization_notification(
+                db, alert_type["id"], watch, quote, "CANDIDATE", result,
+            ):
+                created += 1
+                upsert_alert_signal_event(
+                    db, watch["user_id"], alert_type["id"], watch["stock_code"], watch["stock_name"],
+                    "CANDIDATE", quote.get("quote_time", quote["fetched_at"]), float(quote["close"]),
+                    CONSOLIDATION_STABILIZATION_RULE_VERSION, params,
+                    consolidation_stabilization_metrics(result),
+                )
+            candidate_at = quote.get("quote_time", quote["fetched_at"])
+        if result.get("confirmed_ok") and closing and not confirmation_at:
+            if create_consolidation_stabilization_notification(
+                db, alert_type["id"], watch, quote, "CONFIRMED", result,
+            ):
                 created += 1
                 upsert_alert_signal_event(
                     db, watch["user_id"], alert_type["id"], watch["stock_code"], watch["stock_name"],
                     "CONFIRMED", quote.get("quote_time", quote["fetched_at"]), float(quote["close"]),
-                    CONSOLIDATION_STABILIZATION_RULE_VERSION, params, {
-                        key: result.get(key) for key in (
-                            "pattern_type", "range_high", "range_low", "range_ratio",
-                            "breakout_volume_ratio", "trend_change_ratio",
-                        )
-                    },
+                    CONSOLIDATION_STABILIZATION_RULE_VERSION, params,
+                    consolidation_stabilization_metrics(result),
                 )
             confirmation_at = quote.get("quote_time", quote["fetched_at"])
+        if result.get("confirmed_ok") and closing:
+            upsert_alert_signal_sample(
+                db, watch["user_id"], alert_type["id"], watch["stock_code"], watch["stock_name"],
+                prices, result, rule_version=CONSOLIDATION_STABILIZATION_RULE_VERSION,
+                metrics=consolidation_stabilization_metrics(result),
+            )
         db.execute(
             """INSERT INTO alert_rule_states
             (user_id, alert_type_id, stock_code, trade_date, candidate_triggered_at,
              confirmation_triggered_at, last_evaluated_at, last_matched)
-            VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, alert_type_id, stock_code, trade_date) DO UPDATE SET
+            candidate_triggered_at = excluded.candidate_triggered_at,
             confirmation_triggered_at = excluded.confirmation_triggered_at,
             last_evaluated_at = excluded.last_evaluated_at, last_matched = excluded.last_matched""",
             (
                 watch["user_id"], alert_type["id"], watch["stock_code"], quote["trade_date"],
-                confirmation_at, quote.get("quote_time", quote["fetched_at"]), int(bool(result.get("matched"))),
+                candidate_at, confirmation_at, quote.get("quote_time", quote["fetched_at"]),
+                int(bool(result.get("candidate_ok"))),
             ),
         )
     return created
@@ -5249,7 +5414,7 @@ def sync_watchlist_history():
     stock_codes = watchlist_sync_codes()
     if not stock_codes:
         return watchlist_sync_response("重点观察列表为空，无需同步历史行情。", "warning")
-    synced, failed = sync_history_codes(stock_codes)
+    synced, failed = sync_history_codes(stock_codes, full=True)
     message = f"已同步 {synced} 条历史行情。" if not failed else f"历史行情部分同步失败：{'；'.join(failed)}"
     category = "success" if not failed else "warning"
     return watchlist_sync_response(message, category)
@@ -5456,7 +5621,7 @@ def sync_portfolio_history():
         ]
     if not stock_codes:
         return portfolio_sync_response("当前没有持仓，无需同步历史行情。", "warning")
-    synced, failed = sync_history_codes(stock_codes)
+    synced, failed = sync_history_codes(stock_codes, full=True)
     message = f"已同步 {synced} 条历史行情。" if not failed else f"历史行情部分同步失败：{'；'.join(failed)}"
     return portfolio_sync_response(message, "success" if not failed else "warning")
 
@@ -5730,8 +5895,12 @@ def consolidation_stabilization_management():
     backtest = None
     backtest_error = None
     selected_stock_code = request.args.get("stock_code", "").strip()
-    start_date = request.args.get("start_date", "").strip()
-    end_date = request.args.get("end_date", "").strip()
+    signal_date = request.args.get("signal_date", "").strip()
+    if not signal_date:
+        signal_date = (
+            request.args.get("start_date", "").strip()
+            or request.args.get("end_date", "").strip()
+        )
     with db_connect() as db:
         alert_type, params = consolidation_stabilization_alert_type_data(db)
         effectiveness = alert_effectiveness_data(db, current_user_id(), alert_type["id"])
@@ -5747,19 +5916,18 @@ def consolidation_stabilization_management():
                 (current_user_id(), selected_stock_code),
             ).fetchone()
             try:
-                start_date = normalize_date(start_date)
-                end_date = normalize_date(end_date)
-                if start_date > end_date:
-                    raise ValueError("开始日期不能晚于截止日期")
+                signal_date = normalize_date(signal_date)
                 if stock is None:
                     raise ValueError("请选择当前用户重点观察中的股票")
-                backtest = backtest_consolidation_stabilization(db, stock, start_date, end_date, params)
+                backtest = backtest_consolidation_stabilization(
+                    db, stock, signal_date, signal_date, params,
+                )
             except (TypeError, ValueError) as error:
                 backtest_error = str(error) if str(error) else "测试条件无效，请检查股票和日期。"
     return render_template(
         "index.html", page="consolidation_stabilization", alert_type=alert_type, alert_params=params,
         alert_watchlist=watchlist, selected_stock_code=selected_stock_code,
-        test_start_date=start_date, test_end_date=end_date, backtest=backtest,
+        test_signal_date=signal_date, backtest=backtest,
         backtest_error=backtest_error, alert_effectiveness=effectiveness,
     )
 
@@ -5768,13 +5936,23 @@ def consolidation_stabilization_management():
 def save_consolidation_stabilization_alert_type():
     try:
         params = consolidation_stabilization_params({
-            "consolidation_days": int(request.form.get("consolidation_days", "3")),
-            "setup_lookback_days": int(request.form.get("setup_lookback_days", "4")),
-            "setup_max_range_ratio": float(request.form.get("setup_max_range_percent", "10")) / 100,
-            "max_range_ratio": float(request.form.get("max_range_percent", "4")) / 100,
-            "trend_lookback_days": int(request.form.get("trend_lookback_days", "10")),
-            "trend_threshold_ratio": float(request.form.get("trend_threshold_percent", "5")) / 100,
-            "min_breakout_volume_ratio": float(request.form.get("min_breakout_volume_ratio", "1.2")),
+            "volume_window": int(request.form.get("volume_window", "20")),
+            "candidate_volume_ratio": float(request.form.get("candidate_volume_ratio", "1.5")),
+            "confirmation_volume_ratio": float(request.form.get("confirmation_volume_ratio", "2")),
+            "min_change_ratio": float(request.form.get("min_change_percent", "2")) / 100,
+            "strong_change_ratio": float(request.form.get("strong_change_percent", "4")) / 100,
+            "strong_volume_ratio": float(request.form.get("strong_volume_ratio", "3")),
+            "short_consolidation_days": int(request.form.get("short_consolidation_days", "3")),
+            "short_close_range_ratio": float(request.form.get("short_close_range_percent", "3")) / 100,
+            "downtrend_lookback_days": int(request.form.get("downtrend_lookback_days", "20")),
+            "downtrend_min_drop_ratio": float(request.form.get("downtrend_min_drop_percent", "8")) / 100,
+            "downtrend_volume_window": int(request.form.get("downtrend_volume_window", "10")),
+            "downtrend_candidate_volume_ratio": float(
+                request.form.get("downtrend_candidate_volume_ratio", "1.5")
+            ),
+            "downtrend_confirmation_close_position": float(
+                request.form.get("downtrend_confirmation_close_position_percent", "60")
+            ) / 100,
             "enabled": "enabled" in request.form,
         })
         now = datetime.now().isoformat(timespec="seconds")
@@ -5786,7 +5964,7 @@ def save_consolidation_stabilization_alert_type():
                     CONSOLIDATION_STABILIZATION_CODE,
                 ),
             )
-        flash("已保存横盘整理企稳提醒参数。", "success")
+        flash("已保存异动提醒参数。", "success")
     except (TypeError, ValueError):
         flash("提醒参数格式无效，请检查数值。", "error")
     return redirect(url_for("consolidation_stabilization_management"))
@@ -5972,7 +6150,10 @@ def add_consolidation_stabilization_sample():
             raise ValueError("证券名称不能为空，备注不能超过 500 字")
         with db_connect() as db:
             alert_type, params = consolidation_stabilization_alert_type_data(db)
-            required = params["trend_lookback_days"] + params["consolidation_days"] + 1
+            required = max(
+                params["volume_window"], params["short_consolidation_days"],
+                params["downtrend_lookback_days"], params["downtrend_volume_window"],
+            ) + 1
             prices = [dict(row) for row in reversed(db.execute(
                 """SELECT trade_date, open, high, low, close, volume, source FROM daily_prices
                 WHERE stock_code = ? AND trade_date <= ? AND open IS NOT NULL AND high IS NOT NULL
@@ -5992,7 +6173,7 @@ def add_consolidation_stabilization_sample():
                 raise ValueError("信号日前行情不足，无法建立样本")
             result = evaluate_consolidation_stabilization(prices, params)
             pattern_type = request.form.get("pattern_type", "").strip() or result.get("pattern_type")
-            if pattern_type not in ("DOWN_STABILIZATION", "UP_CONTINUATION", "NEUTRAL_BREAKOUT"):
+            if pattern_type not in ("ANOMALY", "STRONG_ANOMALY"):
                 raise ValueError("当前规则未识别形态，请手工选择形态类型")
             upsert_alert_signal_sample(
                 db, current_user_id(), alert_type["id"], stock_code, stock_name, prices, result,
@@ -6000,7 +6181,7 @@ def add_consolidation_stabilization_sample():
                 rule_version=CONSOLIDATION_STABILIZATION_RULE_VERSION,
                 metrics=consolidation_stabilization_metrics(result),
             )
-        flash(f"已加入横盘整理企稳池：{stock_name} {signal_date}", "success")
+        flash(f"已加入异动样本池：{stock_name} {signal_date}", "success")
     except (RuntimeError, TypeError, ValueError) as error:
         flash(f"加入样本失败：{error}", "error")
     return redirect(url_for("consolidation_stabilization_pool"))
