@@ -10,10 +10,12 @@ import math
 import os
 import sqlite3
 import ssl
+import sys
 import tempfile
 import threading
 import time
 import uuid
+import webbrowser
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -25,8 +27,9 @@ from openpyxl import load_workbook
 import xlrd
 
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("STOCKNOTES_DB", BASE_DIR / "stocknotes.db"))
+BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+DATA_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else BASE_DIR
+DB_PATH = Path(os.environ.get("STOCKNOTES_DB", DATA_DIR / "stocknotes.db"))
 ALLOWED_EXTENSIONS = {"xlsx", "xls", "csv", "txt"}
 IGNORED_ACTIONS = {"申购配号", "股息入账", "股息红利税补", "指定交易"}
 STATEMENTS_PER_PAGE = 20
@@ -203,7 +206,11 @@ HEADER_ALIASES = {
     "过户费": "transfer_fee", "交易市场": "market", "市场": "market",
 }
 
-app = Flask(__name__)
+app = Flask(
+    __name__,
+    template_folder=str(BASE_DIR / "templates"),
+    static_folder=str(BASE_DIR / "static"),
+)
 app.secret_key = os.environ.get("SECRET_KEY", "stocknotes-local-only")
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
@@ -6599,4 +6606,7 @@ init_db()
 
 if __name__ == "__main__":
     start_auto_sync_scheduler()
-    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "5001")), debug=True, use_reloader=False)
+    port = int(os.environ.get("PORT", "5001"))
+    if getattr(sys, "frozen", False) and os.environ.get("STOCKNOTES_NO_BROWSER") != "1":
+        threading.Timer(1.0, webbrowser.open, args=(f"http://127.0.0.1:{port}",)).start()
+    app.run(host="127.0.0.1", port=port, debug=not getattr(sys, "frozen", False), use_reloader=False)

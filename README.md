@@ -2,16 +2,29 @@
 
 本地 Flask + SQLite 单体应用。当前只实现交割单导入、清洗、FIFO 处理和客观交易分析。
 
-## 启动
+## Windows 免 Python 运行版
 
-双击 `start.bat`，或在当前目录执行：
+需要在一台 Windows 电脑上执行一次构建（Windows `.exe` 不能直接在 macOS 上生成）：
+
+1. 安装 64 位 Python 3.11，仅构建电脑需要安装。
+2. 双击 `build-windows.bat`。
+3. 构建结果位于 `dist\StockNotes-Windows.zip`。
+4. 将 ZIP 发给目标电脑，完整解压后双击 `StockNotes.exe`。目标电脑不需要安装 Python。
+
+构建脚本会将当前 `stocknotes.db` 复制到发布包。数据库包含个人交易数据；若要发布空白版本，请在分发前删除发布目录中的 `stocknotes.db`，程序首次启动时会自动创建。
+
+详细使用说明见 `README-WINDOWS.txt`。
+
+## 源码启动
+
+在当前目录执行：
 
 ```powershell
 python -m pip install -r requirements.txt
 python app.py
 ```
 
-浏览器打开 `http://127.0.0.1:5000`。
+浏览器打开 `http://127.0.0.1:5001`。
 
 ## 数据
 
